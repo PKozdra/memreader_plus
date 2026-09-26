@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 
 project(memreader_plus VERSION 0.2.0 LANGUAGES C)
 
@@ -28,7 +28,8 @@ target_include_directories(memreader_plus PRIVATE
 target_compile_definitions(memreader_plus PRIVATE LUA_BUILD_AS_DLL)
 
 if(MSVC)
-	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W4 /GS /GL /Gy /Zi /O1 /Os /sdl /fp:precise /Oi /MD /FC /Brepro")
-	set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /MANIFEST:NO /LTCG /NOENTRY /NXCOMPAT /DYNAMICBASE:NO /LARGEADDRESSAWARE /MANIFESTUAC:NO /NODEFAULTLIB /Brepro")
+	set(CMAKE_C_FLAGS_RELEASE "/O1 /DNDEBUG")
+	target_compile_options(memreader_plus PRIVATE /W4 /GS /GL /Gy /Zi /sdl /fp:precise /Oi /FC /Brepro)
+	target_link_options(memreader_plus PRIVATE /MANIFEST:NO /LTCG /NOENTRY /NODEFAULTLIB /Brepro)
 	target_link_libraries(memreader_plus "${GAME_IMPORT_LIB}" ucrt.lib libcmt.lib libvcruntime.lib)
 endif()
