@@ -26,12 +26,14 @@ static void push_module(lua_State *L, const MODULEENTRY32 *module)
 	lua_setfield(L, -2, "size");
 }
 
+enum { MODULE_LIST = 1, MODULE_POSITION = 2, MODULE_UPVALUE_COUNT = 2 };
+
 static int next_module(lua_State *L)
 {
-	int index = (int)lua_tointeger(L, lua_upvalueindex(2)) + 1;
-	lua_pushinteger(L, index);
-	lua_replace(L, lua_upvalueindex(2));
-	lua_rawgeti(L, lua_upvalueindex(1), index);
+	int position = (int)lua_tointeger(L, lua_upvalueindex(MODULE_POSITION)) + 1;
+	lua_pushinteger(L, position);
+	lua_replace(L, lua_upvalueindex(MODULE_POSITION));
+	lua_rawgeti(L, lua_upvalueindex(MODULE_LIST), position);
 	return 1;
 }
 
@@ -53,7 +55,7 @@ static int l_modules(lua_State *L)
 	CloseHandle(snapshot);
 
 	lua_pushinteger(L, 0);
-	lua_pushcclosure(L, next_module, 2);
+	lua_pushcclosure(L, next_module, MODULE_UPVALUE_COUNT);
 	return 1;
 }
 

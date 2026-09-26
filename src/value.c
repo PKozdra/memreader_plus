@@ -5,11 +5,14 @@
 
 enum Operation { ADD, SUBTRACT, MULTIPLY, DIVIDE };
 enum Comparison { GREATER, LESS, EQUAL };
+enum { INTEGER_STRING_WIDTH = sizeof(INT32) };
 
 static const char *const type_names[VALUE_TYPE_COUNT] = {
 	"pointer", "uint8", "int8", "uint16", "int16", "uint32", "int32"
 };
-static const size_t type_sizes[VALUE_TYPE_COUNT] = { 8, 1, 1, 2, 2, 4, 4 };
+static const size_t type_sizes[VALUE_TYPE_COUNT] = {
+	sizeof(INT_PTR), sizeof(UINT8), sizeof(INT8), sizeof(UINT16), sizeof(INT16), sizeof(UINT32), sizeof(INT32)
+};
 static const char *const operation_names[] = { "addition", "subtraction", "multiplication", "divide" };
 static const char *const comparison_symbols[] = { ">", "<", "==" };
 
@@ -97,7 +100,7 @@ BOOL to_integer(lua_State *L, int index, size_t string_width, INT64 *result)
 INT64 to_offset(lua_State *L, int index)
 {
 	INT64 offset;
-	return to_integer(L, index, 4, &offset) ? offset : 0;
+	return to_integer(L, index, INTEGER_STRING_WIDTH, &offset) ? offset : 0;
 }
 
 INT_PTR check_pointer(lua_State *L, int index)
@@ -195,7 +198,7 @@ static int arithmetic(lua_State *L, int operation)
 		push_value(L, VALUE_POINTER, left->pointer - right_value->pointer);
 		return 1;
 	}
-	if (!to_integer(L, 2, 4, &right))
+	if (!to_integer(L, 2, INTEGER_STRING_WIDTH, &right))
 		return arithmetic_error(L, operation);
 	push_value(L, left->type, calculate_integer(L, operation, value_to_integer(left), right));
 	return 1;
@@ -223,7 +226,7 @@ static int compare(lua_State *L, int comparison)
 	a = value_to_integer(left);
 	if (right_value)
 		b = value_to_integer(right_value);
-	else if (!to_integer(L, 2, left->type == VALUE_POINTER ? sizeof(INT_PTR) : 4, &b))
+	else if (!to_integer(L, 2, left->type == VALUE_POINTER ? sizeof(INT_PTR) : INTEGER_STRING_WIDTH, &b))
 		return comparison_error(L, comparison);
 
 	switch (comparison) {
@@ -265,14 +268,14 @@ static void push_hex(lua_State *L, int index)
 	luaL_buffinit(L, &buffer);
 	for (i = 0; i < length; i++) {
 		luaL_addchar(&buffer, digits[bytes[i] >> 4]);
-		luaL_addchar(&buffer, digits[bytes[i] & 15]);
+		luaL_addchar(&buffer, digits[bytes[i] & 0x0F]);
 	}
 	luaL_pushresult(&buffer);
 }
 
 static int l_tostring(lua_State *L)
 {
-	char text[24];
+	char text[sizeof "-9223372036854775808"];
 	TypedValue *value = to_value(L, 1);
 
 	switch (lua_type(L, 1)) {

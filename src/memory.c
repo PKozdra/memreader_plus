@@ -3,10 +3,16 @@
 enum {
 	STRING_LENGTH_OFFSET = 0,
 	STRING_DATA_OFFSET = 8,
-	ARRAY_SIZE_OFFSET = 4,
-	ARRAY_DATA_OFFSET = 8,
 	STACK_BUFFER_SIZE = 1024
 };
+
+typedef struct {
+	UINT32 capacity;
+	INT32 size;
+	INT_PTR data;
+} CaVector;
+
+_Static_assert(sizeof(CaVector) == 16, "CA_STD::VECTOR is 16 bytes");
 
 static BOOL read_memory(INT_PTR address, void *destination, size_t size)
 {
@@ -103,7 +109,7 @@ static int l_read_string(lua_State *L)
 {
 	INT_PTR address = address_argument(L);
 	BOOL is_pointer = flag_argument(L, 3);
-	BOOL is_wide = flag_argument(L, 4);
+	size_t char_size = flag_argument(L, 4) ? sizeof(WCHAR) : sizeof(char);
 	INT32 length;
 	INT_PTR data;
 
@@ -115,24 +121,22 @@ static int l_read_string(lua_State *L)
 		return 1;
 	}
 	read_or_fail(L, address + STRING_DATA_OFFSET, &data, sizeof data);
-	return push_memory(L, data, (size_t)length * (is_wide ? 2 : 1));
+	return push_memory(L, data, (size_t)length * char_size);
 }
 
 static int l_read_array(lua_State *L)
 {
-	INT_PTR address = address_argument(L);
-	INT32 size;
-	INT_PTR data = 0;
+	CaVector vector;
 
-	read_or_fail(L, address + ARRAY_SIZE_OFFSET, &size, sizeof size);
-	if (size > 0)
-		read_or_fail(L, address + ARRAY_DATA_OFFSET, &data, sizeof data);
+	read_or_fail(L, address_argument(L), &vector, sizeof vector);
+	if (vector.size <= 0)
+		vector.data = 0;
 
 	if (flag_argument(L, 3))
-		push_value(L, VALUE_INT32, size);
+		push_value(L, VALUE_INT32, vector.size);
 	else
-		lua_pushnumber(L, (lua_Number)size);
-	push_value(L, VALUE_POINTER, data);
+		lua_pushnumber(L, (lua_Number)vector.size);
+	push_value(L, VALUE_POINTER, vector.data);
 	return 2;
 }
 
