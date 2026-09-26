@@ -164,6 +164,27 @@ static int l_read_string(lua_State *L)
 	return push_memory(L, view.data, read_size(L, (lua_Number)view.length * char_size));
 }
 
+static int l_read_unistring(lua_State *L)
+{
+	StringView view = read_string_view(L, address_argument(L), sizeof(WCHAR));
+	size_t size = read_size(L, (lua_Number)view.length * sizeof(WCHAR));
+	WCHAR *text;
+	char *utf8;
+	int utf8_size;
+
+	if (view.length == 0) {
+		lua_pushliteral(L, "");
+		return 1;
+	}
+	text = lua_newuserdata(L, size);
+	read_or_fail(L, view.data, text, size);
+	utf8_size = WideCharToMultiByte(CP_UTF8, 0, text, (int)view.length, NULL, 0, NULL, NULL);
+	utf8 = lua_newuserdata(L, (size_t)utf8_size);
+	WideCharToMultiByte(CP_UTF8, 0, text, (int)view.length, utf8, utf8_size, NULL, NULL);
+	lua_pushlstring(L, utf8, (size_t)utf8_size);
+	return 1;
+}
+
 static int l_read_array(lua_State *L)
 {
 	CaVector vector;
@@ -232,6 +253,7 @@ const luaL_Reg memory_functions[] = {
 	{ "read_int32", l_read_int32 },
 	{ "read_boolean", l_read_boolean },
 	{ "read_string", l_read_string },
+	{ "read_unistring", l_read_unistring },
 	{ "read_array", l_read_array },
 	{ "read_rowidx", l_read_rowidx },
 	{ "read", l_read },
