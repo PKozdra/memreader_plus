@@ -5,7 +5,7 @@
 
 enum Operation { ADD, SUBTRACT, MULTIPLY, DIVIDE };
 enum Comparison { GREATER, LESS, EQUAL };
-enum { INTEGER_STRING_WIDTH = sizeof(INT32) };
+enum { MAX_TABLE_SIZE_HINT = 1 << 20, INTEGER_STRING_WIDTH = sizeof(INT32) };
 
 static const char *const type_names[VALUE_TYPE_COUNT] = {
 	"pointer", "uint8", "int8", "uint16", "int16", "uint32", "int32"
@@ -26,8 +26,8 @@ size_t value_size(int type)
 TypedValue *push_value(lua_State *L, int type, INT64 number)
 {
 	TypedValue *value = lua_newuserdata(L, sizeof(TypedValue));
+	memset(value, 0, sizeof *value);
 	value->type = (BYTE)type;
-	value->pointer = 0;
 	switch (type) {
 	case VALUE_POINTER: value->pointer = (INT_PTR)number; break;
 	case VALUE_UINT8:   value->uint8 = (UINT8)number; break;
@@ -173,6 +173,8 @@ static INT64 calculate_integer(lua_State *L, int operation, INT64 a, INT64 b)
 	default:
 		if (b == 0)
 			luaL_error(L, "attempt to divide by zero");
+		if (b == -1)
+			return (INT64)(0 - (UINT64)a);
 		return a / b;
 	}
 }
@@ -302,11 +304,17 @@ static int l_tonumber(lua_State *L)
 	return 1;
 }
 
+static int table_size_hint(lua_State *L, int index)
+{
+	INT64 size = to_offset(L, index);
+	if (size <= 0)
+		return 0;
+	return size < MAX_TABLE_SIZE_HINT ? (int)size : MAX_TABLE_SIZE_HINT;
+}
+
 static int l_createtable(lua_State *L)
 {
-	INT64 array_size = to_offset(L, 1);
-	INT64 hash_size = to_offset(L, 2);
-	lua_createtable(L, array_size > 0 ? (int)array_size : 0, hash_size > 0 ? (int)hash_size : 0);
+	lua_createtable(L, table_size_hint(L, 1), table_size_hint(L, 2));
 	return 1;
 }
 

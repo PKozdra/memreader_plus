@@ -62,6 +62,7 @@ static int l_modules(lua_State *L)
 static int l_ud_topointer(lua_State *L)
 {
 	luaL_checktype(L, 1, LUA_TUSERDATA);
+	luaL_argcheck(L, lua_objlen(L, 1) >= sizeof(INT_PTR), 1, "userdata too small to hold a pointer");
 	push_value(L, VALUE_POINTER, *(INT_PTR *)lua_touserdata(L, 1));
 	return 1;
 }
@@ -69,6 +70,7 @@ static int l_ud_topointer(lua_State *L)
 static int l_ud_debug(lua_State *L)
 {
 	const TValue *argument = L->base;
+	luaL_checkany(L, 1);
 	lua_pushnumber(L, (lua_Number)argument->tt);
 	push_value(L, VALUE_POINTER, (INT_PTR)argument->value.p);
 	return 2;

@@ -3,7 +3,8 @@
 enum {
 	STRING_LENGTH_OFFSET = 0,
 	STRING_DATA_OFFSET = 8,
-	STACK_BUFFER_SIZE = 1024
+	STACK_BUFFER_SIZE = 1024,
+	MAX_READ_SIZE = 16 * 1024 * 1024
 };
 
 typedef struct {
@@ -38,6 +39,13 @@ static INT_PTR address_argument(lua_State *L)
 static BOOL flag_argument(lua_State *L, int index)
 {
 	return lua_type(L, index) == LUA_TBOOLEAN && lua_toboolean(L, index);
+}
+
+static size_t read_size(lua_State *L, lua_Number size)
+{
+	if (size > MAX_READ_SIZE)
+		luaL_error(L, "cannot read more than %d bytes at once", MAX_READ_SIZE);
+	return (size_t)size;
 }
 
 static int push_memory(lua_State *L, INT_PTR address, size_t size)
@@ -98,11 +106,11 @@ static int l_read(lua_State *L)
 	INT_PTR address = address_argument(L);
 	lua_Number size = lua_tonumber(L, 3);
 
-	if (size < 1) {
+	if (!(size >= 1)) {
 		lua_pushliteral(L, "");
 		return 1;
 	}
-	return push_memory(L, address, (size_t)size);
+	return push_memory(L, address, read_size(L, size));
 }
 
 static int l_read_string(lua_State *L)
@@ -112,6 +120,7 @@ static int l_read_string(lua_State *L)
 	size_t char_size = flag_argument(L, 4) ? sizeof(WCHAR) : sizeof(char);
 	INT32 length;
 	INT_PTR data;
+	size_t size;
 
 	if (is_pointer)
 		read_or_fail(L, address, &address, sizeof address);
@@ -120,8 +129,9 @@ static int l_read_string(lua_State *L)
 		lua_pushliteral(L, "");
 		return 1;
 	}
+	size = read_size(L, (lua_Number)length * char_size);
 	read_or_fail(L, address + STRING_DATA_OFFSET, &data, sizeof data);
-	return push_memory(L, data, (size_t)length * char_size);
+	return push_memory(L, data, size);
 }
 
 static int l_read_array(lua_State *L)
@@ -144,11 +154,13 @@ static int l_read_rowidx(lua_State *L)
 {
 	INT_PTR address = address_argument(L);
 	INT_PTR base = check_pointer(L, 3);
-	lua_Number row_size = lua_tonumber(L, 4);
+	INT64 row_size = (INT64)lua_tonumber(L, 4);
 	INT_PTR entry;
 
+	if (row_size <= 0)
+		return luaL_error(L, "row size must be positive");
 	read_or_fail(L, address, &entry, sizeof entry);
-	lua_pushnumber(L, (lua_Number)(INT64)((entry - base) / row_size) + 1);
+	lua_pushnumber(L, (lua_Number)((entry - base) / row_size + 1));
 	return 1;
 }
 
