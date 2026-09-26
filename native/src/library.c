@@ -1,0 +1,19 @@
+#include "memreader_plus.h"
+
+#define MEMREADER_API_VERSION 1.2f
+
+__declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
+{
+	lua_newtable(L);
+	luaL_register(L, NULL, value_functions);
+	luaL_register(L, NULL, memory_functions);
+	luaL_register(L, NULL, process_functions);
+
+	push_value(L, VALUE_POINTER, (INT_PTR)GetModuleHandleA(NULL));
+	lua_setfield(L, -2, "base");
+	lua_pushnumber(L, MEMREADER_API_VERSION);
+	lua_setfield(L, -2, "version");
+	lua_pushstring(L, MEMREADER_PLUS_VERSION);
+	lua_setfield(L, -2, "plus_version");
+	return 1;
+}
