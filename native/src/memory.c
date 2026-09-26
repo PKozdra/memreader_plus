@@ -1,4 +1,4 @@
-#include "memreader_plus.h"
+#include "common.h"
 
 enum {
 	STRING_LENGTH_OFFSET = 0,

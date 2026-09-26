@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "memreader_plus.h"
+#include "common.h"
 
 enum Operation { ADD, SUBTRACT, MULTIPLY, DIVIDE };
 enum Comparison { GREATER, LESS, EQUAL };

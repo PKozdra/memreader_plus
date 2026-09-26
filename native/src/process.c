@@ -1,4 +1,4 @@
-#include "memreader_plus.h"
+#include "common.h"
 
 #include <tlhelp32.h>
 

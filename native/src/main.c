@@ -1,4 +1,4 @@
-#include "memreader_plus.h"
+#include "common.h"
 
 #define MEMREADER_API_VERSION 1.2f
 

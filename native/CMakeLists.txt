@@ -13,8 +13,8 @@ add_custom_command(
 add_custom_target(game_import_lib DEPENDS "${GAME_IMPORT_LIB}")
 
 add_library(memreader_plus SHARED
-	src/memreader_plus.h
-	src/library.c
+	src/common.h
+	src/main.c
 	src/value.c
 	src/memory.c
 	src/process.c)
