@@ -3,3 +3,5 @@
 .vs/
 .vscode/
 .luarc.json
+__pycache__/
+.ruff_cache/
