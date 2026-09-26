@@ -8,8 +8,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(GAME_IMPORT_LIB "${PROJECT_BINARY_DIR}/warhammer3.lib")
 add_custom_command(
 	OUTPUT "${GAME_IMPORT_LIB}"
-	COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${PROJECT_SOURCE_DIR}/warhammer3.def" "/out:${GAME_IMPORT_LIB}"
-	DEPENDS "${PROJECT_SOURCE_DIR}/warhammer3.def")
+	COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${PROJECT_SOURCE_DIR}/src/warhammer3.def" "/out:${GAME_IMPORT_LIB}"
+	DEPENDS "${PROJECT_SOURCE_DIR}/src/warhammer3.def")
 add_custom_target(game_import_lib DEPENDS "${GAME_IMPORT_LIB}")
 
 add_library(memreader_plus SHARED
@@ -24,7 +24,7 @@ configure_file(src/config.h.in config.h @ONLY)
 
 target_include_directories(memreader_plus PRIVATE
 	"${PROJECT_BINARY_DIR}"
-	"${PROJECT_SOURCE_DIR}/lua-5.1")
+	"${PROJECT_SOURCE_DIR}/vendor/lua-5.1")
 target_compile_definitions(memreader_plus PRIVATE LUA_BUILD_AS_DLL)
 
 if(MSVC)
