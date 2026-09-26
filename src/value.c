@@ -312,6 +312,19 @@ static int table_size_hint(lua_State *L, int index)
 	return size < MAX_TABLE_SIZE_HINT ? (int)size : MAX_TABLE_SIZE_HINT;
 }
 
+static int l_is_null(lua_State *L)
+{
+	TypedValue *value = to_value(L, 1);
+	INT64 number = 0;
+
+	if (value)
+		number = value_to_integer(value);
+	else if (!lua_isnoneornil(L, 1) && !to_integer(L, 1, sizeof(INT_PTR), &number))
+		return luaL_typerror(L, 1, "pointer, number, bytes or nil");
+	lua_pushboolean(L, number == 0);
+	return 1;
+}
+
 static int l_createtable(lua_State *L)
 {
 	lua_createtable(L, table_size_hint(L, 1), table_size_hint(L, 2));
@@ -336,6 +349,7 @@ const luaL_Reg value_functions[] = {
 	{ "type", l_type },
 	{ "tostring", l_tostring },
 	{ "tonumber", l_tonumber },
+	{ "is_null", l_is_null },
 	{ "createtable", l_createtable },
 	{ NULL, NULL }
 };
