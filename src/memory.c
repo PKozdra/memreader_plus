@@ -1,11 +1,22 @@
 #include "common.h"
 
 enum {
-	STRING_LENGTH_OFFSET = 0,
-	STRING_DATA_OFFSET = 8,
 	STACK_BUFFER_SIZE = 1024,
-	MAX_READ_SIZE = 16 * 1024 * 1024
+	MAX_READ_SIZE = 16 * 1024 * 1024,
+	IN_PLACE_STRING_TAG = 8
 };
+
+typedef union {
+	struct {
+		INT32 length;
+		UINT32 capacity;
+		INT_PTR data;
+	} heap;
+	struct {
+		char text[15];
+		BYTE tag_and_length;
+	} in_place;
+} CaString;
 
 typedef struct {
 	UINT32 capacity;
@@ -13,7 +24,12 @@ typedef struct {
 	INT_PTR data;
 } CaVector;
 
-_Static_assert(sizeof(CaVector) == 16, "CA_STD::VECTOR is 16 bytes");
+_Static_assert(sizeof(CaString) == 16 && sizeof(CaVector) == 16, "CA::String and CA_STD::VECTOR are 16 bytes");
+
+typedef struct {
+	INT_PTR data;
+	size_t length;
+} StringView;
 
 static BOOL read_memory(INT_PTR address, void *destination, size_t size)
 {
@@ -113,25 +129,39 @@ static int l_read(lua_State *L)
 	return push_memory(L, address, read_size(L, size));
 }
 
+static StringView read_string_view(lua_State *L, INT_PTR address, size_t char_size)
+{
+	CaString string;
+	StringView view;
+
+	read_or_fail(L, address, &string, sizeof string);
+	if (string.in_place.tag_and_length >> 4 == IN_PLACE_STRING_TAG) {
+		view.data = address;
+		view.length = string.in_place.tag_and_length & 0x0F;
+		if (view.length * char_size > sizeof string.in_place.text)
+			luaL_error(L, "not a CA string");
+		return view;
+	}
+	view.data = string.heap.data;
+	view.length = string.heap.length > 0 ? (size_t)string.heap.length : 0;
+	return view;
+}
+
 static int l_read_string(lua_State *L)
 {
 	INT_PTR address = address_argument(L);
 	BOOL is_pointer = flag_argument(L, 3);
 	size_t char_size = flag_argument(L, 4) ? sizeof(WCHAR) : sizeof(char);
-	INT32 length;
-	INT_PTR data;
-	size_t size;
+	StringView view;
 
 	if (is_pointer)
 		read_or_fail(L, address, &address, sizeof address);
-	read_or_fail(L, address + STRING_LENGTH_OFFSET, &length, sizeof length);
-	if (length <= 0) {
+	view = read_string_view(L, address, char_size);
+	if (view.length == 0) {
 		lua_pushliteral(L, "");
 		return 1;
 	}
-	size = read_size(L, (lua_Number)length * char_size);
-	read_or_fail(L, address + STRING_DATA_OFFSET, &data, sizeof data);
-	return push_memory(L, data, size);
+	return push_memory(L, view.data, read_size(L, (lua_Number)view.length * char_size));
 }
 
 static int l_read_array(lua_State *L)
