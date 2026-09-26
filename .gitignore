@@ -1,0 +1,5 @@
+/build/
+/dist/
+.vs/
+.vscode/
+.luarc.json
