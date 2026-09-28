@@ -34,6 +34,7 @@ typedef struct {
 extern const luaL_Reg value_functions[];
 extern const luaL_Reg memory_functions[];
 extern const luaL_Reg process_functions[];
+extern const luaL_Reg scan_functions[];
 
 TypedValue *push_value(lua_State *L, int type, INT64 number);
 TypedValue *to_value(lua_State *L, int index);

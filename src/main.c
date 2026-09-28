@@ -8,6 +8,7 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 	luaL_register(L, NULL, value_functions);
 	luaL_register(L, NULL, memory_functions);
 	luaL_register(L, NULL, process_functions);
+	luaL_register(L, NULL, scan_functions);
 
 	push_value(L, VALUE_POINTER, (INT_PTR)GetModuleHandleA(NULL));
 	lua_setfield(L, -2, "base");

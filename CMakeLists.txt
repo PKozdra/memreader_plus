@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(memreader_plus VERSION 0.2.0 LANGUAGES C)
+project(memreader_plus VERSION 0.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -17,7 +17,8 @@ add_library(memreader_plus SHARED
 	src/main.c
 	src/value.c
 	src/memory.c
-	src/process.c)
+	src/process.c
+	src/scan.c)
 add_dependencies(memreader_plus game_import_lib)
 
 configure_file(src/config.h.in config.h @ONLY)
