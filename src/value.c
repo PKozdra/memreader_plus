@@ -7,14 +7,16 @@ enum Operation { ADD, SUBTRACT, MULTIPLY, DIVIDE };
 enum Comparison { GREATER, LESS, EQUAL };
 enum { MAX_TABLE_SIZE_HINT = 1 << 20, INTEGER_STRING_WIDTH = sizeof(INT32) };
 
-static const char *const type_names[VALUE_TYPE_COUNT] = {
-	"pointer", "uint8", "int8", "uint16", "int16", "uint32", "int32"
+const char *const value_type_names[VALUE_TYPE_COUNT] = {
+	"pointer", "uint8", "int8", "uint16", "int16", "uint32", "int32", "int64", "uint64"
 };
 static const size_t type_sizes[VALUE_TYPE_COUNT] = {
-	sizeof(INT_PTR), sizeof(UINT8), sizeof(INT8), sizeof(UINT16), sizeof(INT16), sizeof(UINT32), sizeof(INT32)
+	sizeof(INT_PTR), sizeof(UINT8), sizeof(INT8), sizeof(UINT16), sizeof(INT16), sizeof(UINT32), sizeof(INT32),
+	sizeof(INT64), sizeof(UINT64)
 };
 static const char *const operation_names[] = { "addition", "subtraction", "multiplication", "divide" };
 static const char *const comparison_symbols[] = { ">", "<", "==" };
+static const char interned_values_key = 0;
 
 _Static_assert(offsetof(TypedValue, pointer) == 8 && sizeof(TypedValue) == 16, "TypedValue must match memreader's layout");
 
@@ -23,9 +25,25 @@ size_t value_size(int type)
 	return type_sizes[type];
 }
 
-TypedValue *push_value(lua_State *L, int type, INT64 number)
+static void push_interned_values(lua_State *L)
 {
-	TypedValue *value = lua_newuserdata(L, sizeof(TypedValue));
+	lua_pushlightuserdata(L, (void *)&interned_values_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if (!lua_isnil(L, -1))
+		return;
+	lua_pop(L, 1);
+	lua_newtable(L);
+	lua_createtable(L, 0, 1);
+	lua_pushliteral(L, "v");
+	lua_setfield(L, -2, "__mode");
+	lua_setmetatable(L, -2);
+	lua_pushlightuserdata(L, (void *)&interned_values_key);
+	lua_pushvalue(L, -2);
+	lua_rawset(L, LUA_REGISTRYINDEX);
+}
+
+static void set_value(TypedValue *value, int type, INT64 number)
+{
 	memset(value, 0, sizeof *value);
 	value->type = (BYTE)type;
 	switch (type) {
@@ -36,8 +54,34 @@ TypedValue *push_value(lua_State *L, int type, INT64 number)
 	case VALUE_INT16:   value->int16 = (INT16)number; break;
 	case VALUE_UINT32:  value->uint32 = (UINT32)number; break;
 	case VALUE_INT32:   value->int32 = (INT32)number; break;
+	case VALUE_INT64:   value->int64 = number; break;
+	case VALUE_UINT64:  value->uint64 = (UINT64)number; break;
 	}
-	return value;
+}
+
+TypedValue *push_value(lua_State *L, int type, INT64 number)
+{
+	TypedValue value, *interned;
+
+	set_value(&value, type, number);
+	push_interned_values(L);
+	lua_pushlstring(L, (const char *)&value, sizeof value);
+	lua_pushvalue(L, -1);
+	lua_rawget(L, -3);
+	interned = lua_touserdata(L, -1);
+	if (interned && memcmp(interned, &value, sizeof value) == 0) {
+		lua_replace(L, -3);
+		lua_pop(L, 1);
+		return interned;
+	}
+	lua_pop(L, 1);
+	interned = lua_newuserdata(L, sizeof value);
+	memcpy(interned, &value, sizeof value);
+	lua_pushvalue(L, -1);
+	lua_insert(L, -4);
+	lua_rawset(L, -3);
+	lua_pop(L, 1);
+	return interned;
 }
 
 TypedValue *to_value(lua_State *L, int index)
@@ -63,8 +107,18 @@ INT64 value_to_integer(const TypedValue *value)
 	case VALUE_INT16:   return value->int16;
 	case VALUE_UINT32:  return value->uint32;
 	case VALUE_INT32:   return value->int32;
+	case VALUE_INT64:   return value->int64;
+	case VALUE_UINT64:  return (INT64)value->uint64;
 	}
 	return 0;
+}
+
+INT64 narrow_integer(int type, INT64 number)
+{
+	TypedValue value;
+
+	set_value(&value, type, number);
+	return value_to_integer(&value);
 }
 
 static INT64 bytes_to_integer(const char *bytes, size_t length, size_t width)
@@ -137,7 +191,7 @@ static int make_value(lua_State *L, int type)
 		lua_pushvalue(L, 1);
 		return 1;
 	}
-	return luaL_error(L, "attempt to convert %s into %s", luaL_typename(L, 1), type_names[type]);
+	return luaL_error(L, "attempt to convert %s into %s", luaL_typename(L, 1), value_type_names[type]);
 }
 
 static int l_pointer(lua_State *L) { return make_value(L, VALUE_POINTER); }
@@ -147,6 +201,8 @@ static int l_uint16(lua_State *L)  { return make_value(L, VALUE_UINT16); }
 static int l_int16(lua_State *L)   { return make_value(L, VALUE_INT16); }
 static int l_uint32(lua_State *L)  { return make_value(L, VALUE_UINT32); }
 static int l_int32(lua_State *L)   { return make_value(L, VALUE_INT32); }
+static int l_int64(lua_State *L)   { return make_value(L, VALUE_INT64); }
+static int l_uint64(lua_State *L)  { return make_value(L, VALUE_UINT64); }
 
 static int arithmetic_error(lua_State *L, int operation)
 {
@@ -217,10 +273,20 @@ static int comparison_error(lua_State *L, int comparison)
 		comparison_symbols[comparison], luaL_typename(L, 1), luaL_typename(L, 2));
 }
 
+static BOOL compare_integers(int comparison, INT64 a, INT64 b, BOOL is_unsigned)
+{
+	if (comparison == EQUAL)
+		return a == b;
+	if (is_unsigned)
+		return comparison == GREATER ? (UINT64)a > (UINT64)b : (UINT64)a < (UINT64)b;
+	return comparison == GREATER ? a > b : a < b;
+}
+
 static int compare(lua_State *L, int comparison)
 {
 	TypedValue *left = to_value(L, 1);
 	TypedValue *right_value = to_value(L, 2);
+	BOOL is_unsigned;
 	INT64 a, b;
 
 	if (!left)
@@ -231,11 +297,8 @@ static int compare(lua_State *L, int comparison)
 	else if (!to_integer(L, 2, left->type == VALUE_POINTER ? sizeof(INT_PTR) : INTEGER_STRING_WIDTH, &b))
 		return comparison_error(L, comparison);
 
-	switch (comparison) {
-	case GREATER: lua_pushboolean(L, a > b); break;
-	case LESS:    lua_pushboolean(L, a < b); break;
-	default:      lua_pushboolean(L, a == b); break;
-	}
+	is_unsigned = left->type == VALUE_UINT64 || (right_value && right_value->type == VALUE_UINT64);
+	lua_pushboolean(L, compare_integers(comparison, a, b, is_unsigned));
 	return 1;
 }
 
@@ -256,7 +319,7 @@ static int l_type(lua_State *L)
 	}
 	if (!value)
 		return luaL_error(L, "invalid type %s", luaL_typename(L, 1));
-	lua_pushstring(L, type_names[value->type]);
+	lua_pushstring(L, value_type_names[value->type]);
 	return 1;
 }
 
@@ -293,14 +356,19 @@ static int l_tostring(lua_State *L)
 		lua_pushfstring(L, "%p", (void *)value->pointer);
 		return 1;
 	}
-	sprintf_s(text, sizeof text, "%lld", value_to_integer(value));
+	sprintf_s(text, sizeof text, value->type == VALUE_UINT64 ? "%llu" : "%lld", value_to_integer(value));
 	lua_pushstring(L, text);
 	return 1;
 }
 
 static int l_tonumber(lua_State *L)
 {
-	lua_pushnumber(L, (lua_Number)to_offset(L, 1));
+	TypedValue *value = to_value(L, 1);
+
+	if (value && value->type == VALUE_UINT64)
+		lua_pushnumber(L, (lua_Number)value->uint64);
+	else
+		lua_pushnumber(L, (lua_Number)to_offset(L, 1));
 	return 1;
 }
 
@@ -317,10 +385,12 @@ static int l_is_null(lua_State *L)
 	TypedValue *value = to_value(L, 1);
 	INT64 number = 0;
 
-	if (value)
+	if (lua_type(L, 1) == LUA_TBOOLEAN && !lua_toboolean(L, 1))
+		number = 0;
+	else if (value)
 		number = value_to_integer(value);
 	else if (!lua_isnoneornil(L, 1) && !to_integer(L, 1, sizeof(INT_PTR), &number))
-		return luaL_typerror(L, 1, "pointer, number, bytes or nil");
+		return luaL_typerror(L, 1, "pointer, number, bytes, false or nil");
 	lua_pushboolean(L, number == 0);
 	return 1;
 }
@@ -339,6 +409,8 @@ const luaL_Reg value_functions[] = {
 	{ "int16", l_int16 },
 	{ "uint32", l_uint32 },
 	{ "int32", l_int32 },
+	{ "int64", l_int64 },
+	{ "uint64", l_uint64 },
 	{ "add", l_add },
 	{ "sub", l_sub },
 	{ "mult", l_mult },

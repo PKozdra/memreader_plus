@@ -76,9 +76,33 @@ static int l_ud_debug(lua_State *L)
 	return 2;
 }
 
+static int l_ticks(lua_State *L)
+{
+	LARGE_INTEGER now;
+
+	QueryPerformanceCounter(&now);
+	push_value(L, VALUE_UINT64, now.QuadPart);
+	return 1;
+}
+
+static int l_elapsed_us(lua_State *L)
+{
+	TypedValue *start = to_value(L, 1);
+	LARGE_INTEGER now, frequency;
+
+	if (!start || start->type != VALUE_UINT64)
+		return luaL_argerror(L, 1, "a value from ticks() expected");
+	QueryPerformanceCounter(&now);
+	QueryPerformanceFrequency(&frequency);
+	lua_pushnumber(L, (lua_Number)((double)(now.QuadPart - start->int64) * 1e6 / (double)frequency.QuadPart));
+	return 1;
+}
+
 const luaL_Reg process_functions[] = {
 	{ "modules", l_modules },
 	{ "ud_topointer", l_ud_topointer },
 	{ "ud_debug", l_ud_debug },
+	{ "ticks", l_ticks },
+	{ "elapsed_us", l_elapsed_us },
 	{ NULL, NULL }
 };

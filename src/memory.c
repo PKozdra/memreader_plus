@@ -1,50 +1,96 @@
+#include <string.h>
+
 #include "common.h"
 
 enum {
 	STACK_BUFFER_SIZE = 1024,
 	MAX_READ_SIZE = 16 * 1024 * 1024,
-	IN_PLACE_STRING_TAG = 8
+	IN_PLACE_STRING_TAG = 8,
+	MAX_UTF8_PER_WCHAR = 3
 };
-
-typedef union {
-	struct {
-		INT32 length;
-		UINT32 capacity;
-		INT_PTR data;
-	} heap;
-	struct {
-		char text[15];
-		BYTE tag_and_length;
-	} in_place;
-} CaString;
-
-typedef struct {
-	UINT32 capacity;
-	INT32 size;
-	INT_PTR data;
-} CaVector;
-
-_Static_assert(sizeof(CaString) == 16 && sizeof(CaVector) == 16, "CA::String and CA_STD::VECTOR are 16 bytes");
 
 typedef struct {
 	INT_PTR data;
 	size_t length;
 } StringView;
 
-static BOOL read_memory(INT_PTR address, void *destination, size_t size)
+int catch_fault(const EXCEPTION_RECORD *record, Fault *fault)
 {
-	return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)address, destination, size, NULL);
+	fault->code = record->ExceptionCode;
+	fault->address = record->NumberParameters >= 2 ? record->ExceptionInformation[1] : 0;
+	fault->instruction = record->ExceptionAddress;
+	switch (fault->code) {
+	case EXCEPTION_ACCESS_VIOLATION:
+	case STATUS_GUARD_PAGE_VIOLATION:
+	case EXCEPTION_IN_PAGE_ERROR:
+		return EXCEPTION_EXECUTE_HANDLER;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void restore_guard(ULONG_PTR address)
+{
+	MEMORY_BASIC_INFORMATION page;
+	DWORD old_protection;
+
+	if (VirtualQuery((LPCVOID)address, &page, sizeof page) && page.State == MEM_COMMIT)
+		VirtualProtect((LPVOID)address, 1, page.Protect | PAGE_GUARD, &old_protection);
+}
+
+BOOL copy_memory(void *destination, INT_PTR address, size_t size)
+{
+	Fault fault = { 0, 0, NULL };
+
+	__try {
+		memcpy(destination, (const void *)address, size);
+	} __except (catch_fault(GetExceptionInformation()->ExceptionRecord, &fault)) {
+		if (fault.code == STATUS_GUARD_PAGE_VIOLATION)
+			restore_guard(fault.address);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static BOOL copy_into_memory(INT_PTR address, const void *source, size_t size)
+{
+	Fault fault = { 0, 0, NULL };
+
+	__try {
+		memcpy((void *)address, source, size);
+	} __except (catch_fault(GetExceptionInformation()->ExceptionRecord, &fault)) {
+		if (fault.code == STATUS_GUARD_PAGE_VIOLATION)
+			restore_guard(fault.address);
+		return FALSE;
+	}
+	return TRUE;
 }
 
 static BOOL write_memory(INT_PTR address, const void *source, size_t size)
 {
-	return WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
+	return copy_into_memory(address, source, size)
+		|| WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
+}
+
+void push_read_error(lua_State *L, int result)
+{
+	switch (result) {
+	case READ_TOO_LARGE:     lua_pushfstring(L, "cannot read more than %d bytes at once", MAX_READ_SIZE); break;
+	case READ_NOT_CA_STRING: lua_pushliteral(L, "not a CA string"); break;
+	default:                 lua_pushliteral(L, "failed to read memory"); break;
+	}
+}
+
+void check_read(lua_State *L, int result)
+{
+	if (result == READ_OK)
+		return;
+	push_read_error(L, result);
+	lua_error(L);
 }
 
 static void read_or_fail(lua_State *L, INT_PTR address, void *destination, size_t size)
 {
-	if (!read_memory(address, destination, size))
-		luaL_error(L, "failed to read memory");
+	check_read(L, copy_memory(destination, address, size) ? READ_OK : READ_FAILED);
 }
 
 static INT_PTR address_argument(lua_State *L)
@@ -60,7 +106,7 @@ static BOOL flag_argument(lua_State *L, int index)
 static size_t read_size(lua_State *L, lua_Number size)
 {
 	if (size > MAX_READ_SIZE)
-		luaL_error(L, "cannot read more than %d bytes at once", MAX_READ_SIZE);
+		check_read(L, READ_TOO_LARGE);
 	return (size_t)size;
 }
 
@@ -69,20 +115,31 @@ static int push_memory(lua_State *L, INT_PTR address, size_t size)
 	char stack_buffer[STACK_BUFFER_SIZE];
 	char *buffer = size <= sizeof stack_buffer ? stack_buffer : lua_newuserdata(L, size);
 
-	read_or_fail(L, address, buffer, size);
+	if (!copy_memory(buffer, address, size))
+		return READ_FAILED;
 	lua_pushlstring(L, buffer, size);
-	return 1;
+	if (buffer != stack_buffer)
+		lua_remove(L, -2);
+	return READ_OK;
+}
+
+int push_integer(lua_State *L, INT_PTR address, int type, BOOL exact)
+{
+	TypedValue value = { (BYTE)type };
+
+	if (!copy_memory(&value.pointer, address, value_size(type)))
+		return READ_FAILED;
+	if (exact || type == VALUE_INT64 || type == VALUE_UINT64)
+		push_value(L, type, value_to_integer(&value));
+	else
+		lua_pushnumber(L, (lua_Number)value_to_integer(&value));
+	return READ_OK;
 }
 
 static int read_integer(lua_State *L, int type)
 {
-	TypedValue value = { (BYTE)type };
-
-	read_or_fail(L, address_argument(L), &value.pointer, value_size(type));
-	if (flag_argument(L, 3))
-		push_value(L, type, value_to_integer(&value));
-	else
-		lua_pushnumber(L, (lua_Number)value_to_integer(&value));
+	INT_PTR address = address_argument(L);
+	check_read(L, push_integer(L, address, type, flag_argument(L, 3)));
 	return 1;
 }
 
@@ -92,12 +149,22 @@ static int l_read_uint16(lua_State *L) { return read_integer(L, VALUE_UINT16); }
 static int l_read_int16(lua_State *L)  { return read_integer(L, VALUE_INT16); }
 static int l_read_uint32(lua_State *L) { return read_integer(L, VALUE_UINT32); }
 static int l_read_int32(lua_State *L)  { return read_integer(L, VALUE_INT32); }
+static int l_read_int64(lua_State *L)  { return read_integer(L, VALUE_INT64); }
+static int l_read_uint64(lua_State *L) { return read_integer(L, VALUE_UINT64); }
 
 static int l_read_float(lua_State *L)
 {
 	float number;
 	read_or_fail(L, address_argument(L), &number, sizeof number);
 	lua_pushnumber(L, number);
+	return 1;
+}
+
+static int l_read_double(lua_State *L)
+{
+	double number;
+	read_or_fail(L, address_argument(L), &number, sizeof number);
+	lua_pushnumber(L, (lua_Number)number);
 	return 1;
 }
 
@@ -126,25 +193,62 @@ static int l_read(lua_State *L)
 		lua_pushliteral(L, "");
 		return 1;
 	}
-	return push_memory(L, address, read_size(L, size));
+	check_read(L, push_memory(L, address, read_size(L, size)));
+	return 1;
 }
 
-static StringView read_string_view(lua_State *L, INT_PTR address, size_t char_size)
+static int string_view(INT_PTR address, size_t char_size, StringView *view)
 {
 	CaString string;
-	StringView view;
 
-	read_or_fail(L, address, &string, sizeof string);
+	if (!copy_memory(&string, address, sizeof string))
+		return READ_FAILED;
 	if (string.in_place.tag_and_length >> 4 == IN_PLACE_STRING_TAG) {
-		view.data = address;
-		view.length = string.in_place.tag_and_length & 0x0F;
-		if (view.length * char_size > sizeof string.in_place.text)
-			luaL_error(L, "not a CA string");
-		return view;
+		view->data = address;
+		view->length = string.in_place.tag_and_length & 0x0F;
+		return view->length * char_size > sizeof string.in_place.text ? READ_NOT_CA_STRING : READ_OK;
 	}
-	view.data = string.heap.data;
-	view.length = string.heap.length > 0 ? (size_t)string.heap.length : 0;
-	return view;
+	view->data = string.heap.data;
+	view->length = string.heap.length > 0 ? (size_t)string.heap.length : 0;
+	return view->length * char_size > MAX_READ_SIZE ? READ_TOO_LARGE : READ_OK;
+}
+
+int push_string(lua_State *L, INT_PTR address, size_t char_size)
+{
+	StringView view;
+	int result = string_view(address, char_size, &view);
+
+	if (result != READ_OK)
+		return result;
+	if (view.length == 0) {
+		lua_pushliteral(L, "");
+		return READ_OK;
+	}
+	return push_memory(L, view.data, view.length * char_size);
+}
+
+int push_unistring(lua_State *L, INT_PTR address)
+{
+	StringView view;
+	int result = string_view(address, sizeof(WCHAR), &view);
+	WCHAR *text;
+	char *utf8;
+	int utf8_size;
+
+	if (result != READ_OK)
+		return result;
+	if (view.length == 0) {
+		lua_pushliteral(L, "");
+		return READ_OK;
+	}
+	text = lua_newuserdata(L, view.length * (sizeof(WCHAR) + MAX_UTF8_PER_WCHAR));
+	utf8 = (char *)(text + view.length);
+	if (!copy_memory(text, view.data, view.length * sizeof(WCHAR)))
+		return READ_FAILED;
+	utf8_size = WideCharToMultiByte(CP_UTF8, 0, text, (int)view.length, utf8, (int)(view.length * MAX_UTF8_PER_WCHAR), NULL, NULL);
+	lua_pushlstring(L, utf8, (size_t)utf8_size);
+	lua_remove(L, -2);
+	return READ_OK;
 }
 
 static int l_read_string(lua_State *L)
@@ -152,36 +256,16 @@ static int l_read_string(lua_State *L)
 	INT_PTR address = address_argument(L);
 	BOOL is_pointer = flag_argument(L, 3);
 	size_t char_size = flag_argument(L, 4) ? sizeof(WCHAR) : sizeof(char);
-	StringView view;
 
 	if (is_pointer)
 		read_or_fail(L, address, &address, sizeof address);
-	view = read_string_view(L, address, char_size);
-	if (view.length == 0) {
-		lua_pushliteral(L, "");
-		return 1;
-	}
-	return push_memory(L, view.data, read_size(L, (lua_Number)view.length * char_size));
+	check_read(L, push_string(L, address, char_size));
+	return 1;
 }
 
 static int l_read_unistring(lua_State *L)
 {
-	StringView view = read_string_view(L, address_argument(L), sizeof(WCHAR));
-	size_t size = read_size(L, (lua_Number)view.length * sizeof(WCHAR));
-	WCHAR *text;
-	char *utf8;
-	int utf8_size;
-
-	if (view.length == 0) {
-		lua_pushliteral(L, "");
-		return 1;
-	}
-	text = lua_newuserdata(L, size);
-	read_or_fail(L, view.data, text, size);
-	utf8_size = WideCharToMultiByte(CP_UTF8, 0, text, (int)view.length, NULL, 0, NULL, NULL);
-	utf8 = lua_newuserdata(L, (size_t)utf8_size);
-	WideCharToMultiByte(CP_UTF8, 0, text, (int)view.length, utf8, utf8_size, NULL, NULL);
-	lua_pushlstring(L, utf8, (size_t)utf8_size);
+	check_read(L, push_unistring(L, address_argument(L)));
 	return 1;
 }
 
@@ -251,6 +335,9 @@ const luaL_Reg memory_functions[] = {
 	{ "read_int16", l_read_int16 },
 	{ "read_uint32", l_read_uint32 },
 	{ "read_int32", l_read_int32 },
+	{ "read_int64", l_read_int64 },
+	{ "read_uint64", l_read_uint64 },
+	{ "read_double", l_read_double },
 	{ "read_boolean", l_read_boolean },
 	{ "read_string", l_read_string },
 	{ "read_unistring", l_read_unistring },
