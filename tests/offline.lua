@@ -174,6 +174,49 @@ FIXED = {
 	['alloc limit'] = 'error: alloc holds at most 16777216 bytes per mode (<n> in use); memory returns at the next mode switch, so reuse buffers',
 }
 
+local SNAPSHOT = ROOT .. '/tests/api_cases.expected.tsv'
+local function read_snapshot()
+	local f = assert(io.open(SNAPSHOT, 'rb'))
+	local text = f:read('*a')
+	f:close()
+	local rows = {}
+	for line in text:gmatch('[^\n]+') do
+		local name, value = line:gsub('\r$', ''):match('^([^\t]*)\t(.*)$')
+		rows[#rows + 1] = { name = name, value = value }
+	end
+	return rows
+end
+local function write_snapshot(rows)
+	local lines = {}
+	for i, r in ipairs(rows) do
+		assert(not (r.name .. r.value):find('[\t\r\n]'), 'snapshot value with a tab or newline: ' .. r.name)
+		lines[i] = r.name .. '\t' .. r.value
+	end
+	local f = assert(io.open(SNAPSHOT, 'wb'))
+	f:write(table.concat(lines, '\n'), '\n')
+	f:close()
+end
+local function check_against_snapshot(rows)
+	local snapshot = read_snapshot()
+	local mismatches = #rows == #snapshot and 0 or 1
+	if mismatches > 0 then print('  DIFF case count: ' .. #rows .. ' vs snapshot ' .. #snapshot) end
+	for i, r in ipairs(rows) do
+		local s = snapshot[i]
+		if not s or s.name ~= r.name or s.value ~= r.value then
+			mismatches = mismatches + 1
+			print('  DIFF ' .. r.name)
+			print('       snapshot: ' .. tostring(s and s.value))
+			print('       plus:     ' .. r.value)
+		end
+	end
+	return mismatches
+end
+local function check_fixes(rows)
+	for _, r in ipairs(rows) do
+		check(r.value == FIXED[r.name], 'fixed: ' .. r.name .. ' = ' .. r.value)
+	end
+end
+
 local OURS = PACK .. '/script/_lib/mod/memreader_plus.lua'
 local THEIRS = WORKSHOP_MR .. '/script/_lib/mod/memreader.lua'
 
@@ -239,9 +282,11 @@ elseif SCENARIO == 'cpecific_first' then
 
 	local cases = dofile(ROOT .. '/tests/api_cases.lua')
 	local old, new = cases.shared(theirs), cases.shared(plus)
+	local expected_rows = {}
 	local mismatches = 0
 	for i, r in ipairs(new) do
 		local expected = CHANGED[r.name] or old[i].value
+		expected_rows[i] = { name = r.name, value = expected }
 		if r.value ~= expected then
 			mismatches = mismatches + 1
 			print('  DIFF ' .. r.name)
@@ -251,9 +296,12 @@ elseif SCENARIO == 'cpecific_first' then
 		end
 	end
 	check(mismatches == 0, #new .. ' API cases match memreader, except the listed intended changes')
-	for _, r in ipairs(cases.fixes(plus)) do
-		check(r.value == FIXED[r.name], 'fixed: ' .. r.name .. ' = ' .. r.value)
+	if os.getenv('API_SNAPSHOT') then
+		write_snapshot(expected_rows)
+		print('  wrote ' .. SNAPSHOT)
 	end
+	check(check_against_snapshot(expected_rows) == 0, 'tests/api_cases.expected.tsv is current')
+	check_fixes(cases.fixes(plus))
 	local function feed(make)
 		local p = make.add(make.base, 0x3C)
 		local header = plus.read_struct(p, 0, { offset = { 0, 'int32' }, raw = { 0, 'uint32', true } })
@@ -282,6 +330,13 @@ elseif SCENARIO == 'cpecific_first' then
 	print('  plus   -> plus: ' .. from_plus)
 	check(from_theirs == from_plus, "values made by Cpecific's DLL work in ours like our own")
 	check(not rawequal(theirs.uint32(7), plus.uint32(7)) and plus.eq(theirs.uint32(7), plus.uint32(7)), 'his values are separate objects, equal by eq')
+elseif SCENARIO == 'api_cases' then
+	run_mod(OURS)
+	local plus = _G.memreader_plus
+	local cases = dofile(ROOT .. '/tests/api_cases.lua')
+	local rows = cases.shared(plus)
+	check(check_against_snapshot(rows) == 0, #rows .. ' API cases match tests/api_cases.expected.tsv')
+	check_fixes(cases.fixes(plus))
 elseif SCENARIO == 'call_cpp_exception' then
 	io.stdout:setvbuf('no')
 	run_mod(OURS)

@@ -1,0 +1,111 @@
+version	1.2000000476837
+type(nil)	bytes:6E696C
+type(true)	bytes:626F6F6C65616E
+type(1)	bytes:666C6F6174
+type(x)	bytes:6279746573
+type({})	error: invalid type table
+tostring(nil)	bytes:6E696C
+tostring(true)	bytes:74727565
+tostring(1.5)	bytes:312E35
+tostring(bytes)	bytes:3631363230304646
+tostring(empty)	bytes:
+tostring({})	error: attempt to print table as special type
+pointer(bytes)	pointer:0000000000000010
+pointer(pointer)	true
+pointer(123)	error: attempt to convert number into pointer
+uint8(200)	uint8:200
+uint8(300)	uint8:44
+int8(-5)	int8:-5
+uint16(65535)	uint16:65535
+int16(-300)	int16:-300
+uint32(4000000000)	uint32:4000000000
+int32(-7)	int32:-7
+uint32(bytes)	uint32:67305985
+int32(bytes)	int32:-1
+uint8(bytes)	uint8:7
+uint32(true)	error: attempt to convert boolean into uint32
+add(p,16)	pointer:0000000000000020
+add(p,bytes)	pointer:0000000000000020
+add(p,uint8)	pointer:0000000000000013
+add(p,p)	error: attempt to perform addition operation on userdata and userdata
+add(p,-16)	pointer:0000000000000000
+sub(p,p2)	pointer:0000000000000008
+sub(p,4)	pointer:000000000000000C
+div(p,2)	pointer:0000000000000008
+mult(p,2)	error: attempt to perform multiplication operation on userdata and number
+add(5,6)	11
+add(5,uint32)	8
+div(7,2)	3.5
+add(5,p)	error: attempt to perform addition operation on number and userdata
+add(nil,1)	error: attempt to perform addition operation on nil and number
+sub(uint16(1),2)	uint16:65535
+add(uint8(250),10)	uint8:4
+mult(int16(300),300)	int16:24464
+div(uint32(42),6)	uint32:7
+div(uint32(42),uint8)	uint32:7
+add(int32(-5),3)	int32:-2
+div(int32(-8),2)	int32:-4
+add(uint32,bytes)	uint32:3
+eq(p,p)	true
+eq(p,bytes)	true
+eq(null,bytes)	true
+eq(p,p2)	false
+gt(p,p2)	true
+lt(p,p2)	false
+eq(p,16)	true
+lt(uint32(5),7)	true
+eq(int32(5),bytes)	true
+gt(uint32(10),uint32(3))	true
+gt(uint8(5),1)	true
+gt(int32(-1),5)	false
+eq(5,p)	error: attempt to perform == operation on number and userdata
+tonumber(uint32)	123
+tonumber(int32(5))	5
+tonumber(7.9)	7
+tonumber(bytes)	3
+tonumber(nil)	0
+tonumber(p)	0
+tonumber(uint8)	9
+tonumber(int32(-1))	-1
+createtable	bytes:7461626C65
+read_uint8	77
+read_int8	0
+read_uint16	23117
+read_int16	-28582
+read_uint32	280
+read_int32	280
+read_uint8 ud	uint8:77
+read_int16 ud	int16:23117
+read_uint32 ud	uint32:280
+read_int32 ud	int32:280
+read_float	4.5882444692256e-30
+read_pointer	pointer:0000000300905A4D
+read_boolean(1)	true
+read_boolean(0)	false
+read(16)	bytes:4D5A90000300000004000000FFFF0000
+read(0)	bytes:
+read(1023)	1023
+offset bytes	144
+offset uint32	144
+offset uint8	144
+offset pointer	23117
+read null	error: failed to read memory
+read number address	error: expected pointer argument in the form of raw string or pointer type
+read_string	bytes:68656C6C6F
+read_string isPtr	bytes:68656C6C6F
+read_string wide	bytes:68006900
+read_string empty	bytes:
+read_array	3, true
+read_array ud	int32:3
+read_array empty	0, pointer:0000000000000000
+read_rowidx	3
+write uint32	uint32:77
+write uint8	uint32:16843013
+write pointer	pointer:0000000000000010
+write offset	uint32:256
+write negative offset	uint32:256
+write read-only page	error: failed to write memory
+modules	bytes:57617268616D6D6572332E657865, true, bytes:6E756D626572, bytes:737472696E67
+type(modules entry)	bytes:7461626C65
+ud_topointer	pointer:00007FFAA86DF4E8
+ud_debug	7

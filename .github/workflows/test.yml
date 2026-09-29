@@ -1,0 +1,18 @@
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pwsh -File build.ps1
+      - run: pwsh -File tests\run.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memreader_plus
+          path: dist

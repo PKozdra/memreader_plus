@@ -10,12 +10,14 @@ $reportPrefix = 'memreader_crash_report_'
 
 $failed = @()
 $expect = [ordered]@{
-    api = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
+    api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
     call_cpp_exception = -1073740791; call_stack_overflow = -1073741571; hook = 0
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash
 }
 $reports = @{ fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none' }
 $profilePacks = Join-Path $env:TEMP 'memreader_plus_test_packs'
+$cpecificDir = [IO.Path]::GetFullPath((Join-Path $root '..\..\workshop\2789863945_twwh3-memreader'))
+$needsCpecific = @('plus_first', 'cpecific_first', 'cpecific_bigread')
 
 function New-ModFile($work) {
     $packs = New-Item -ItemType Directory (Join-Path $work 'packs')
@@ -40,6 +42,11 @@ $modNeedles = @(
 )
 
 foreach ($scenario in $expect.Keys) {
+    if ($needsCpecific -contains $scenario -and -not (Test-Path $cpecificDir)) {
+        "== $scenario"
+        "skipped: Cpecific's files not found at $cpecificDir"
+        continue
+    }
     $work = Join-Path $root "build\test_$scenario"
     if (Test-Path $work) { Remove-Item -Recurse -Force $work }
     New-Item -ItemType Directory $work | Out-Null
