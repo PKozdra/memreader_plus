@@ -77,7 +77,7 @@ foreach ($scenario in $expect.Keys) {
             }
             $stamps = if ($reports[$scenario] -eq 'started') { $before, $after } else { , $reports[$scenario] }
             $report = $written | Where-Object { $stamps -contains ($_ -replace "^$reportPrefix|\.txt$") } | Select-Object -First 1
-            if ($written.Count -ne 1 -or -not $report) { $failed += "$scenario (reports: $written, expected stamp $stamps)"; continue }
+            if ($written.Count -ne 1 -or -not $report) { Get-ChildItem $work | ForEach-Object { "$($_.Name) created $($_.CreationTimeUtc.ToString('o'))" }; $failed += "$scenario (reports: $written, expected stamp $stamps)"; continue }
             $text = Get-Content -Raw -ErrorAction SilentlyContinue (Join-Path $work $report)
             $logLine = if ($scenario -eq 'fault_report') { 'Script log of this Lua state: script_log_010203_0405.txt' } else { 'Script logging is off' }
             foreach ($needle in @('exception 0xc0000005', 'report_me', 'marker = "event-under-test"', $logLine) + $modNeedles) {
