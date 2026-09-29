@@ -263,30 +263,36 @@ void push_bits(lua_State *L, int type, UINT64 bits)
 	push_value(L, type, (INT64)bits);
 }
 
-static int l_call(lua_State *L)
+int call_with_signature(lua_State *L, INT_PTR function, const Signature *signature, int first)
 {
-	INT_PTR function = pointer_argument(L, 1);
 	UINT64 arguments[MAX_ARGUMENTS] = { 0 };
 	UINT64 result = 0, float_result = 0;
 	Fault fault = { 0, 0, NULL };
-	Signature signature;
-	int given = lua_gettop(L) - 2;
+	int given = lua_gettop(L) - first + 1;
 	int i;
 
-	parse_signature(L, luaL_checkstring(L, 2), &signature);
-	if (given != signature.count)
-		return luaL_error(L, "the signature takes %d %s, got %d", signature.count,
-			signature.count == 1 ? "argument" : "arguments", given);
-	for (i = 0; i < signature.count; i++)
-		arguments[i] = argument_bits(L, i + 3, signature.arguments[i]);
+	if (given != signature->count)
+		return luaL_error(L, "the signature takes %d %s, got %d", signature->count,
+			signature->count == 1 ? "argument" : "arguments", given);
+	for (i = 0; i < signature->count; i++)
+		arguments[i] = argument_bits(L, i + first, signature->arguments[i]);
 	if (!function)
 		return luaL_argerror(L, 1, "function address is NULL");
-	if (!guarded_call(function, arguments, signature.count, &result, &float_result, &fault))
+	if (!guarded_call(function, arguments, signature->count, &result, &float_result, &fault))
 		return crash_error(L, &fault);
-	if (signature.result == CALL_VOID)
+	if (signature->result == CALL_VOID)
 		return 0;
-	push_bits(L, signature.result, is_float_type(signature.result) ? float_result : result);
+	push_bits(L, signature->result, is_float_type(signature->result) ? float_result : result);
 	return 1;
+}
+
+static int l_call(lua_State *L)
+{
+	INT_PTR function = pointer_argument(L, 1);
+	Signature signature;
+
+	parse_signature(L, luaL_checkstring(L, 2), &signature);
+	return call_with_signature(L, function, &signature, 3);
 }
 
 static void push_allocations(lua_State *L)

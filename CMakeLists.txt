@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(memreader_plus VERSION 0.4.0 LANGUAGES C ASM_MASM)
+project(memreader_plus VERSION 0.5.0 LANGUAGES C ASM_MASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -30,6 +30,7 @@ add_library(memreader_plus SHARED
 	src/call.c
 	src/hook.c
 	src/crash.c
+	src/session.c
 	src/thunk.asm)
 add_dependencies(memreader_plus game_import_lib)
 
@@ -49,5 +50,5 @@ if(MSVC)
 		"$<$<COMPILE_LANGUAGE:ASM_MASM>:/W3;/WX>")
 	target_link_options(memreader_plus PRIVATE /MANIFEST:NO /LTCG /NOENTRY /NODEFAULTLIB /Brepro)
 	target_compile_options(minhook PRIVATE /W3 /GS /GL /Gy /Brepro)
-	target_link_libraries(memreader_plus minhook "${GAME_IMPORT_LIB}" ucrt.lib libcmt.lib libvcruntime.lib)
+	target_link_libraries(memreader_plus minhook "${GAME_IMPORT_LIB}" version.lib ucrt.lib libcmt.lib libvcruntime.lib)
 endif()

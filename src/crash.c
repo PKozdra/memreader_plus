@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "common.h"
+#include "MinHook.h"
 
 enum {
 	REPORT_SIZE = 16384,
@@ -27,8 +28,22 @@ static const char watch_key = 0;
 static const char script_log_prefix[] = "script_log_";
 static const char script_logs[] = "script_log_*.txt";
 static const char report_format[] = "memreader_crash_report_%s.txt";
+static const char game_handler_pattern[] =
+	"48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? B8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 2B E0 45 33 E4 "
+	"4C 8B F2 44 38 25 ?? ?? ?? ?? 8B D9 74 0A 48 83 C9 FF E8 ?? ?? ?? ?? CC B8 8D 00 00 C0";
+static const char game_file_format[] = "D%4d-%2d-%2d_T%2d-%2d-%2d";
+
+enum { GAME_FILE_GRACE_SECONDS = 2, TICKS_PER_SECOND = 10000000 };
+
+typedef int (*GameHandler)(DWORD code, EXCEPTION_POINTERS *info);
 
 static PVOID handler;
+static BOOL enabled = TRUE;
+static BOOL reported;
+static GameHandler game_handler;
+static FILETIME fault_time;
+static char script_log[MAX_PATH];
+static char written_path[MAX_PATH + sizeof report_format + STAMP_LENGTH];
 static lua_State *watched;
 static DWORD script_thread;
 static ULONG_PTR own_start;
@@ -120,12 +135,18 @@ static void add_location(const EXCEPTION_RECORD *record)
 static void write_report(void)
 {
 	HANDLE file = CreateFileA(report_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	const char *session;
+	size_t session_length;
 	DWORD written;
 
 	if (file == INVALID_HANDLE_VALUE)
 		return;
+	session = session_text(&session_length);
 	WriteFile(file, report, (DWORD)used, &written, NULL);
+	WriteFile(file, session, (DWORD)session_length, &written, NULL);
 	CloseHandle(file);
+	memcpy(written_path, report_path, sizeof written_path);
+	reported = TRUE;
 }
 
 static void build_report(const EXCEPTION_RECORD *record)
@@ -133,11 +154,16 @@ static void build_report(const EXCEPTION_RECORD *record)
 	SYSTEMTIME time;
 
 	GetLocalTime(&time);
+	SystemTimeToFileTime(&time, &fault_time);
 	used = 0;
 	add("memreader Plus %s: the game hit a fatal fault on the script thread.\n", MEMREADER_PLUS_VERSION);
 	add("%04d-%02d-%02d %02d:%02d:%02d, exception 0x%08lx ", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
 		time.wSecond, record->ExceptionCode);
 	add_location(record);
+	if (script_log[0])
+		add("\nScript log of this Lua state: %s", script_log);
+	else
+		add("\nScript logging is off");
 	add("\nLua stack of the script thread, innermost first:\n");
 	__try {
 		add_lua_stack(watched);
@@ -151,7 +177,7 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
 	const EXCEPTION_RECORD *record = info->ExceptionRecord;
 	ULONG_PTR address = (ULONG_PTR)record->ExceptionAddress;
 
-	if (!is_fatal(record->ExceptionCode) || !watched || GetCurrentThreadId() != script_thread || reporting ||
+	if (!enabled || !is_fatal(record->ExceptionCode) || !watched || GetCurrentThreadId() != script_thread || reporting ||
 		guarded_calls > 0 || (address >= own_start && address < own_end))
 		return EXCEPTION_CONTINUE_SEARCH;
 	reporting = TRUE;
@@ -236,22 +262,115 @@ static BOOL find_report_path(void)
 	if (!name)
 		return FALSE;
 	name++;
-	if (!script_log_stamp(name, started, stamp))
+	script_log[0] = '\0';
+	if (script_log_stamp(name, started, stamp))
+		_snprintf_s(script_log, sizeof script_log, _TRUNCATE, "%s%s.txt", script_log_prefix, stamp);
+	else
 		time_stamp(started, stamp);
 	_snprintf_s(name, sizeof report_path - (size_t)(name - report_path), _TRUNCATE, report_format, stamp);
 	return TRUE;
 }
 
+static UINT64 ticks_of(FILETIME time)
+{
+	return (UINT64)time.dwHighDateTime << 32 | time.dwLowDateTime;
+}
+
+static BOOL game_file_time(const char *name, FILETIME *time)
+{
+	SYSTEMTIME parts = { 0 };
+	int year, month, day, hour, minute, second;
+
+	if (sscanf_s(name, game_file_format, &year, &month, &day, &hour, &minute, &second) != 6)
+		return FALSE;
+	parts.wYear = (WORD)year;
+	parts.wMonth = (WORD)month;
+	parts.wDay = (WORD)day;
+	parts.wHour = (WORD)hour;
+	parts.wMinute = (WORD)minute;
+	parts.wSecond = (WORD)second;
+	return SystemTimeToFileTime(&parts, time);
+}
+
+static void note_game_files(void)
+{
+	char pattern[MAX_PATH + 8], names[1024] = "", line[1200];
+	WIN32_FIND_DATAA found;
+	FILETIME written;
+	HANDLE search, file;
+	DWORD length;
+
+	_snprintf_s(pattern, sizeof pattern, _TRUNCATE, "%s\\D*.*", game_crash_folder());
+	search = FindFirstFileA(pattern, &found);
+	if (search != INVALID_HANDLE_VALUE) {
+		do {
+			if (game_file_time(found.cFileName, &written) &&
+				ticks_of(written) + (UINT64)GAME_FILE_GRACE_SECONDS * TICKS_PER_SECOND >= ticks_of(fault_time)) {
+				strncat_s(names, sizeof names, " ", _TRUNCATE);
+				strncat_s(names, sizeof names, found.cFileName, _TRUNCATE);
+			}
+		} while (FindNextFileA(search, &found));
+		FindClose(search);
+	}
+	if (names[0])
+		_snprintf_s(line, sizeof line, _TRUNCATE, "The game's own crash files for this crash, in the game crash folder:%s\n", names);
+	else
+		_snprintf_s(line, sizeof line, _TRUNCATE, "The game wrote no crash files for this crash (it skips them when a debugger is attached)\n");
+	file = CreateFileA(written_path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return;
+	WriteFile(file, line, (DWORD)strlen(line), &length, NULL);
+	CloseHandle(file);
+}
+
+static int after_game_handler(DWORD code, EXCEPTION_POINTERS *info)
+{
+	int result = game_handler(code, info);
+
+	if (reported) {
+		note_game_files();
+		reported = FALSE;
+	}
+	return result;
+}
+
+static void hook_game_handler(void)
+{
+	int count;
+	const BYTE *target = find_code(game_handler_pattern, &count);
+
+	if (count != 1 || MH_CreateHook((LPVOID)target, (LPVOID)after_game_handler, (LPVOID *)&game_handler) != MH_OK)
+		return;
+	if (MH_EnableHook((LPVOID)target) != MH_OK)
+		MH_RemoveHook((LPVOID)target);
+}
+
+static int l_set_crash_reports(lua_State *L)
+{
+	luaL_checktype(L, 1, LUA_TBOOLEAN);
+	lua_pushboolean(L, enabled);
+	enabled = lua_toboolean(L, 1);
+	return 1;
+}
+
+const luaL_Reg crash_functions[] = {
+	{ "set_crash_reports", l_set_crash_reports },
+	{ NULL, NULL }
+};
+
 void watch_crashes(lua_State *L)
 {
+	if (!find_report_path())
+		return;
 	if (!handler) {
+		describe_session();
+		hook_game_handler();
 		const IMAGE_NT_HEADERS *headers = (const IMAGE_NT_HEADERS *)((ULONG_PTR)&__ImageBase + __ImageBase.e_lfanew);
 		HMODULE module;
 
 		own_start = (ULONG_PTR)&__ImageBase;
 		own_end = own_start + headers->OptionalHeader.SizeOfImage;
-		if (!find_report_path() ||
-			!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(void *)on_exception, &module))
+		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(void *)on_exception, &module))
 			return;
 		handler = AddVectoredExceptionHandler(1, on_exception);
 	}

@@ -5,16 +5,23 @@
 #include "MinHook.h"
 #include "buffer.h"
 
-enum { MAX_HOOKS = 64, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8 };
+enum { MAX_HOOKS = 1000, MAX_CALLBACKS = 16, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8 };
+
+typedef struct {
+	lua_State *state;
+	int thread;
+	int function;
+} Callback;
 
 typedef struct {
 	INT_PTR target;
 	void *original;
 	Signature signature;
-	lua_State *state;
-	int thread;
-	int callback;
+	Callback callbacks[MAX_CALLBACKS];
+	int callback_count;
+	int running;
 	UINT32 calls;
+	BYTE saved[SAVED_BYTES];
 	char error[MAX_ERROR_LENGTH + 1];
 } Hook;
 
@@ -40,9 +47,11 @@ typedef struct {
 } HookStub;
 #pragma pack(pop)
 
-typedef struct {
+typedef struct HookCall {
 	Hook *hook;
 	HookFrame *frame;
+	int level;
+	struct HookCall *outer;
 } HookCall;
 
 static const BYTE MOV_RAX[2] = { 0x48, 0xB8 };
@@ -55,6 +64,8 @@ static HookStub *stubs;
 static LPVOID memory_near_game;
 static DWORD script_thread;
 static int callback_depth;
+static int runner = LUA_NOREF;
+static HookCall *innermost;
 
 void hook_entry(void);
 
@@ -67,6 +78,15 @@ static Hook *find_hook(INT_PTR target)
 			return &hooks[i];
 	}
 	return NULL;
+}
+
+BOOL saved_code(int index, SavedCode *code)
+{
+	if (index >= hook_count)
+		return FALSE;
+	code->start = hooks[index].target - SAVED_BYTES / 2;
+	code->bytes = hooks[index].saved;
+	return TRUE;
 }
 
 static BOOL is_read_only_code(INT_PTR address)
@@ -133,7 +153,8 @@ static Hook *install_hook(lua_State *L, INT_PTR target)
 		luaL_error(L, "cannot start hooking");
 	hook = &hooks[hook_count];
 	hook->target = target;
-	hook->callback = LUA_NOREF;
+	hook->callback_count = 0;
+	copy_memory(hook->saved, target - SAVED_BYTES / 2, SAVED_BYTES);
 	status = MH_CreateHook((LPVOID)target, &stubs[hook_count], &hook->original);
 	if (status == MH_OK) {
 		status = MH_EnableHook((LPVOID)target);
@@ -148,43 +169,91 @@ static Hook *install_hook(lua_State *L, INT_PTR target)
 	return hook;
 }
 
-static int forget_callbacks(lua_State *L)
+static BOOL is_attached(const Callback *callback)
+{
+	return callback->function != LUA_NOREF;
+}
+
+static int attached_count(const Hook *hook)
+{
+	int i, count = 0;
+
+	for (i = 0; i < hook->callback_count; i++)
+		count += is_attached(&hook->callbacks[i]);
+	return count;
+}
+
+static int next_runnable(const Hook *hook, int below)
 {
 	int i;
 
+	for (i = below - 1; i >= 0; i--) {
+		if (is_attached(&hook->callbacks[i]) && lua_status(hook->callbacks[i].state) == 0)
+			return i;
+	}
+	return -1;
+}
+
+static void compact(Hook *hook)
+{
+	int i, kept = 0;
+
+	if (hook->running)
+		return;
+	for (i = 0; i < hook->callback_count; i++) {
+		if (is_attached(&hook->callbacks[i]))
+			hook->callbacks[kept++] = hook->callbacks[i];
+	}
+	hook->callback_count = kept;
+}
+
+static void detach(Hook *hook, int index)
+{
+	Callback *callback = &hook->callbacks[index];
+
+	luaL_unref(callback->state, LUA_REGISTRYINDEX, callback->function);
+	luaL_unref(callback->state, LUA_REGISTRYINDEX, callback->thread);
+	callback->function = LUA_NOREF;
+	callback->state = NULL;
+}
+
+static int find_callback(lua_State *L, const Hook *hook, int index)
+{
+	int i;
+	BOOL same;
+
+	for (i = 0; i < hook->callback_count; i++) {
+		if (!is_attached(&hook->callbacks[i]))
+			continue;
+		lua_rawgeti(L, LUA_REGISTRYINDEX, hook->callbacks[i].function);
+		same = lua_rawequal(L, -1, index);
+		lua_pop(L, 1);
+		if (same)
+			return i;
+	}
+	return -1;
+}
+
+static BOOL same_signature(const Signature *a, const Signature *b)
+{
+	return a->result == b->result && a->count == b->count &&
+		memcmp(a->arguments, b->arguments, sizeof a->arguments[0] * (size_t)a->count) == 0;
+}
+
+static int forget_callbacks(lua_State *L)
+{
+	int i, j;
+
 	(void)L;
 	for (i = 0; i < hook_count; i++) {
-		hooks[i].callback = LUA_NOREF;
-		hooks[i].state = NULL;
+		for (j = 0; j < hooks[i].callback_count; j++) {
+			hooks[i].callbacks[j].function = LUA_NOREF;
+			hooks[i].callbacks[j].state = NULL;
+		}
+		hooks[i].callback_count = 0;
 	}
+	runner = LUA_NOREF;
 	return 0;
-}
-
-static void watch_state_close(lua_State *L)
-{
-	lua_pushlightuserdata(L, (void *)&state_watch_key);
-	lua_rawget(L, LUA_REGISTRYINDEX);
-	if (!lua_isnil(L, -1)) {
-		lua_pop(L, 1);
-		return;
-	}
-	lua_pop(L, 1);
-	lua_pushlightuserdata(L, (void *)&state_watch_key);
-	lua_newuserdata(L, 1);
-	lua_createtable(L, 0, 1);
-	lua_pushcfunction(L, forget_callbacks);
-	lua_setfield(L, -2, "__gc");
-	lua_setmetatable(L, -2);
-	lua_rawset(L, LUA_REGISTRYINDEX);
-	script_thread = GetCurrentThreadId();
-}
-
-static void detach(Hook *hook)
-{
-	luaL_unref(hook->state, LUA_REGISTRYINDEX, hook->callback);
-	luaL_unref(hook->state, LUA_REGISTRYINDEX, hook->thread);
-	hook->callback = LUA_NOREF;
-	hook->state = NULL;
 }
 
 static UINT64 argument_slot(const HookFrame *frame, int index, int type)
@@ -217,7 +286,7 @@ static int dispatch(lua_State *L)
 	int i;
 
 	luaL_checkstack(L, MAX_ARGUMENTS + EXTRA_STACK_SLOTS, "hook arguments");
-	lua_rawgeti(L, LUA_REGISTRYINDEX, call->hook->callback);
+	lua_rawgeti(L, LUA_REGISTRYINDEX, call->hook->callbacks[call->level].function);
 	for (i = 0; i < signature->count; i++)
 		push_bits(L, signature->arguments[i], argument_slot(call->frame, i, signature->arguments[i]));
 	lua_call(L, signature->count, 1);
@@ -225,10 +294,31 @@ static int dispatch(lua_State *L)
 	return 0;
 }
 
-static void keep_error(Hook *hook)
+static void watch_state_close(lua_State *L)
+{
+	lua_pushlightuserdata(L, (void *)&state_watch_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if (!lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		return;
+	}
+	lua_pop(L, 1);
+	lua_pushlightuserdata(L, (void *)&state_watch_key);
+	lua_newuserdata(L, 1);
+	lua_createtable(L, 0, 1);
+	lua_pushcfunction(L, forget_callbacks);
+	lua_setfield(L, -2, "__gc");
+	lua_setmetatable(L, -2);
+	lua_rawset(L, LUA_REGISTRYINDEX);
+	lua_pushcfunction(L, dispatch);
+	runner = luaL_ref(L, LUA_REGISTRYINDEX);
+	script_thread = GetCurrentThreadId();
+}
+
+static void keep_error(Hook *hook, lua_State *L)
 {
 	size_t length;
-	const char *message = lua_tolstring(hook->state, -1, &length);
+	const char *message = lua_tolstring(L, -1, &length);
 
 	if (!message) {
 		message = "the callback raised an error that is not a string";
@@ -238,35 +328,116 @@ static void keep_error(Hook *hook)
 		length = MAX_ERROR_LENGTH;
 	memcpy(hook->error, message, length);
 	hook->error[length] = '\0';
-	lua_pop(hook->state, 1);
+	lua_pop(L, 1);
+}
+
+static BOOL run_callbacks(HookCall *call)
+{
+	Hook *hook = call->hook;
+	lua_State *L;
+
+	while ((call->level = next_runnable(hook, call->level)) >= 0) {
+		L = hook->callbacks[call->level].state;
+		if (!lua_checkstack(L, 2))
+			return FALSE;
+		lua_rawgeti(L, LUA_REGISTRYINDEX, runner);
+		lua_pushlightuserdata(L, call);
+		if (lua_pcall(L, 1, 0, 0) == 0)
+			return TRUE;
+		keep_error(hook, L);
+		detach(hook, call->level);
+	}
+	return FALSE;
 }
 
 BOOL run_hook(Hook *hook, HookFrame *frame)
 {
-	HookCall call = { hook, frame };
-	int failed;
+	HookCall call = { hook, frame, hook->callback_count, innermost };
+	BOOL done;
 
 	frame->original = hook->original;
-	if (GetCurrentThreadId() != script_thread || hook->callback == LUA_NOREF || lua_status(hook->state) != 0)
+	if (GetCurrentThreadId() != script_thread || runner == LUA_NOREF || next_runnable(hook, call.level) < 0)
 		return FALSE;
 	hook->calls++;
+	hook->running++;
 	callback_depth++;
+	innermost = &call;
 	__try {
-		failed = lua_cpcall(hook->state, dispatch, &call);
+		done = run_callbacks(&call);
 	} __finally {
+		innermost = call.outer;
 		callback_depth--;
+		hook->running--;
+		compact(hook);
 	}
-	if (!failed)
-		return TRUE;
-	keep_error(hook);
-	detach(hook);
-	return FALSE;
+	return done;
+}
+
+static HookCall *find_call(INT_PTR target)
+{
+	HookCall *call;
+
+	for (call = innermost; call; call = call->outer) {
+		if (call->hook->target == target)
+			return call;
+	}
+	return NULL;
+}
+
+static int call_next(lua_State *L, HookCall *call, int arguments)
+{
+	Hook *hook = call->hook;
+	int result = hook->signature.result;
+	int i, failed;
+
+	luaL_checkstack(L, arguments + EXTRA_STACK_SLOTS, "hook_next arguments");
+	lua_rawgeti(L, LUA_REGISTRYINDEX, hook->callbacks[call->level].function);
+	for (i = 0; i < arguments; i++)
+		lua_pushvalue(L, i + 2);
+	callback_depth++;
+	failed = lua_pcall(L, arguments, 1, 0);
+	callback_depth--;
+	if (!failed && result != CALL_VOID && lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		lua_pushfstring(L, "the callback returned nothing, expected %s", call_type_name(result));
+		failed = 1;
+	}
+	if (failed) {
+		keep_error(hook, L);
+		detach(hook, call->level);
+		return -1;
+	}
+	if (result != CALL_VOID)
+		return 1;
+	lua_pop(L, 1);
+	return 0;
+}
+
+static int l_hook_next(lua_State *L)
+{
+	HookCall *call = find_call(pointer_argument(L, 1));
+	int arguments = lua_gettop(L) - 1;
+	int level, results;
+
+	if (!call)
+		return luaL_error(L, "hook_next works only inside a callback of this address");
+	level = call->level;
+	while ((call->level = next_runnable(call->hook, call->level)) >= 0) {
+		results = call_next(L, call, arguments);
+		if (results >= 0) {
+			call->level = level;
+			return results;
+		}
+	}
+	call->level = level;
+	return call_with_signature(L, (INT_PTR)call->hook->original, &call->hook->signature, 2);
 }
 
 static int l_hook(lua_State *L)
 {
 	INT_PTR target = pointer_argument(L, 1);
 	Signature signature;
+	Callback *callback;
 	Hook *hook;
 
 	parse_signature(L, luaL_checkstring(L, 2), &signature);
@@ -274,44 +445,68 @@ static int l_hook(lua_State *L)
 	if (!target)
 		return luaL_argerror(L, 1, "address is NULL");
 	hook = find_hook(target);
-	if (hook && hook->callback != LUA_NOREF)
-		return luaL_error(L, "%p is already hooked in this mode; unhook it first", (void *)target);
+	if (hook && attached_count(hook) > 0) {
+		if (!same_signature(&hook->signature, &signature))
+			return luaL_error(L, "%p is already hooked in this mode with a different signature", (void *)target);
+		if (find_callback(L, hook, 3) >= 0)
+			return luaL_error(L, "this callback is already attached to %p", (void *)target);
+	}
 	if (!hook)
 		hook = install_hook(L, target);
+	compact(hook);
+	if (hook->callback_count == MAX_CALLBACKS)
+		return luaL_error(L, "at most %d callbacks per address", MAX_CALLBACKS);
 	watch_state_close(L);
-	hook->signature = signature;
-	hook->calls = 0;
-	hook->error[0] = '\0';
-	hook->state = L;
+	if (attached_count(hook) == 0) {
+		hook->signature = signature;
+		hook->calls = 0;
+		hook->error[0] = '\0';
+	}
+	callback = &hook->callbacks[hook->callback_count++];
+	callback->state = L;
 	lua_pushthread(L);
-	hook->thread = luaL_ref(L, LUA_REGISTRYINDEX);
+	callback->thread = luaL_ref(L, LUA_REGISTRYINDEX);
 	lua_pushvalue(L, 3);
-	hook->callback = luaL_ref(L, LUA_REGISTRYINDEX);
+	callback->function = luaL_ref(L, LUA_REGISTRYINDEX);
 	return 0;
 }
 
 static int l_unhook(lua_State *L)
 {
 	Hook *hook = find_hook(pointer_argument(L, 1));
+	int i;
 
-	if (hook && hook->callback != LUA_NOREF)
-		detach(hook);
+	if (!hook)
+		return 0;
+	if (lua_isnoneornil(L, 2)) {
+		for (i = 0; i < hook->callback_count; i++) {
+			if (is_attached(&hook->callbacks[i]))
+				detach(hook, i);
+		}
+	} else if ((i = find_callback(L, hook, 2)) >= 0) {
+		detach(hook, i);
+	}
+	compact(hook);
 	return 0;
 }
 
 static int l_hook_info(lua_State *L)
 {
 	Hook *hook = find_hook(pointer_argument(L, 1));
+	int attached;
 
 	if (!hook) {
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_createtable(L, 0, 4);
+	attached = attached_count(hook);
+	lua_createtable(L, 0, 5);
 	push_value(L, VALUE_POINTER, (INT_PTR)hook->original);
 	lua_setfield(L, -2, "original");
-	lua_pushboolean(L, hook->callback != LUA_NOREF);
+	lua_pushboolean(L, attached > 0);
 	lua_setfield(L, -2, "attached");
+	lua_pushnumber(L, attached);
+	lua_setfield(L, -2, "callbacks");
 	lua_pushnumber(L, (lua_Number)hook->calls);
 	lua_setfield(L, -2, "calls");
 	if (hook->error[0]) {
@@ -330,6 +525,7 @@ static int l_hook_depth(lua_State *L)
 const luaL_Reg hook_functions[] = {
 	{ "hook", l_hook },
 	{ "unhook", l_unhook },
+	{ "hook_next", l_hook_next },
 	{ "hook_info", l_hook_info },
 	{ "hook_depth", l_hook_depth },
 	{ NULL, NULL }

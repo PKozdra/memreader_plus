@@ -213,6 +213,31 @@ static int string_view(INT_PTR address, size_t char_size, StringView *view)
 	return view->length * char_size > MAX_READ_SIZE ? READ_TOO_LARGE : READ_OK;
 }
 
+BOOL read_ca_text(INT_PTR address, BOOL wide, char *out, size_t size)
+{
+	WCHAR units[MAX_PATH];
+	StringView view;
+	size_t length;
+	int written;
+
+	out[0] = '\0';
+	if (string_view(address, wide ? sizeof(WCHAR) : sizeof(char), &view) != READ_OK)
+		return FALSE;
+	if (!wide) {
+		length = view.length < size - 1 ? view.length : size - 1;
+		if (length && !copy_memory(out, view.data, length))
+			return FALSE;
+		out[length] = '\0';
+		return TRUE;
+	}
+	length = view.length < MAX_PATH ? view.length : MAX_PATH;
+	if (length && !copy_memory(units, view.data, length * sizeof(WCHAR)))
+		return FALSE;
+	written = WideCharToMultiByte(CP_UTF8, 0, units, (int)length, out, (int)size - 1, NULL, NULL);
+	out[written > 0 ? written : 0] = '\0';
+	return TRUE;
+}
+
 int push_string(lua_State *L, INT_PTR address, size_t char_size)
 {
 	StringView view;

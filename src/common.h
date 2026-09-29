@@ -26,6 +26,8 @@ enum { MAX_ARGUMENTS = 16, REGISTER_ARGUMENTS = 4 };
 
 enum ReadResult { READ_OK, READ_FAILED, READ_TOO_LARGE, READ_NOT_CA_STRING };
 
+enum { SAVED_BYTES = 16 };
+
 typedef struct {
 	BYTE type;
 	union {
@@ -83,6 +85,11 @@ typedef struct {
 	int count;
 } Signature;
 
+typedef struct {
+	INT_PTR start;
+	const BYTE *bytes;
+} SavedCode;
+
 _Static_assert(sizeof(CaString) == 16 && sizeof(CaVector) == 16, "CA::String and CA_STD::VECTOR are 16 bytes");
 _Static_assert(sizeof(CaList) == 0x18 && sizeof(CaListNode) == 0x10, "CA_STD::LIST is 0x18 bytes, a node header 0x10");
 
@@ -95,6 +102,7 @@ extern const luaL_Reg scan_functions[];
 extern const luaL_Reg layout_functions[];
 extern const luaL_Reg call_functions[];
 extern const luaL_Reg hook_functions[];
+extern const luaL_Reg crash_functions[];
 
 TypedValue *push_value(lua_State *L, int type, INT64 number);
 TypedValue *to_value(lua_State *L, int index);
@@ -117,6 +125,13 @@ void check_read(lua_State *L, int result);
 
 const char *call_type_name(int type);
 void parse_signature(lua_State *L, const char *text, Signature *signature);
+int call_with_signature(lua_State *L, INT_PTR function, const Signature *signature, int first);
+BOOL saved_code(int index, SavedCode *code);
+const BYTE *find_code(const char *pattern, int *count);
+BOOL read_ca_text(INT_PTR address, BOOL wide, char *out, size_t size);
+void describe_session(void);
+const char *session_text(size_t *length);
+const char *game_crash_folder(void);
 INT_PTR pointer_argument(lua_State *L, int index);
 UINT64 argument_bits(lua_State *L, int index, int type);
 BOOL is_float_type(int type);

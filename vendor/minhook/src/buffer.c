@@ -30,7 +30,7 @@
 #include "buffer.h"
 
 // Size of each memory block. (= page size of VirtualAlloc)
-#define MEMORY_BLOCK_SIZE 0x1000
+#define MEMORY_BLOCK_SIZE 0x10000
 
 // Max range for seeking a memory block. (= 1024MB)
 #define MAX_MEMORY_RANGE 0x40000000
