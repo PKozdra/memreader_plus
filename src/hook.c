@@ -51,6 +51,7 @@ typedef struct HookCall {
 	Hook *hook;
 	HookFrame *frame;
 	int level;
+	int passed_down;
 	struct HookCall *outer;
 } HookCall;
 
@@ -66,6 +67,8 @@ static DWORD script_thread;
 static int callback_depth;
 static int runner = LUA_NOREF;
 static HookCall *innermost;
+static INT_PTR handler_target;
+static BYTE handler_saved[SAVED_BYTES];
 
 void hook_entry(void);
 
@@ -80,8 +83,22 @@ static Hook *find_hook(INT_PTR target)
 	return NULL;
 }
 
+void save_handler_code(INT_PTR target)
+{
+	if (copy_memory(handler_saved, target - SAVED_BYTES / 2, SAVED_BYTES))
+		handler_target = target;
+}
+
 BOOL saved_code(int index, SavedCode *code)
 {
+	if (handler_target) {
+		if (index == 0) {
+			code->start = handler_target - SAVED_BYTES / 2;
+			code->bytes = handler_saved;
+			return TRUE;
+		}
+		index--;
+	}
 	if (index >= hook_count)
 		return FALSE;
 	code->start = hooks[index].target - SAVED_BYTES / 2;
@@ -211,6 +228,8 @@ static void detach(Hook *hook, int index)
 {
 	Callback *callback = &hook->callbacks[index];
 
+	if (!is_attached(callback))
+		return;
 	luaL_unref(callback->state, LUA_REGISTRYINDEX, callback->function);
 	luaL_unref(callback->state, LUA_REGISTRYINDEX, callback->thread);
 	callback->function = LUA_NOREF;
@@ -263,20 +282,22 @@ static UINT64 argument_slot(const HookFrame *frame, int index, int type)
 	return is_float_type(type) ? frame->floats[index] : frame->registers[index];
 }
 
+static void set_result(HookFrame *frame, int type, UINT64 bits)
+{
+	if (is_float_type(type))
+		frame->float_result = bits;
+	else
+		frame->result = bits;
+}
+
 static void store_result(lua_State *L, int type, HookFrame *frame)
 {
-	UINT64 bits;
-
 	if (type == CALL_VOID)
 		return;
 	if (lua_isnil(L, -1))
 		luaL_error(L, "the callback returned nothing, expected %s", call_type_name(type));
 	lua_replace(L, 1);
-	bits = argument_bits(L, 1, type);
-	if (is_float_type(type))
-		frame->float_result = bits;
-	else
-		frame->result = bits;
+	set_result(frame, type, argument_bits(L, 1, type));
 }
 
 static int dispatch(lua_State *L)
@@ -346,25 +367,32 @@ static BOOL run_callbacks(HookCall *call)
 			return TRUE;
 		keep_error(hook, L);
 		detach(hook, call->level);
+		if (call->passed_down == call->level)
+			return TRUE;
 	}
 	return FALSE;
 }
 
 BOOL run_hook(Hook *hook, HookFrame *frame)
 {
-	HookCall call = { hook, frame, hook->callback_count, innermost };
+	HookCall call = { hook, frame, hook->callback_count, -1, innermost };
+	LONG paused;
 	BOOL done;
 
 	frame->original = hook->original;
 	if (GetCurrentThreadId() != script_thread || runner == LUA_NOREF || next_runnable(hook, call.level) < 0)
 		return FALSE;
+	frame->result = 0;
+	frame->float_result = 0;
 	hook->calls++;
 	hook->running++;
 	callback_depth++;
 	innermost = &call;
+	paused = pause_guarded_calls();
 	__try {
 		done = run_callbacks(&call);
 	} __finally {
+		resume_guarded_calls(paused);
 		innermost = call.outer;
 		callback_depth--;
 		hook->running--;
@@ -413,24 +441,67 @@ static int call_next(lua_State *L, HookCall *call, int arguments)
 	return 0;
 }
 
+static int store_next_result(lua_State *L)
+{
+	HookCall *call = lua_touserdata(L, 1);
+	int type = call->hook->signature.result;
+
+	set_result(call->frame, type, argument_bits(L, 2, type));
+	return 0;
+}
+
+static void keep_callback_result(lua_State *L, HookCall *call, int results)
+{
+	if (results == 0 || !lua_checkstack(L, 3))
+		return;
+	lua_pushcfunction(L, store_next_result);
+	lua_pushlightuserdata(L, call);
+	lua_pushvalue(L, -3);
+	if (lua_pcall(L, 2, 0, 0))
+		lua_pop(L, 1);
+}
+
+static int push_kept_result(lua_State *L, const HookCall *call)
+{
+	int type = call->hook->signature.result;
+
+	if (type == CALL_VOID)
+		return 0;
+	push_bits(L, type, is_float_type(type) ? call->frame->float_result : call->frame->result);
+	return 1;
+}
+
+static int passed_down(HookCall *call, int level, int results)
+{
+	call->level = level;
+	call->passed_down = level;
+	return results;
+}
+
 static int l_hook_next(lua_State *L)
 {
 	HookCall *call = find_call(pointer_argument(L, 1));
 	int arguments = lua_gettop(L) - 1;
-	int level, results;
+	int type, level, results;
 
 	if (!call)
 		return luaL_error(L, "hook_next works only inside a callback of this address");
+	type = call->hook->signature.result;
 	level = call->level;
 	while ((call->level = next_runnable(call->hook, call->level)) >= 0) {
 		results = call_next(L, call, arguments);
 		if (results >= 0) {
-			call->level = level;
-			return results;
+			keep_callback_result(L, call, results);
+			return passed_down(call, level, results);
 		}
+		if (call->passed_down == call->level)
+			return passed_down(call, level, push_kept_result(L, call));
 	}
 	call->level = level;
-	return call_with_signature(L, (INT_PTR)call->hook->original, &call->hook->signature, 2);
+	results = call_with_signature(L, (INT_PTR)call->hook->original, &call->hook->signature, 2);
+	if (results > 0)
+		set_result(call->frame, type, argument_bits(L, -1, type));
+	return passed_down(call, level, results);
 }
 
 static int l_hook(lua_State *L)
@@ -445,7 +516,7 @@ static int l_hook(lua_State *L)
 	if (!target)
 		return luaL_argerror(L, 1, "address is NULL");
 	hook = find_hook(target);
-	if (hook && attached_count(hook) > 0) {
+	if (hook && (attached_count(hook) > 0 || hook->running > 0)) {
 		if (!same_signature(&hook->signature, &signature))
 			return luaL_error(L, "%p is already hooked in this mode with a different signature", (void *)target);
 		if (find_callback(L, hook, 3) >= 0)
@@ -454,6 +525,8 @@ static int l_hook(lua_State *L)
 	if (!hook)
 		hook = install_hook(L, target);
 	compact(hook);
+	if (hook->callback_count == MAX_CALLBACKS && attached_count(hook) < MAX_CALLBACKS)
+		return luaL_error(L, "unhooked callbacks keep their place until the running call returns; at most %d per address", MAX_CALLBACKS);
 	if (hook->callback_count == MAX_CALLBACKS)
 		return luaL_error(L, "at most %d callbacks per address", MAX_CALLBACKS);
 	watch_state_close(L);

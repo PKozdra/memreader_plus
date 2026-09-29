@@ -97,6 +97,10 @@ FIXED = {
 	['read of a guard page'] = 'false, false, true',
 	['read_int64/uint64/double'] = 'int64:-2, uint64:18446744073709551615, 2.5, true',
 	['int64/uint64 constructors'] = 'int64:-5, uint64:18446744073709551615, bytes:696E743634',
+	['div(uint64 max,2)'] = 'uint64:9223372036854775807',
+	['div(int64,uint64 max)'] = 'int64:0',
+	['add(float,uint64 max)'] = 'true',
+	['64-bit values and 8 bytes'] = 'true, int64:4294967296',
 	['exact values are shared'] = 'true, bytes:686974, true, true',
 	['shared value after a write into it'] = 'uint32:4242, false',
 	['is_null(false)'] = 'true',
@@ -111,6 +115,7 @@ FIXED = {
 	['read_list broken link'] = 'error: [2]: broken list link',
 	['read_list wrong size'] = 'error: list shorter than its size',
 	['read_struct self-reference'] = 'false, true',
+	['read_struct struct budget'] = 'false, true',
 	['read_struct error path'] = 'error: items[1]: failed to read memory',
 	['read_struct unknown type'] = "error: a: unknown field type 'uint33'",
 	['read_struct bad third value'] = "error: a: 'string' takes no third value",
@@ -169,9 +174,15 @@ FIXED = {
 	['call empty signature'] = "error: bad argument #2 to 'call' (expected a type, found the end)",
 	['call missing comma'] = "error: bad argument #2 to 'call' (expected ',' or ')', found 'uint64)')",
 	['call one argument missing'] = 'error: the signature takes 1 argument, got 0',
+	['hook unhook then error'] = 'int32:12, false',
+	['hook signature while running'] = 'int32:7, false, true',
+	['hook_next then error'] = 'int32:12, 1',
+	['void hook_next then error'] = '101',
+	['hook limit while running'] = 'true',
 	['alloc'] = 'true, true, true',
 	['alloc size'] = "error: bad argument #1 to 'alloc' (size must be from 1 to 16777216 bytes)",
 	['alloc limit'] = 'error: alloc holds at most 16777216 bytes per mode (<n> in use); memory returns at the next mode switch, so reuse buffers',
+	['alloc limit is exact'] = 'false',
 }
 
 local SNAPSHOT = ROOT .. '/tests/api_cases.expected.tsv'
@@ -525,13 +536,13 @@ elseif SCENARIO == 'hook' then
 			mr.hook(...)
 		end
 		local refused = {
-			[run(hook, nil, TARGET, hooked)] = "error: bad argument #1 to 'hook' (address is NULL)",
-			[run(hook, mr.base, TARGET, hooked)] = "error: bad argument #1 to 'hook' (not an address in read-only executable code)",
-			[run(hook, target, 'int(int)', hooked)] = "error: bad argument #2 to 'hook' (unknown type 'int' in the signature)",
-			[run(hook, target, TARGET, nil)] = "error: bad argument #3 to 'hook' (function expected, got nil)",
+			{ run(hook, nil, TARGET, hooked), "error: bad argument #1 to 'hook' (address is NULL)" },
+			{ run(hook, mr.base, TARGET, hooked), "error: bad argument #1 to 'hook' (not an address in read-only executable code)" },
+			{ run(hook, target, 'int(int)', hooked), "error: bad argument #2 to 'hook' (unknown type 'int' in the signature)" },
+			{ run(hook, target, TARGET, nil), "error: bad argument #3 to 'hook' (function expected, got nil)" },
 		}
-		for got, expected in pairs(refused) do
-			check(got == expected, 'refused: ' .. got)
+		for _, pair in ipairs(refused) do
+			check(pair[1] == pair[2], 'refused: ' .. pair[1])
 		end
 		local hooking_thread, callback_thread
 		local worker = coroutine.create(function()
@@ -576,7 +587,7 @@ elseif SCENARIO == 'hook' then
 		check(run(mr.call, target, TARGET, 1, 2) == '3', 'the new state attaches again')
 		check(mr.hook_info(target).calls == 1, 'calls restart in the new state')
 	end
-elseif SCENARIO == 'fault_report' or SCENARIO == 'fault_report_no_log' or SCENARIO == 'fault_report_off' then
+elseif SCENARIO == 'fault_report' or SCENARIO == 'fault_report_no_log' or SCENARIO == 'fault_report_off' or SCENARIO == 'fault_report_in_callback' then
 	io.stdout:setvbuf('no')
 	local log = PASS == 1 and 'script_log_010203_0404.txt' or 'script_log_010203_0405.txt'
 	if SCENARIO == 'fault_report' then io.open(log, 'wb'):close() end
@@ -587,14 +598,27 @@ elseif SCENARIO == 'fault_report' or SCENARIO == 'fault_report_no_log' or SCENAR
 		not exists('memreader_crash_report_010203_0404.txt') and not exists('memreader_crash_report_010203_0405.txt'),
 		'a fault inside a guarded call writes no report'
 	)
+	check(not pcall(mr.call, mr.pointer(test_function('raise_lua_error')), 'void(pointer)', mr.pointer(test_state())), 'a Lua error leaves a guarded call')
 	check(not pcall(mr.set_crash_reports, 'yes'), 'set_crash_reports takes a boolean')
 	if SCENARIO == 'fault_report_off' and PASS > 1 then mr.set_crash_reports(false) end
 	if PASS == 1 then
 		NEXT_PASS = true
 	else
+		local function crash_in_callback()
+			local single = mr.pointer(test_function('hook_single'))
+			mr.hook(single, 'int64(int64)', function()
+				test_crash()
+				return 0
+			end)
+			mr.call(mr.pointer(test_function('call_directly')), 'int64(pointer, int64)', single, 1)
+		end
 		local function report_me()
 			local marker = 'event-under-test'
-			test_crash()
+			if SCENARIO == 'fault_report_in_callback' then
+				crash_in_callback()
+			else
+				test_crash()
+			end
 			return marker
 		end
 		print('an unguarded fault on the script thread (expected to crash)')

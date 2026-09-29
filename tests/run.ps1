@@ -9,12 +9,13 @@ $crash = -1073741819
 $reportPrefix = 'memreader_crash_report_'
 
 $failed = @()
+$skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
     call_cpp_exception = -1073740791; call_stack_overflow = -1073741571; hook = 0
-    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash
+    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash
 }
-$reports = @{ fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none' }
+$reports = @{ fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started' }
 $profilePacks = Join-Path $env:TEMP 'memreader_plus_test_packs'
 $cpecificDir = [IO.Path]::GetFullPath((Join-Path $root '..\..\workshop\2789863945_twwh3-memreader'))
 $needsCpecific = @('plus_first', 'cpecific_first', 'cpecific_bigread')
@@ -45,6 +46,7 @@ foreach ($scenario in $expect.Keys) {
     if ($needsCpecific -contains $scenario -and -not (Test-Path $cpecificDir)) {
         "== $scenario"
         "skipped: Cpecific's files not found at $cpecificDir"
+        $skipped += $scenario
         continue
     }
     $work = Join-Path $root "build\test_$scenario"
@@ -88,4 +90,4 @@ foreach ($scenario in $expect.Keys) {
 }
 if (Test-Path $profilePacks) { Remove-Item -Recurse -Force $profilePacks }
 if ($failed) { throw "failed: $($failed -join ', ')" }
-'all scenarios passed'
+if ($skipped) { "all other scenarios passed; skipped: $($skipped -join ', ')" } else { 'all scenarios passed' }

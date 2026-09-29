@@ -220,32 +220,45 @@ static lua_Number calculate_number(int operation, lua_Number a, lua_Number b)
 	}
 }
 
-static INT64 calculate_integer(lua_State *L, int operation, INT64 a, INT64 b)
+static INT64 calculate_integer(lua_State *L, int operation, INT64 a, INT64 b, BOOL is_unsigned)
 {
 	switch (operation) {
-	case ADD:      return a + b;
-	case SUBTRACT: return a - b;
-	case MULTIPLY: return a * b;
+	case ADD:      return (INT64)((UINT64)a + (UINT64)b);
+	case SUBTRACT: return (INT64)((UINT64)a - (UINT64)b);
+	case MULTIPLY: return (INT64)((UINT64)a * (UINT64)b);
 	default:
 		if (b == 0)
 			luaL_error(L, "attempt to divide by zero");
+		if (is_unsigned)
+			return (INT64)((UINT64)a / (UINT64)b);
 		if (b == -1)
 			return (INT64)(0 - (UINT64)a);
 		return a / b;
 	}
 }
 
+static lua_Number value_to_number(const TypedValue *value)
+{
+	return value->type == VALUE_UINT64 ? (lua_Number)value->uint64 : (lua_Number)value_to_integer(value);
+}
+
+static size_t string_width(int type)
+{
+	return type == VALUE_INT64 || type == VALUE_UINT64 ? value_size(type) : INTEGER_STRING_WIDTH;
+}
+
 static int arithmetic(lua_State *L, int operation)
 {
 	TypedValue *left = to_value(L, 1);
 	TypedValue *right_value = to_value(L, 2);
+	BOOL is_unsigned;
 	INT64 right;
 
 	if (lua_type(L, 1) == LUA_TNUMBER) {
 		if (lua_type(L, 2) == LUA_TNUMBER)
 			lua_pushnumber(L, calculate_number(operation, lua_tonumber(L, 1), lua_tonumber(L, 2)));
 		else if (right_value && right_value->type != VALUE_POINTER)
-			lua_pushnumber(L, calculate_number(operation, lua_tonumber(L, 1), (lua_Number)value_to_integer(right_value)));
+			lua_pushnumber(L, calculate_number(operation, lua_tonumber(L, 1), value_to_number(right_value)));
 		else
 			return arithmetic_error(L, operation);
 		return 1;
@@ -256,9 +269,10 @@ static int arithmetic(lua_State *L, int operation)
 		push_value(L, VALUE_POINTER, left->pointer - right_value->pointer);
 		return 1;
 	}
-	if (!to_integer(L, 2, INTEGER_STRING_WIDTH, &right))
+	if (!to_integer(L, 2, string_width(left->type), &right))
 		return arithmetic_error(L, operation);
-	push_value(L, left->type, calculate_integer(L, operation, value_to_integer(left), right));
+	is_unsigned = left->type == VALUE_UINT64 || (right_value && right_value->type == VALUE_UINT64);
+	push_value(L, left->type, calculate_integer(L, operation, value_to_integer(left), right, is_unsigned));
 	return 1;
 }
 
@@ -294,7 +308,7 @@ static int compare(lua_State *L, int comparison)
 	a = value_to_integer(left);
 	if (right_value)
 		b = value_to_integer(right_value);
-	else if (!to_integer(L, 2, left->type == VALUE_POINTER ? sizeof(INT_PTR) : INTEGER_STRING_WIDTH, &b))
+	else if (!to_integer(L, 2, left->type == VALUE_POINTER ? sizeof(INT_PTR) : string_width(left->type), &b))
 		return comparison_error(L, comparison);
 
 	is_unsigned = left->type == VALUE_UINT64 || (right_value && right_value->type == VALUE_UINT64);

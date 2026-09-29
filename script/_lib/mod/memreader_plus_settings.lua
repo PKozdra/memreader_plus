@@ -3,8 +3,14 @@ local function apply_crash_reports()
 	if not plus or not get_mct then return end
 	local mod = get_mct():get_mod_by_key('memreader_plus')
 	local option = mod and mod:get_option_by_key('crash_reports')
-	if option then plus.set_crash_reports(option:get_finalized_setting()) end
+	local enabled = option and option:get_finalized_setting()
+	if type(enabled) == 'boolean' then plus.set_crash_reports(enabled) end
 end
 
-core:add_listener('memreader_plus_mct_initialized', 'MctInitialized', true, apply_crash_reports, true)
-core:add_listener('memreader_plus_mct_finalized', 'MctFinalized', true, apply_crash_reports, true)
+local function apply_crash_reports_safely()
+	local ok, message = xpcall(apply_crash_reports, debug.traceback)
+	if not ok then ModLog('[memreader_plus] cannot apply the MCT setting: ' .. tostring(message)) end
+end
+
+core:add_listener('memreader_plus_mct_initialized', 'MctInitialized', true, apply_crash_reports_safely, true)
+core:add_listener('memreader_plus_mct_finalized', 'MctFinalized', true, apply_crash_reports_safely, true)

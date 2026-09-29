@@ -281,6 +281,7 @@ static void read_command_line(void)
 	char statements[sizeof command_line];
 
 	WideCharToMultiByte(CP_UTF8, 0, GetCommandLineW(), -1, command_line, (int)sizeof command_line, NULL, NULL);
+	command_line[sizeof command_line - 1] = '\0';
 	strncpy_s(statements, sizeof statements, skip_program(command_line), _TRUNCATE);
 	read_statements(statements, FALSE);
 }

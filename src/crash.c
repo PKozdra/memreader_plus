@@ -64,6 +64,21 @@ void end_guarded_call(void)
 	InterlockedDecrement(&guarded_calls);
 }
 
+BOOL in_guarded_call(void)
+{
+	return guarded_calls > 0;
+}
+
+LONG pause_guarded_calls(void)
+{
+	return InterlockedExchange(&guarded_calls, 0);
+}
+
+void resume_guarded_calls(LONG paused)
+{
+	InterlockedExchange(&guarded_calls, paused);
+}
+
 static void add(const char *format, ...)
 {
 	va_list arguments;
@@ -118,6 +133,15 @@ static void add_lua_stack(lua_State *L)
 		add("  no Lua function was running: the fault is in native game code\n");
 }
 
+static const char *access_name(ULONG_PTR access)
+{
+	switch (access) {
+	case EXCEPTION_READ_FAULT:    return "read";
+	case EXCEPTION_EXECUTE_FAULT: return "execution";
+	default:                      return "write";
+	}
+}
+
 static void add_location(const EXCEPTION_RECORD *record)
 {
 	ULONG_PTR address = (ULONG_PTR)record->ExceptionAddress;
@@ -129,7 +153,7 @@ static void add_location(const EXCEPTION_RECORD *record)
 	else
 		add("at %p (outside the game exe)", record->ExceptionAddress);
 	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
-		add(", %s of %p", record->ExceptionInformation[0] == 0 ? "read" : "write", (void *)record->ExceptionInformation[1]);
+		add(", %s of %p", access_name(record->ExceptionInformation[0]), (void *)record->ExceptionInformation[1]);
 }
 
 static void write_report(void)
@@ -323,14 +347,24 @@ static void note_game_files(void)
 	CloseHandle(file);
 }
 
+static BOOL is_recent(FILETIME time)
+{
+	SYSTEMTIME parts;
+	FILETIME now;
+
+	GetLocalTime(&parts);
+	SystemTimeToFileTime(&parts, &now);
+	return ticks_of(now) <= ticks_of(time) + (UINT64)GAME_FILE_GRACE_SECONDS * TICKS_PER_SECOND;
+}
+
 static int after_game_handler(DWORD code, EXCEPTION_POINTERS *info)
 {
+	BOOL same_fault = reported && is_recent(fault_time);
 	int result = game_handler(code, info);
 
-	if (reported) {
+	if (same_fault)
 		note_game_files();
-		reported = FALSE;
-	}
+	reported = FALSE;
 	return result;
 }
 
@@ -341,6 +375,7 @@ static void hook_game_handler(void)
 
 	if (count != 1 || MH_CreateHook((LPVOID)target, (LPVOID)after_game_handler, (LPVOID *)&game_handler) != MH_OK)
 		return;
+	save_handler_code((INT_PTR)target);
 	if (MH_EnableHook((LPVOID)target) != MH_OK)
 		MH_RemoveHook((LPVOID)target);
 }

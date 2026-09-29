@@ -32,6 +32,7 @@ typedef struct {
 	int step_count;
 	int depth;
 	int elements_left;
+	int structs_left;
 	int types;
 } Walk;
 
@@ -97,6 +98,13 @@ static void spend(lua_State *L, Walk *walk, int elements)
 	if (elements > walk->elements_left)
 		fail(L, walk, lua_pushfstring(L, "more than %d elements in one read", MAX_ELEMENTS));
 	walk->elements_left -= elements;
+}
+
+static void spend_struct(lua_State *L, Walk *walk)
+{
+	if (walk->structs_left == 0)
+		fail(L, walk, lua_pushfstring(L, "more than %d structs in one read", MAX_ELEMENTS));
+	walk->structs_left--;
 }
 
 static INT64 whole_number(lua_State *L, const Walk *walk, int table, int slot, INT64 minimum, const char *what)
@@ -176,6 +184,7 @@ static int count_fields(lua_State *L, int layout)
 
 static void push_struct(lua_State *L, Walk *walk, int layout, INT_PTR base)
 {
+	spend_struct(L, walk);
 	enter(L, walk);
 	lua_createtable(L, 0, count_fields(L, layout));
 	for (lua_pushnil(L); lua_next(L, layout); lua_pop(L, 1)) {
@@ -352,6 +361,7 @@ static INT_PTR start_walk(lua_State *L, Walk *walk, int field)
 	luaL_checktype(L, field, LUA_TTABLE);
 	memset(walk, 0, sizeof *walk);
 	walk->elements_left = MAX_ELEMENTS;
+	walk->structs_left = MAX_ELEMENTS;
 	walk->types = push_field_types(L);
 	return address;
 }

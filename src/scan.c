@@ -122,11 +122,12 @@ static BOOL matches_original(INT_PTR at, const Pattern *pattern, const SavedCode
 
 static void scan_memory(const BYTE *start, size_t size, const Pattern *pattern, Matches *matches)
 {
-	const BYTE *last = start + size - pattern->size;
+	const BYTE *last;
 	const BYTE *at;
 
 	if (size < pattern->size)
 		return;
+	last = start + size - pattern->size;
 	for (at = start; at <= last; at++) {
 		at = memchr(at, pattern->bytes[0], (size_t)(last - at) + 1);
 		if (!at)
@@ -160,16 +161,23 @@ static BOOL is_readable(const MEMORY_BASIC_INFORMATION *region)
 static void scan_section(const BYTE *start, size_t size, const Pattern *pattern, Matches *matches)
 {
 	const BYTE *end = start + size;
+	const BYTE *readable = NULL;
 	MEMORY_BASIC_INFORMATION region;
 
 	while (start < end && VirtualQuery(start, &region, sizeof region)) {
 		const BYTE *region_end = (const BYTE *)region.BaseAddress + region.RegionSize;
 		if (region_end > end)
 			region_end = end;
-		if (is_readable(&region))
-			scan_memory(start, (size_t)(region_end - start), pattern, matches);
+		if (is_readable(&region) && !readable)
+			readable = start;
+		if (!is_readable(&region) && readable) {
+			scan_memory(readable, (size_t)(start - readable), pattern, matches);
+			readable = NULL;
+		}
 		start = region_end;
 	}
+	if (readable)
+		scan_memory(readable, (size_t)(start - readable), pattern, matches);
 }
 
 static BOOL is_code(const IMAGE_SECTION_HEADER *section)

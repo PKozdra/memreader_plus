@@ -173,6 +173,8 @@ static BOOL is_memory_fault(DWORD code)
 
 static int catch_call_fault(const EXCEPTION_RECORD *record, Fault *fault)
 {
+	if (!in_guarded_call())
+		return EXCEPTION_CONTINUE_SEARCH;
 	if (catch_fault(record, fault) == EXCEPTION_EXECUTE_HANDLER)
 		return EXCEPTION_EXECUTE_HANDLER;
 	switch (record->ExceptionCode) {
@@ -215,17 +217,21 @@ static const char *fault_name(DWORD code)
 static BOOL guarded_call(INT_PTR function, const UINT64 *arguments, int count, UINT64 *result, UINT64 *float_result,
 	Fault *fault)
 {
+	BOOL done = FALSE;
+
 	begin_guarded_call();
 	__try {
-		*result = call_function(function, arguments, (UINT64)count, float_result);
-	} __except (catch_call_fault(GetExceptionInformation()->ExceptionRecord, fault)) {
+		__try {
+			*result = call_function(function, arguments, (UINT64)count, float_result);
+			done = TRUE;
+		} __except (catch_call_fault(GetExceptionInformation()->ExceptionRecord, fault)) {
+			if (fault->code == STATUS_GUARD_PAGE_VIOLATION)
+				restore_guard(fault->address);
+		}
+	} __finally {
 		end_guarded_call();
-		if (fault->code == STATUS_GUARD_PAGE_VIOLATION)
-			restore_guard(fault->address);
-		return FALSE;
 	}
-	end_guarded_call();
-	return TRUE;
+	return done;
 }
 
 static int crash_error(lua_State *L, const Fault *fault)
@@ -323,7 +329,7 @@ static int l_alloc(lua_State *L)
 	lua_getfield(L, -1, "bytes");
 	in_use = lua_tonumber(L, -1);
 	lua_pop(L, 1);
-	if (in_use + (lua_Number)size > MAX_ALLOCATED)
+	if ((lua_Number)size > MAX_ALLOCATED - in_use)
 		return luaL_error(L, "alloc holds at most %d bytes per mode (%d in use); memory returns at the next mode switch, so reuse buffers",
 			MAX_ALLOCATED, (int)in_use);
 	block_size = size + ALLOCATION_ALIGNMENT - 1;
