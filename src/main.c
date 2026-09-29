@@ -1,14 +1,20 @@
 #include "common.h"
 
 #define MEMREADER_API_VERSION 1.2f
+#define MEMREADER_PLUS_API 4
 
 __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 {
+	prepare_hooks();
+	watch_crashes(L);
 	lua_newtable(L);
 	luaL_register(L, NULL, value_functions);
 	luaL_register(L, NULL, memory_functions);
 	luaL_register(L, NULL, process_functions);
 	luaL_register(L, NULL, scan_functions);
+	luaL_register(L, NULL, layout_functions);
+	luaL_register(L, NULL, call_functions);
+	luaL_register(L, NULL, hook_functions);
 
 	push_value(L, VALUE_POINTER, (INT_PTR)GetModuleHandleA(NULL));
 	lua_setfield(L, -2, "base");
@@ -16,5 +22,7 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 	lua_setfield(L, -2, "version");
 	lua_pushstring(L, MEMREADER_PLUS_VERSION);
 	lua_setfield(L, -2, "plus_version");
+	lua_pushnumber(L, MEMREADER_PLUS_API);
+	lua_setfield(L, -2, "plus_api");
 	return 1;
 }
