@@ -1,4 +1,5 @@
 local STRING_HEADER = 0x18
+local USERDATA_BODY = 0x28
 local USERDATA_VALUE = 0x30
 
 local cases = {}
@@ -392,7 +393,8 @@ case('type(modules entry)', function(mr)
 	end
 end)
 case('ud_topointer', function(mr)
-	return mr.ud_topointer(io.stdout)
+	local p = mr.ud_topointer(io.stdout)
+	return mr.eq(p, mr.read_pointer(mr.add(gc_pointer(mr, io.stdout), USERDATA_BODY), 0)), mr.eq(p, mr.pointer(NULL))
 end)
 case('ud_debug', function(mr)
 	local t = mr.ud_debug(mr.pointer(P))
@@ -584,6 +586,19 @@ end)
 fix('int64/uint64 constructors', function(mr)
 	return mr.int64(-5), mr.uint64(string.rep('\255', 8)), mr.type(mr.int64(1))
 end)
+fix('div(uint64 max,2)', function(mr)
+	return mr.div(mr.uint64(string.rep('\255', 8)), 2)
+end)
+fix('div(int64,uint64 max)', function(mr)
+	return mr.div(mr.int64(10), mr.uint64(string.rep('\255', 8)))
+end)
+fix('add(float,uint64 max)', function(mr)
+	return mr.add(5, mr.uint64(string.rep('\255', 8))) > 1e19
+end)
+fix('64-bit values and 8 bytes', function(mr)
+	local high = '\0\0\0\0\1\0\0\0'
+	return mr.eq(mr.uint64(high), high), mr.add(mr.int64(0), high)
+end)
 fix('exact values are shared', function(mr)
 	local s = '\135\214\18\0'
 	local a = mr.uint32(1234567)
@@ -674,6 +689,14 @@ fix('read_struct self-reference', function(mr)
 	node.next = { 0, 'pointer', { 0, 'struct', node } }
 	local ok, err = pcall(mr.read_struct, a, 0, node)
 	return ok, err:match('nested deeper than 16$') ~= nil
+end)
+fix('read_struct struct budget', function(mr)
+	local layout = { v = { 0, 'uint8' } }
+	for _ = 1, 11 do
+		layout = { a = { 0, 'struct', layout }, b = { 0, 'struct', layout }, c = { 0, 'struct', layout } }
+	end
+	local ok, err = pcall(mr.read_struct, mr.base, 0, layout)
+	return ok, err:match('more than 131072 structs in one read$') ~= nil
 end)
 fix('read_struct error path', function(mr)
 	local header = vector_bytes(mr, 1, P)
@@ -918,6 +941,75 @@ end)
 fix('call one argument missing', function(mr)
 	return mr.call(test_address(mr, 'echo_raw'), 'uint64(uint64)')
 end)
+local HOOK_TARGET = 'int32(int32, int32)'
+fix('hook unhook then error', function(mr)
+	local target = test_address(mr, 'hook_target')
+	local callback
+	callback = function()
+		mr.unhook(target, callback)
+		error('fails after unhook')
+	end
+	mr.hook(target, HOOK_TARGET, callback)
+	return mr.call(target, HOOK_TARGET, 1, 2), mr.hook_info(target).attached
+end)
+fix('hook signature while running', function(mr)
+	local target = test_address(mr, 'hook_target')
+	local ok, err
+	mr.hook(target, HOOK_TARGET, function()
+		mr.unhook(target)
+		ok, err = pcall(mr.hook, target, 'int32(int32)', function() end)
+		return 7
+	end)
+	return mr.call(target, HOOK_TARGET, 1, 2), ok, err:match('different signature$') ~= nil
+end)
+fix('hook_next then error', function(mr)
+	local target = test_address(mr, 'hook_target')
+	local lower_calls = 0
+	mr.hook(target, HOOK_TARGET, function(a, b)
+		lower_calls = lower_calls + 1
+		return mr.hook_next(target, a, b)
+	end)
+	mr.hook(target, HOOK_TARGET, function(a, b)
+		mr.hook_next(target, a, b)
+		error('fails after hook_next')
+	end)
+	local result = mr.call(target, HOOK_TARGET, 1, 2)
+	mr.unhook(target)
+	return result, lower_calls
+end)
+fix('void hook_next then error', function(mr)
+	local store = test_address(mr, 'hook_store')
+	local cell = mr.alloc(4)
+	mr.hook(store, 'void(pointer, int32)', function(p)
+		mr.hook_next(store, p, 100)
+		error('fails after hook_next')
+	end)
+	mr.call(store, 'void(pointer, int32)', cell, 5)
+	mr.unhook(store)
+	return mr.read_int32(cell, 0)
+end)
+fix('hook limit while running', function(mr)
+	local target = test_address(mr, 'hook_target')
+	local function pass_down(a, b)
+		return mr.hook_next(target, a, b)
+	end
+	for _ = 1, 15 do
+		mr.hook(target, HOOK_TARGET, function(a, b)
+			return pass_down(a, b)
+		end)
+	end
+	local message
+	local top
+	top = function(a, b)
+		mr.unhook(target, top)
+		message = select(2, pcall(mr.hook, target, HOOK_TARGET, pass_down))
+		return pass_down(a, b)
+	end
+	mr.hook(target, HOOK_TARGET, top)
+	mr.call(target, HOOK_TARGET, 1, 2)
+	mr.unhook(target)
+	return message:match('keep their place until the running call returns') ~= nil
+end)
 fix('alloc', function(mr)
 	local p = mr.alloc(24)
 	local zeroed = mr.read(p, 0, 24) == string.rep('\0', 24)
@@ -934,6 +1026,13 @@ fix('alloc limit', function(mr)
 	end
 	local _, err = pcall(mr.alloc, 1024 * 1024)
 	error((err:gsub('%(%d+ in use%)', '(<n> in use)')), 0)
+end)
+fix('alloc limit is exact', function(mr)
+	local limit = 16 * 1024 * 1024
+	local _, err = pcall(mr.alloc, limit)
+	local in_use = tonumber(err:match('%((%d+) in use%)'))
+	if in_use < limit then mr.alloc(limit - in_use) end
+	return (pcall(mr.alloc, 1))
 end)
 
 local function show(mr, ...)
