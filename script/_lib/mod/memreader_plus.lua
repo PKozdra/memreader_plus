@@ -1,1 +1,1 @@
-assert(loadfile('/script/memreader_plus/loader'))()
+assert(loadfile('/script/memreader_plus/loader'))(ModLog)

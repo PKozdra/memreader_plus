@@ -1,7 +1,9 @@
+local mod_log = ...
+
 if _G.memreader_plus then return _G.memreader_plus end
 
 local function log(message)
-	if type(ModLog) == 'function' then ModLog('[memreader_plus] ' .. message) end
+	if type(mod_log) == 'function' then mod_log('[memreader_plus] ' .. message) end
 end
 
 local function load_dll()
