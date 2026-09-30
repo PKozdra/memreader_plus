@@ -93,7 +93,6 @@ FIXED = {
 	['find_pattern(bad hex)'] = "error: bad argument #1 to 'find_pattern' (expected hex bytes and ?? separated by spaces)",
 	['find_pattern(too long)'] = 'error: pattern longer than 256 bytes',
 	['find_pattern across a protection change'] = 'true, true',
-	['plus_api'] = '5',
 	['read unmapped'] = 'error: failed to read memory',
 	['read of a guard page'] = 'false, false, true',
 	['read_int64/uint64/double'] = 'int64:-2, uint64:18446744073709551615, 2.5, true',
@@ -384,7 +383,6 @@ elseif SCENARIO == 'hook' then
 	end
 
 	if PASS == 1 then
-		check(mr.plus_api == 5, 'plus_api is 5')
 		check(mr.hook_depth() == 0, 'hook_depth is 0 outside callbacks')
 		local start = mr.ticks()
 		local later = mr.ticks()
@@ -462,6 +460,8 @@ elseif SCENARIO == 'hook' then
 		check(run(mr.call, address('call_directly'), 'int64(pointer, int64)', single, 5) == '65531', 'native callers go through the hook')
 		check(run(mr.call, address('call_on_thread'), 'int64(pointer, int64)', single, 5) == '16', 'calls on another thread run the original')
 		check(mr.hook_info(single).calls == 1, 'calls on another thread are not counted')
+		check(mr.hook_info(single).other_thread_calls == 1, 'calls on another thread are counted apart')
+		check(mr.hook_info(target).other_thread_calls == 0, 'no other-thread calls on a script-thread address')
 		mr.unhook(single)
 		local deepest = 0
 		mr.hook(single, SINGLE, function(x)

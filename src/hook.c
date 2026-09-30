@@ -23,6 +23,7 @@ typedef struct {
 	int callback_count;
 	int running;
 	UINT32 calls;
+	LONG other_thread_calls;
 	BYTE saved[SAVED_BYTES];
 	char error[MAX_ERROR_LENGTH + 1];
 } Hook;
@@ -388,7 +389,11 @@ int run_hook(Hook *hook, HookFrame *frame)
 	BOOL done;
 
 	frame->original = hook->original;
-	if (GetCurrentThreadId() != script_thread || runner == LUA_NOREF || next_runnable(hook, call.level) < 0)
+	if (GetCurrentThreadId() != script_thread) {
+		InterlockedIncrement(&hook->other_thread_calls);
+		return RUN_ORIGINAL;
+	}
+	if (runner == LUA_NOREF || next_runnable(hook, call.level) < 0)
 		return RUN_ORIGINAL;
 	outcome = is_float_type(hook->signature.result) ? RETURN_FLOAT_RESULT : RETURN_RESULT;
 	frame->result = 0;
@@ -542,6 +547,7 @@ static int l_hook(lua_State *L)
 	if (attached_count(hook) == 0) {
 		hook->signature = signature;
 		hook->calls = 0;
+		InterlockedExchange(&hook->other_thread_calls, 0);
 		hook->error[0] = '\0';
 	}
 	callback = &hook->callbacks[hook->callback_count++];
@@ -582,7 +588,7 @@ static int l_hook_info(lua_State *L)
 		return 1;
 	}
 	attached = attached_count(hook);
-	lua_createtable(L, 0, 5);
+	lua_createtable(L, 0, 6);
 	push_value(L, VALUE_POINTER, (INT_PTR)hook->original);
 	lua_setfield(L, -2, "original");
 	lua_pushboolean(L, attached > 0);
@@ -591,6 +597,8 @@ static int l_hook_info(lua_State *L)
 	lua_setfield(L, -2, "callbacks");
 	lua_pushnumber(L, (lua_Number)hook->calls);
 	lua_setfield(L, -2, "calls");
+	lua_pushnumber(L, (lua_Number)hook->other_thread_calls);
+	lua_setfield(L, -2, "other_thread_calls");
 	if (hook->error[0]) {
 		lua_pushstring(L, hook->error);
 		lua_setfield(L, -2, "error");

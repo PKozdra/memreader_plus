@@ -580,9 +580,6 @@ local function make_list(mr, size, broken, tag)
 	return h, { header, first, second }
 end
 
-fix('plus_api', function(mr)
-	return mr.plus_api
-end)
 fix('read unmapped', function(mr)
 	return mr.read_uint32(mr.pointer(P), 0)
 end)

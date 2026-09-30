@@ -33,7 +33,6 @@ end
 local function check_globals()
 	check(_G.memreader == mr, '_G.memreader is memreader Plus')
 	check(package.loaded['twwh3-memreader'] == mr, "package.loaded['twwh3-memreader'] is ours")
-	check((mr.plus_api or 0) >= 3, 'plus_api ' .. tostring(mr.plus_api))
 	check(mr.free == nil, 'no free: alloc memory lives until the mode ends')
 	say('plus_version ' .. tostring(mr.plus_version) .. ', version ' .. tostring(mr.version))
 end
@@ -104,10 +103,6 @@ local function find_projectiles()
 end
 
 local function check_hook(murmur, text, length, run_game_code)
-	if mr.plus_api < 3 then
-		say('skip hook: plus_api ' .. tostring(mr.plus_api))
-		return
-	end
 	local HASH = 'uint32(pointer, uint32)'
 	local info = mr.hook_info(murmur)
 	if info and info.attached then mr.unhook(murmur) end

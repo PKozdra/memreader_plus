@@ -33,7 +33,7 @@ function steps.alone()
 	for name in pairs(package.loaded) do
 		if string.match(name, 'memreader') then names[#names + 1] = name end
 	end
-	return { plus_version = mr.plus_version, plus_api = mr.plus_api, same = _G.memreader == mr, loaded = table.concat(names, ' ') }
+	return { plus_version = mr.plus_version, same = _G.memreader == mr, loaded = table.concat(names, ' ') }
 end
 
 function steps.pattern()

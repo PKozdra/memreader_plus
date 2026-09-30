@@ -510,8 +510,6 @@ The address of `Warhammer3.exe` in memory: `0x0000000140000000`. The game always
 `1.2`, the memreader API version. memreader Plus keeps it at 1.2 on purpose (see [Both mods installed](#both-mods-installed)).
 #### `plus_version: string`
 The version of memreader Plus, for example `'0.5.0'`.
-#### `plus_api: float`
-An integer that goes up by one whenever the API gets new functions. Level 1 added the bulk reads, level 2 `call`, level 3 `hook`, level 4 `hook_depth`, `ticks` and `elapsed_us`, and level 5 several callbacks per address, `hook_next` and `set_crash_reports`.
 
 ### Addition +
 #### `add(float, float): float`
@@ -726,7 +724,7 @@ out(('took %.1f us'):format(mr.elapsed_us(start)))
 | `createtable(1e9)` | asks for about 16 GB | size hints capped at 2^20 each |
 | `read_rowidx` | divides in float: off by one above 16 MiB | integer division; a row size below 1 is an error |
 | Padding bytes of typed values | not initialised | zeroed |
-| New functions | | `read_unistring`, `is_null`, `read_int64`, `read_uint64`, `read_double`, `int64`, `uint64`, `read_struct`, `read_vector`, `read_list`, `read_chain`, `find_pattern`, `call`, `alloc`, `hook`, `hook_next`, `unhook`, `hook_info`, `hook_depth`, `ticks`, `elapsed_us`, `set_crash_reports`, `plus_version`, `plus_api` |
+| New functions | | `read_unistring`, `is_null`, `read_int64`, `read_uint64`, `read_double`, `int64`, `uint64`, `read_struct`, `read_vector`, `read_list`, `read_chain`, `find_pattern`, `call`, `alloc`, `hook`, `hook_next`, `unhook`, `hook_info`, `hook_depth`, `ticks`, `elapsed_us`, `set_crash_reports`, `plus_version` |
 | Lua globals | `_G.memreader` | `_G.memreader_plus`, and `_G.memreader` for compatibility |
 | DLL in the game folder | `twwh3-memreader.dll`, rewritten only when the loaded `version` differs | `twwh3-memreader_plus.dll`, rewritten whenever its bytes differ from the pack |
 | Metatables | `memreader.module`, `memreader.snapshot` | none, so nothing collides when both DLLs load |
