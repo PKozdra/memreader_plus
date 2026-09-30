@@ -80,7 +80,7 @@ mr.tostring(chptr) -- ex: 0000000049376488
 
 -- here's how you can call a function from the game's own code: its hash function (MurmurHash3, 32-bit)
 -- it turns a text into a number, and the same text always gives the same number
--- the game uses that number to find DB records by their key, so this gives you the number it would look up:
+-- the game uses that number to find entries in its string-key tables, such as the key map of a DB table, so this gives you the number it would look up:
 
 -- 1. find the function by the bytes it starts with (they survive game patches that do not touch it)
 local address, count = mr.find_pattern('48 89 5C 24 08 44 8B CA 8B DA 41 C1 E9 02 41 BA ED 5E 54 4A')
@@ -92,6 +92,17 @@ mr.write(text, 0, key)
 -- 3. call it: a pointer to the text and its length go in, a 32-bit number comes out
 local hash = mr.call(address, 'uint32(pointer, uint32)', text, #key)
 out(mr.tostring(hash)) -- 1628994413 (0x61187B6D)
+
+-- a hook runs your Lua function whenever the game calls one of its own functions
+-- this one tells the game how many units an army may have (20)
+local unit_cap, found = mr.find_pattern('80 B9 ?? ?? ?? ?? ?? 73 ?? 48 8B 81 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ?? 48 8B 81 ?? ?? ?? ?? B9 ?? ?? ?? ?? 8B 80 ?? ?? ?? ?? 3B C1 0F 47 C1 C3 B8 ?? ?? ?? ?? C3')
+assert(found == 1)
+mr.hook(unit_cap, 'uint32(pointer)', function(faction)
+	return 30 -- the game now allows 30 units in every army, player and AI
+end)
+local army = cm:get_faction('wh_main_emp_empire'):military_force_list():item_at(0)
+out(army:unit_count_limit()) -- 30
+mr.unhook(unit_cap) -- back to 20
 ```
 
 The addresses and offsets above are examples. Real ones depend on the game build and the structure you read.
@@ -501,8 +512,12 @@ For a script interface object, `ud_topointer` returns the address of the interfa
 local faction_i = cm:get_faction('wh3_dlc29_nag_host_of_nagash')
 local faction = mr.read_pointer(mr.ud_topointer(faction_i), 0x10)
 local cqis = mr.read_vector(faction, 0xf20, { 0, 'pointer', { 0, 'pointer', { 0x110, 'uint32' } } }, 8)
-out(table.concat(cqis, ',')) -- 1,2,479
+out(table.concat(cqis, ',')) -- ex: 1,2,1068
+local nagash = cm:get_character_by_cqi(cqis[1])
+out(nagash:character_subtype_key()) -- wh3_dlc29_nag_nagash
 ```
+
+The list holds the same numbers, in the same order, as `faction_i:character_list()`. Only the first ones stay the same between campaigns; later numbers depend on how many characters the game created before them.
 
 To read a DB table, find the game's list of tables with `find_pattern`, pick the table whose name (`read_string(table, 0x58, true)`) you want, then read its rows with `read_array(table, 0x08)` and its keys with `read_list(table, 0x28, ...)`. The key of a record sits at a different place in each table, so take the keys from the key map. In the unmodded game, the `cultures` table has 28 rows and 28 keys.
 
