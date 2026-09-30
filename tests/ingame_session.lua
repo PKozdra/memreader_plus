@@ -3,6 +3,11 @@ local HASH = 'uint32(pointer, uint32)'
 local MURMUR = '48 89 5C 24 08 44 8B CA 8B DA 41 C1 E9 02 41 BA ED 5E 54 4A'
 local MURMUR_9_0_1 = 0x4df770
 local STR_REVERSE_9_0_1 = 0x18556b4
+local STRING_HASH_9_0_1 = 0x4fc0d0
+local UNIT_CAP =
+	'80 B9 ?? ?? ?? ?? ?? 73 ?? 48 8B 81 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ?? 48 8B 81 ?? ?? ?? ?? B9 ?? ?? ?? ?? 8B 80 ?? ?? ?? ?? 3B C1 0F 47 C1 C3 B8 ?? ?? ?? ?? C3'
+local LIMIT = 'uint32(pointer)'
+local STRING_HASH = 'uint32(pointer, pointer)'
 local KEY = 'wh2_main_hef_bow_arrow'
 
 local steps = {}
@@ -144,6 +149,108 @@ function steps.capacity(want)
 		end
 	end
 	return { candidates = #starts, hooked = hooked, refused = refused, already = before, memory_error = memory_error, other_error = other_error }
+end
+
+local function ca_string(text)
+	local s = mr.alloc(16 + #text + 1)
+	mr.write(s, 16, text .. '\0')
+	mr.write(s, 0, mr.uint32(#text))
+	mr.write(s, 4, mr.uint32(#text))
+	mr.write(s, 8, mr.add(s, 16))
+	return s
+end
+
+function steps.next_then_error()
+	local murmur, string_hash = mr.add(mr.base, MURMUR_9_0_1), mr.add(mr.base, STRING_HASH_9_0_1)
+	local key = ca_string(KEY)
+	local data = mr.add(key, 16)
+	local hashed = 0
+	mr.unhook(murmur)
+	mr.unhook(string_hash)
+	mr.hook(murmur, HASH, function(bytes, size)
+		if mr.eq(bytes, data) then hashed = hashed + 1 end
+		return mr.hook_next(murmur, bytes, size)
+	end)
+	local plain = mr.tostring(mr.call(string_hash, STRING_HASH, nil, key))
+	local plain_hashed = hashed
+	hashed = 0
+	mr.hook(string_hash, STRING_HASH, function(hasher, text)
+		mr.hook_next(string_hash, hasher, text)
+		error('fails after hook_next')
+	end)
+	local result = mr.tostring(mr.call(string_hash, STRING_HASH, nil, key))
+	local info = mr.hook_info(string_hash)
+	mr.unhook(murmur)
+	return { plain = plain, plain_hashed = plain_hashed, result = result, hashed = hashed, attached = info.attached, error = info.error }
+end
+
+local function find_unit_cap()
+	local address, count = mr.find_pattern(UNIT_CAP)
+	assert(count == 1, 'unit cap pattern matched ' .. count .. ' times')
+	return address
+end
+
+local function first_army(faction)
+	local forces = faction:military_force_list()
+	for i = 0, forces:num_items() - 1 do
+		local force = forces:item_at(i)
+		if force:has_general() and not force:is_armed_citizenry() then return force end
+	end
+end
+
+local function limits(ai_key)
+	local human = first_army(cm:get_faction(cm:get_local_faction_name(true)))
+	local ai = first_army(cm:get_faction(ai_key or 'wh_main_emp_empire'))
+	local human_limit = human:unit_count_limit()
+	return { human = human_limit, human_type = type(human_limit), ai = ai and ai:unit_count_limit(), units = human:unit_list():num_items() }
+end
+
+function steps.unit_cap(value)
+	local unit_cap = find_unit_cap()
+	mr.unhook(unit_cap)
+	mr.hook(unit_cap, LIMIT, function()
+		return value or 30
+	end)
+	local result = limits()
+	local info = mr.hook_info(unit_cap)
+	result.calls, result.error = info.calls, info.error
+	return result
+end
+
+function steps.unit_cap_grant()
+	local force = first_army(cm:get_faction(cm:get_local_faction_name(true)))
+	local lookup = cm:char_lookup_str(force:general_character())
+	local unit = force:unit_list():item_at(1):unit_key()
+	local before = force:unit_list():num_items()
+	cm:grant_unit_to_character(lookup, unit)
+	local after = force:unit_list():num_items()
+	if after > before then cm:remove_unit_from_character(lookup, unit) end
+	return { before = before, after = after, back = force:unit_list():num_items() }
+end
+
+function steps.unit_cap_end()
+	local unit_cap = find_unit_cap()
+	local info = mr.hook_info(unit_cap)
+	mr.unhook(unit_cap)
+	local result = limits()
+	result.calls, result.error = info.calls, info.error
+	return result
+end
+
+function steps.callback_fault()
+	local unit_cap = find_unit_cap()
+	local target = mr.add(mr.base, STR_REVERSE_9_0_1)
+	local function report_me()
+		local marker = 'fault-in-callback-through-call'
+		mr.write(target, 0, '\15\11')
+		return string.reverse(marker)
+	end
+	mr.unhook(unit_cap)
+	mr.hook(unit_cap, LIMIT, function()
+		report_me()
+		return 30
+	end)
+	return mr.call(unit_cap, LIMIT, nil)
 end
 
 function steps.crash()

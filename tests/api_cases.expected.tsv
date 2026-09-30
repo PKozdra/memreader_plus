@@ -72,12 +72,12 @@ read_uint8	77
 read_int8	0
 read_uint16	23117
 read_int16	-28582
-read_uint32	280
-read_int32	280
+read_uint32	184
+read_int32	184
 read_uint8 ud	uint8:77
 read_int16 ud	int16:23117
-read_uint32 ud	uint32:280
-read_int32 ud	int32:280
+read_uint32 ud	uint32:184
+read_int32 ud	int32:184
 read_float	4.5882444692256e-30
 read_pointer	pointer:0000000300905A4D
 read_boolean(1)	true

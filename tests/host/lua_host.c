@@ -227,6 +227,23 @@ static INT64 call_on_thread(INT64 (*function)(INT64), INT64 x)
 
 int throw_and_catch(void);
 void throw_out(void);
+UINT64 leaf_add_one(UINT64 x);
+float leaf_add_floats(float a, float b);
+void call_keeping_registers(void *leaf, void *registers);
+int game_crash_handler(DWORD code, EXCEPTION_POINTERS *info);
+
+void write_game_crash_file(void)
+{
+	SYSTEMTIME now;
+	char name[64];
+	HANDLE file;
+	GetLocalTime(&now);
+	snprintf(name, sizeof name, "crash_report\\D%04d-%02d-%02d_T%02d-%02d-%02d.mdmp", now.wYear, now.wMonth, now.wDay,
+		now.wHour, now.wMinute, now.wSecond);
+	file = CreateFileA(name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file != INVALID_HANDLE_VALUE)
+		CloseHandle(file);
+}
 
 static int format(char *out, size_t size, const char *text, ...)
 {
@@ -277,6 +294,9 @@ static const struct {
 	{ "hook_store", hook_store },
 	{ "call_directly", call_directly },
 	{ "call_on_thread", call_on_thread },
+	{ "leaf_add_one", leaf_add_one },
+	{ "leaf_add_floats", leaf_add_floats },
+	{ "call_keeping_registers", call_keeping_registers },
 };
 
 static int l_test_function(lua_State *L)
@@ -295,6 +315,39 @@ static int l_test_function(lua_State *L)
 static int l_test_crash(lua_State *L)
 {
 	lua_pushinteger(L, read_null());
+	return 1;
+}
+
+static int l_test_recovered_crash(lua_State *L)
+{
+	__try {
+		read_null();
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return 0;
+}
+
+static int l_test_execute_crash(lua_State *L)
+{
+	BYTE *page = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	page[0] = 0xC3;
+	((void (*)(void))page)();
+	return 0;
+}
+
+static int l_test_sleep(lua_State *L)
+{
+	Sleep((DWORD)luaL_checkinteger(L, 1));
+	return 0;
+}
+
+static int l_test_protect(lua_State *L)
+{
+	void *address;
+	DWORD old = 0;
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	VirtualProtect(address, (SIZE_T)luaL_checkinteger(L, 2), (DWORD)luaL_checkinteger(L, 3), &old);
+	lua_pushinteger(L, old);
 	return 1;
 }
 
@@ -322,6 +375,10 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_state", l_test_state);
 	lua_register(L, "test_ref", l_test_ref);
 	lua_register(L, "test_crash", l_test_crash);
+	lua_register(L, "test_recovered_crash", l_test_recovered_crash);
+	lua_register(L, "test_execute_crash", l_test_execute_crash);
+	lua_register(L, "test_sleep", l_test_sleep);
+	lua_register(L, "test_protect", l_test_protect);
 	lua_pushstring(L, argv[2]);
 	lua_setglobal(L, "ROOT");
 	lua_pushstring(L, argc > 3 ? argv[3] : "");
@@ -345,7 +402,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: lua_host <script.lua> <mod root> [scenario]\n");
 		return 2;
 	}
-	while (run_pass(argv, argc, pass))
-		pass++;
+	__try {
+		while (run_pass(argv, argc, pass))
+			pass++;
+	} __except (game_crash_handler(GetExceptionCode(), GetExceptionInformation())) {
+	}
 	return 0;
 }

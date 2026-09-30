@@ -92,6 +92,7 @@ FIXED = {
 	['find_pattern(?? first)'] = "error: bad argument #1 to 'find_pattern' (pattern must start with a byte, not ??)",
 	['find_pattern(bad hex)'] = "error: bad argument #1 to 'find_pattern' (expected hex bytes and ?? separated by spaces)",
 	['find_pattern(too long)'] = 'error: pattern longer than 256 bytes',
+	['find_pattern across a protection change'] = 'true, true',
 	['plus_api'] = '5',
 	['read unmapped'] = 'error: failed to read memory',
 	['read of a guard page'] = 'false, false, true',
@@ -515,6 +516,75 @@ elseif SCENARIO == 'hook' then
 		mr.call(store, 'void(pointer, int32)', cell, 5)
 		check(mr.read_int32(cell, 0) == 16, 'void hook')
 
+		local keeper, leaf, float_leaf = address('call_keeping_registers'), address('leaf_add_one'), address('leaf_add_floats')
+		local REGISTERS_SIZE = 152
+		local registers = {}
+		for i = 0, 5 do
+			registers[#registers + 1] = { 'xmm' .. i, i * 16 }
+			registers[#registers + 1] = { 'xmm' .. i .. ' high', i * 16 + 8 }
+		end
+		for i, name in ipairs({ 'rcx', 'rdx', 'r8', 'r9', 'r10', 'r11', 'rax' }) do
+			registers[#registers + 1] = { name, 88 + i * 8 }
+		end
+		local function call_leaf(target)
+			local bytes = {}
+			for i = 1, REGISTERS_SIZE do
+				bytes[i] = string.char((i * 37 + 11) % 256)
+			end
+			local before = table.concat(bytes)
+			local saved = mr.alloc(REGISTERS_SIZE)
+			mr.write(saved, 0, before)
+			mr.call(keeper, 'void(pointer, pointer)', target, saved)
+			local after = mr.read(saved, 0, REGISTERS_SIZE)
+			local changed = {}
+			for _, register in ipairs(registers) do
+				local from = register[2] + 1
+				if before:sub(from, from + 7) ~= after:sub(from, from + 7) then changed[#changed + 1] = register[1] end
+			end
+			return table.concat(changed, ', '), saved
+		end
+		local function leaf_result(saved)
+			return mr.tostring(mr.read_uint64(saved, 144))
+		end
+		local function rcx_plus_one(saved)
+			return mr.tostring(mr.add(mr.read_uint64(saved, 96), 1))
+		end
+		local changed, saved = call_leaf(leaf)
+		check(changed == 'rax' and leaf_result(saved) == rcx_plus_one(saved), 'the unhooked leaf changes only rax')
+		mr.hook(leaf, 'uint64(uint64)', function()
+			return 42
+		end)
+		changed, saved = call_leaf(leaf)
+		check(changed == 'rax' and leaf_result(saved) == '42', 'a callback result keeps every other volatile register: ' .. changed)
+		mr.unhook(leaf)
+		mr.hook(leaf, 'uint64(uint64)', function(x)
+			return mr.hook_next(leaf, x)
+		end)
+		changed, saved = call_leaf(leaf)
+		check(changed == 'rax' and leaf_result(saved) == rcx_plus_one(saved), 'hook_next to the original keeps every other volatile register: ' .. changed)
+		mr.unhook(leaf)
+		mr.hook(leaf, 'uint64(uint64)', function()
+			error('fails')
+		end)
+		changed, saved = call_leaf(leaf)
+		check(changed == 'rax' and leaf_result(saved) == rcx_plus_one(saved), 'a failing callback passes every register to the original: ' .. changed)
+		mr.unhook(leaf)
+		changed, saved = call_leaf(leaf)
+		check(changed == 'rax' and leaf_result(saved) == rcx_plus_one(saved), 'an unhooked detour passes every register to the original: ' .. changed)
+		check(call_leaf(float_leaf) == 'xmm0, rax', 'the unhooked float leaf changes only xmm0 and rax')
+		mr.hook(float_leaf, 'float(float, float)', function()
+			return 2.5
+		end)
+		changed, saved = call_leaf(float_leaf)
+		check(changed == 'xmm0, rax' and mr.read_float(saved, 0) == 2.5, 'a float result keeps every other register and the high half of xmm0: ' .. changed)
+		mr.unhook(float_leaf)
+		mr.hook(float_leaf, 'float(float, float)', function(a, b)
+			return mr.hook_next(float_leaf, a, b)
+		end)
+		changed = call_leaf(float_leaf)
+		check(changed == 'xmm0, rax', 'float hook_next keeps every other register: ' .. changed)
+		mr.unhook(float_leaf)
+
 		mr.unhook(target)
 		mr.hook(target, TARGET, function()
 			error('boom')
@@ -616,6 +686,8 @@ elseif SCENARIO == 'fault_report' or SCENARIO == 'fault_report_no_log' or SCENAR
 			local marker = 'event-under-test'
 			if SCENARIO == 'fault_report_in_callback' then
 				crash_in_callback()
+			elseif SCENARIO == 'fault_report_no_log' then
+				test_execute_crash()
 			else
 				test_crash()
 			end
@@ -626,6 +698,22 @@ elseif SCENARIO == 'fault_report' or SCENARIO == 'fault_report_no_log' or SCENAR
 		print('did not crash')
 		os.exit(0)
 	end
+elseif SCENARIO == 'fault_report_stale' then
+	io.stdout:setvbuf('no')
+	run_mod(OURS)
+	local function report_me()
+		local marker = 'event-under-test'
+		test_recovered_crash()
+		return marker
+	end
+	report_me()
+	print('a fault the game recovers from wrote a report; waiting past the grace window')
+	test_sleep(3000)
+	_G.memreader_plus.set_crash_reports(false)
+	print('a later crash without a report (expected to crash)')
+	test_crash()
+	print('did not crash')
+	os.exit(0)
 elseif SCENARIO == 'cpecific_bigread' then
 	io.stdout:setvbuf('no')
 	run_mod(THEIRS)

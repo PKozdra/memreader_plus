@@ -5,7 +5,9 @@
 #include "MinHook.h"
 #include "buffer.h"
 
-enum { MAX_HOOKS = 1000, MAX_CALLBACKS = 16, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8 };
+enum { MAX_HOOKS = 1000, MAX_CALLBACKS = 16, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8, SAVED_REGISTERS = 6 };
+
+enum HookOutcome { RUN_ORIGINAL, RETURN_RESULT, RETURN_FLOAT_RESULT };
 
 typedef struct {
 	lua_State *state;
@@ -26,17 +28,22 @@ typedef struct {
 } Hook;
 
 typedef struct {
-	UINT64 registers[REGISTER_ARGUMENTS];
-	UINT64 floats[REGISTER_ARGUMENTS];
+	UINT64 low;
+	UINT64 high;
+} FloatRegister;
+
+typedef struct {
+	UINT64 registers[SAVED_REGISTERS];
+	FloatRegister floats[SAVED_REGISTERS];
 	const UINT64 *stack;
 	UINT64 result;
 	UINT64 float_result;
 	void *original;
 } HookFrame;
 
-_Static_assert(offsetof(HookFrame, floats) == 32 && offsetof(HookFrame, stack) == 64 &&
-	offsetof(HookFrame, result) == 72 && offsetof(HookFrame, float_result) == 80 &&
-	offsetof(HookFrame, original) == 88 && sizeof(HookFrame) == 96, "HookFrame layout is shared with thunk.asm");
+_Static_assert(offsetof(HookFrame, floats) == 48 && offsetof(HookFrame, stack) == 144 &&
+	offsetof(HookFrame, result) == 152 && offsetof(HookFrame, float_result) == 160 &&
+	offsetof(HookFrame, original) == 168 && sizeof(HookFrame) == 176, "HookFrame layout is shared with thunk.asm");
 
 #pragma pack(push, 1)
 typedef struct {
@@ -279,7 +286,7 @@ static UINT64 argument_slot(const HookFrame *frame, int index, int type)
 {
 	if (index >= REGISTER_ARGUMENTS)
 		return frame->stack[index - REGISTER_ARGUMENTS];
-	return is_float_type(type) ? frame->floats[index] : frame->registers[index];
+	return is_float_type(type) ? frame->floats[index].low : frame->registers[index];
 }
 
 static void set_result(HookFrame *frame, int type, UINT64 bits)
@@ -373,15 +380,17 @@ static BOOL run_callbacks(HookCall *call)
 	return FALSE;
 }
 
-BOOL run_hook(Hook *hook, HookFrame *frame)
+int run_hook(Hook *hook, HookFrame *frame)
 {
 	HookCall call = { hook, frame, hook->callback_count, -1, innermost };
+	enum HookOutcome outcome;
 	LONG paused;
 	BOOL done;
 
 	frame->original = hook->original;
 	if (GetCurrentThreadId() != script_thread || runner == LUA_NOREF || next_runnable(hook, call.level) < 0)
-		return FALSE;
+		return RUN_ORIGINAL;
+	outcome = is_float_type(hook->signature.result) ? RETURN_FLOAT_RESULT : RETURN_RESULT;
 	frame->result = 0;
 	frame->float_result = 0;
 	hook->calls++;
@@ -398,7 +407,7 @@ BOOL run_hook(Hook *hook, HookFrame *frame)
 		hook->running--;
 		compact(hook);
 	}
-	return done;
+	return done ? outcome : RUN_ORIGINAL;
 }
 
 static HookCall *find_call(INT_PTR target)
