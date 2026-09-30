@@ -27,7 +27,7 @@ $faultNeedles = @{
 $gameFilesNote = "The game's own crash files for this crash, in the game crash folder: D"
 $commandLineStart = 'Command line: '
 $commandLineBuffer = 1039
-$profilePacks = Join-Path $env:TEMP 'memreader_plus_test_packs'
+$profilePacks = Join-Path $env:LOCALAPPDATA 'Temp\memreader_plus_test_packs'
 $cpecificDir = [IO.Path]::GetFullPath((Join-Path $root '..\..\workshop\2789863945_twwh3-memreader'))
 $needsCpecific = @('plus_first', 'cpecific_first', 'cpecific_bigread')
 
@@ -95,9 +95,9 @@ foreach ($scenario in $expect.Keys) {
             $logLine = if ($scenario -eq 'fault_report') { 'Script log of this Lua state: script_log_010203_0405.txt' } else { 'Script logging is off' }
             $needles = @('exception 0xc0000005', 'report_me', 'marker = "event-under-test"', $logLine, $faultNeedles[$scenario]) + $modNeedles
             if ($scenario -ne 'fault_report_stale') { $needles += $gameFilesNote }
-            foreach ($needle in $needles) {
-                if (-not $text -or -not $text.Contains($needle)) { $failed += "$scenario (report lacks: $needle)" }
-            }
+            $missing = @($needles | Where-Object { -not $text -or -not $text.Contains($_) })
+            foreach ($needle in $missing) { $failed += "$scenario (report lacks: $needle)" }
+            if ($missing) { $text }
             if ($scenario -eq 'fault_report_stale' -and $text -match "The game('s own| wrote no) crash files") { $failed += "$scenario (a later crash wrote into an old report)" }
             if ($scenario -eq 'fault_report_no_log') {
                 $line = $text -split "`n" | Where-Object { $_.StartsWith($commandLineStart) }
