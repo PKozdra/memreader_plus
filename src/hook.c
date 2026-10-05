@@ -7,6 +7,8 @@
 
 enum { MAX_HOOKS = 1000, MAX_CALLBACKS = 16, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8, SAVED_REGISTERS = 6 };
 
+enum { TRAMPOLINE_SIZE = 64, MAX_REPORTED_HOOKS = 24 };
+
 enum HookOutcome { RUN_ORIGINAL, RETURN_RESULT, RETURN_FLOAT_RESULT };
 
 typedef struct {
@@ -24,7 +26,6 @@ typedef struct {
 	int running;
 	UINT32 calls;
 	LONG other_thread_calls;
-	BYTE saved[SAVED_BYTES];
 	char error[MAX_ERROR_LENGTH + 1];
 } Hook;
 
@@ -75,10 +76,13 @@ static DWORD script_thread;
 static int callback_depth;
 static int runner = LUA_NOREF;
 static HookCall *innermost;
-static INT_PTR handler_target;
-static BYTE handler_saved[SAVED_BYTES];
 
 void hook_entry(void);
+
+static ULONG_PTR exe_offset(INT_PTR address)
+{
+	return (ULONG_PTR)address - (ULONG_PTR)GetModuleHandleW(NULL);
+}
 
 static Hook *find_hook(INT_PTR target)
 {
@@ -91,27 +95,15 @@ static Hook *find_hook(INT_PTR target)
 	return NULL;
 }
 
-void save_handler_code(INT_PTR target)
+BOOL is_hook_original(INT_PTR address)
 {
-	if (copy_memory(handler_saved, target - SAVED_BYTES / 2, SAVED_BYTES))
-		handler_target = target;
-}
+	int i;
 
-BOOL saved_code(int index, SavedCode *code)
-{
-	if (handler_target) {
-		if (index == 0) {
-			code->start = handler_target - SAVED_BYTES / 2;
-			code->bytes = handler_saved;
+	for (i = 0; i < hook_count; i++) {
+		if ((INT_PTR)hooks[i].original == address)
 			return TRUE;
-		}
-		index--;
 	}
-	if (index >= hook_count)
-		return FALSE;
-	code->start = hooks[index].target - SAVED_BYTES / 2;
-	code->bytes = hooks[index].saved;
-	return TRUE;
+	return FALSE;
 }
 
 static BOOL is_read_only_code(INT_PTR address)
@@ -167,11 +159,14 @@ void prepare_hooks(void)
 
 static Hook *install_hook(lua_State *L, INT_PTR target)
 {
+	BYTE window[SAVED_BYTES];
 	Hook *hook;
 	MH_STATUS status;
 
-	if (!is_read_only_code(target))
-		luaL_argerror(L, 1, "not an address in read-only executable code");
+	if (!in_exe_code(target) || !is_read_only_code(target)) {
+		note_refusal(L, "hook", target);
+		luaL_argerror(L, 1, "refused: hook takes only read-only code in the game's exe");
+	}
 	if (hook_count == MAX_HOOKS)
 		luaL_error(L, "at most %d addresses can be hooked per game session", MAX_HOOKS);
 	if (!start_hooking())
@@ -179,7 +174,7 @@ static Hook *install_hook(lua_State *L, INT_PTR target)
 	hook = &hooks[hook_count];
 	hook->target = target;
 	hook->callback_count = 0;
-	copy_memory(hook->saved, target - SAVED_BYTES / 2, SAVED_BYTES);
+	capture_code(target, window);
 	status = MH_CreateHook((LPVOID)target, &stubs[hook_count], &hook->original);
 	if (status == MH_OK) {
 		status = MH_EnableHook((LPVOID)target);
@@ -187,9 +182,14 @@ static Hook *install_hook(lua_State *L, INT_PTR target)
 			MH_RemoveHook((LPVOID)target);
 	}
 	if (status == MH_ERROR_MEMORY_ALLOC)
+		status = install_far_hook(target, &stubs[hook_count], &hook->original);
+	if (status == MH_ERROR_MEMORY_ALLOC)
 		luaL_error(L, "cannot hook %p: no free memory near the game's code for the trampoline", (void *)target);
+	if (status == MH_ERROR_UNSUPPORTED_FUNCTION)
+		luaL_error(L, "cannot hook %p: its first bytes cannot run from far memory once the near area is full", (void *)target);
 	if (status != MH_OK)
 		luaL_error(L, "cannot hook %p: %s", (void *)target, MH_StatusToString(status));
+	remember_code(target, window);
 	hook_count++;
 	return hook;
 }
@@ -564,6 +564,8 @@ static int l_unhook(lua_State *L)
 	Hook *hook = find_hook(pointer_argument(L, 1));
 	int i;
 
+	if (!lua_isnoneornil(L, 2))
+		luaL_checktype(L, 2, LUA_TFUNCTION);
 	if (!hook)
 		return 0;
 	if (lua_isnoneornil(L, 2)) {
@@ -593,7 +595,7 @@ static int l_hook_info(lua_State *L)
 	lua_setfield(L, -2, "original");
 	lua_pushboolean(L, attached > 0);
 	lua_setfield(L, -2, "attached");
-	lua_pushnumber(L, attached);
+	lua_pushnumber(L, (lua_Number)attached);
 	lua_setfield(L, -2, "callbacks");
 	lua_pushnumber(L, (lua_Number)hook->calls);
 	lua_setfield(L, -2, "calls");
@@ -606,9 +608,86 @@ static int l_hook_info(lua_State *L)
 	return 1;
 }
 
+BOOL describe_hook_code(ULONG_PTR address, char *out, size_t size)
+{
+	ULONG_PTR stub_start = (ULONG_PTR)stubs, original;
+	int i;
+
+	if (stubs && address >= stub_start && address < stub_start + sizeof(HookStub) * hook_count) {
+		i = (int)((address - stub_start) / sizeof(HookStub));
+		if (out)
+			_snprintf_s(out, size, _TRUNCATE, "Plus hook stub for Warhammer3.exe+0x%llx", (unsigned long long)exe_offset(hooks[i].target));
+		return TRUE;
+	}
+	for (i = 0; i < hook_count; i++) {
+		original = (ULONG_PTR)hooks[i].original;
+		if (original && address >= original && address < original + TRAMPOLINE_SIZE) {
+			if (out)
+				_snprintf_s(out, size, _TRUNCATE, "trampoline of the Plus hook on Warhammer3.exe+0x%llx",
+					(unsigned long long)exe_offset(hooks[i].target));
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static void add_callback_sources(Text *report, lua_State *live, const Hook *hook)
+{
+	DebugRecord record;
+	int i, top;
+
+	for (i = 0; i < hook->callback_count; i++) {
+		if (!is_attached(&hook->callbacks[i]) || hook->callbacks[i].state != live)
+			continue;
+		top = lua_gettop(live);
+		lua_rawgeti(live, LUA_REGISTRYINDEX, hook->callbacks[i].function);
+		if (lua_isfunction(live, -1) && lua_getinfo(live, ">S", &record.fields)) {
+			record.raw[DEBUG_RECORD_SIZE - 1] = '\0';
+			add_text(report, ", callback %s:%d", record.fields.short_src, record.fields.linedefined);
+		}
+		lua_settop(live, top);
+	}
+}
+
+static void add_hook_line(Text *report, lua_State *live, const Hook *hook)
+{
+	add_text(report, "  Warhammer3.exe+0x%llx  calls %lu", (unsigned long long)exe_offset(hook->target), (unsigned long)hook->calls);
+	if (hook->other_thread_calls)
+		add_text(report, ", other threads %ld", hook->other_thread_calls);
+	if (hook->running)
+		add_text(report, ", RUNNING (on the stack)");
+	if (live) {
+		__try {
+			add_callback_sources(report, live, hook);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			add_text(report, ", callbacks unreadable");
+		}
+	}
+	if (hook->error[0])
+		add_text(report, ", last callback error: %s", hook->error);
+	add_text(report, "\n");
+}
+
+void add_hooks(Text *report, lua_State *live)
+{
+	int i, shown = 0, pass;
+
+	add_text(report, "memreader Plus hooks: %d\n", hook_count);
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0; i < hook_count && shown < MAX_REPORTED_HOOKS; i++) {
+			if ((pass == 0) == (hooks[i].running > 0 || hooks[i].error[0] != '\0')) {
+				add_hook_line(report, live, &hooks[i]);
+				shown++;
+			}
+		}
+	}
+	if (shown < hook_count)
+		add_text(report, "  and %d more\n", hook_count - shown);
+}
+
 static int l_hook_depth(lua_State *L)
 {
-	lua_pushnumber(L, callback_depth);
+	lua_pushnumber(L, (lua_Number)callback_depth);
 	return 1;
 }
 

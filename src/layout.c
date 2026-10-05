@@ -226,7 +226,7 @@ static void push_list(lua_State *L, Walk *walk, int element, INT_PTR address)
 {
 	CaList list;
 	CaListNode header;
-	INT_PTR end = address + offsetof(CaList, last);
+	INT_PTR end = address + LIST_END;
 	INT_PTR previous = 0;
 	INT_PTR node;
 	int i;
@@ -356,7 +356,7 @@ static int push_field_types(lua_State *L)
 
 static INT_PTR start_walk(lua_State *L, Walk *walk, int field)
 {
-	INT_PTR address = check_pointer(L, 1) + (INT_PTR)to_offset(L, 2);
+	INT_PTR address = address_argument(L, 1);
 
 	luaL_checktype(L, field, LUA_TTABLE);
 	memset(walk, 0, sizeof *walk);

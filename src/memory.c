@@ -3,6 +3,8 @@
 #include "common.h"
 
 enum {
+	MAX_PATCH_SIZE = 4096,
+	PATCH_PAGES = 2,
 	STACK_BUFFER_SIZE = 1024,
 	MAX_READ_SIZE = 16 * 1024 * 1024,
 	IN_PLACE_STRING_TAG = 8,
@@ -13,6 +15,14 @@ typedef struct {
 	INT_PTR data;
 	size_t length;
 } StringView;
+
+typedef struct {
+	INT_PTR address;
+	const char *expected;
+	const char *bytes;
+	size_t size;
+	char current[MAX_PATCH_SIZE];
+} PatchSite;
 
 int catch_fault(const EXCEPTION_RECORD *record, Fault *fault)
 {
@@ -37,38 +47,43 @@ void restore_guard(ULONG_PTR address)
 		VirtualProtect((LPVOID)address, 1, page.Protect | PAGE_GUARD, &old_protection);
 }
 
+static BOOL guarded_copy(void *destination, const void *source, size_t size, BOOL zero)
+{
+	Fault fault = { 0, 0, NULL };
+
+	__try {
+		if (zero)
+			memset(destination, 0, size);
+		else
+			memmove(destination, source, size);
+	} __except (catch_fault(GetExceptionInformation()->ExceptionRecord, &fault)) {
+		if (fault.code == STATUS_GUARD_PAGE_VIOLATION)
+			restore_guard(fault.address);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 BOOL copy_memory(void *destination, INT_PTR address, size_t size)
 {
-	Fault fault = { 0, 0, NULL };
-
-	__try {
-		memcpy(destination, (const void *)address, size);
-	} __except (catch_fault(GetExceptionInformation()->ExceptionRecord, &fault)) {
-		if (fault.code == STATUS_GUARD_PAGE_VIOLATION)
-			restore_guard(fault.address);
-		return FALSE;
-	}
-	return TRUE;
+	return guarded_copy(destination, (const void *)address, size, FALSE);
 }
 
-static BOOL copy_into_memory(INT_PTR address, const void *source, size_t size)
+static BOOL store(INT_PTR address, const void *source, size_t size)
 {
-	Fault fault = { 0, 0, NULL };
-
-	__try {
-		memcpy((void *)address, source, size);
-	} __except (catch_fault(GetExceptionInformation()->ExceptionRecord, &fault)) {
-		if (fault.code == STATUS_GUARD_PAGE_VIOLATION)
-			restore_guard(fault.address);
-		return FALSE;
-	}
-	return TRUE;
+	if (guarded_copy((void *)address, source, size, FALSE))
+		return TRUE;
+	return in_game_image(address, size) && WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
 }
 
-static BOOL write_memory(INT_PTR address, const void *source, size_t size)
+BOOL write_memory(INT_PTR address, const void *source, size_t size)
 {
-	return copy_into_memory(address, source, size)
-		|| WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
+	return may_write(address, size) && store(address, source, size);
+}
+
+BOOL zero_memory(INT_PTR address, size_t size)
+{
+	return may_write(address, size) && guarded_copy((void *)address, NULL, size, TRUE);
 }
 
 void push_read_error(lua_State *L, int result)
@@ -80,7 +95,7 @@ void push_read_error(lua_State *L, int result)
 	}
 }
 
-void check_read(lua_State *L, int result)
+static void check_read(lua_State *L, int result)
 {
 	if (result == READ_OK)
 		return;
@@ -91,11 +106,6 @@ void check_read(lua_State *L, int result)
 static void read_or_fail(lua_State *L, INT_PTR address, void *destination, size_t size)
 {
 	check_read(L, copy_memory(destination, address, size) ? READ_OK : READ_FAILED);
-}
-
-static INT_PTR address_argument(lua_State *L)
-{
-	return check_pointer(L, 1) + (INT_PTR)to_offset(L, 2);
 }
 
 static BOOL flag_argument(lua_State *L, int index)
@@ -138,7 +148,7 @@ int push_integer(lua_State *L, INT_PTR address, int type, BOOL exact)
 
 static int read_integer(lua_State *L, int type)
 {
-	INT_PTR address = address_argument(L);
+	INT_PTR address = address_argument(L, 1);
 	check_read(L, push_integer(L, address, type, flag_argument(L, 3)));
 	return 1;
 }
@@ -155,7 +165,7 @@ static int l_read_uint64(lua_State *L) { return read_integer(L, VALUE_UINT64); }
 static int l_read_float(lua_State *L)
 {
 	float number;
-	read_or_fail(L, address_argument(L), &number, sizeof number);
+	read_or_fail(L, address_argument(L, 1), &number, sizeof number);
 	lua_pushnumber(L, number);
 	return 1;
 }
@@ -163,7 +173,7 @@ static int l_read_float(lua_State *L)
 static int l_read_double(lua_State *L)
 {
 	double number;
-	read_or_fail(L, address_argument(L), &number, sizeof number);
+	read_or_fail(L, address_argument(L, 1), &number, sizeof number);
 	lua_pushnumber(L, (lua_Number)number);
 	return 1;
 }
@@ -171,7 +181,7 @@ static int l_read_double(lua_State *L)
 static int l_read_pointer(lua_State *L)
 {
 	INT_PTR pointer;
-	read_or_fail(L, address_argument(L), &pointer, sizeof pointer);
+	read_or_fail(L, address_argument(L, 1), &pointer, sizeof pointer);
 	push_value(L, VALUE_POINTER, pointer);
 	return 1;
 }
@@ -179,14 +189,14 @@ static int l_read_pointer(lua_State *L)
 static int l_read_boolean(lua_State *L)
 {
 	BYTE byte;
-	read_or_fail(L, address_argument(L), &byte, sizeof byte);
+	read_or_fail(L, address_argument(L, 1), &byte, sizeof byte);
 	lua_pushboolean(L, byte != 0);
 	return 1;
 }
 
 static int l_read(lua_State *L)
 {
-	INT_PTR address = address_argument(L);
+	INT_PTR address = address_argument(L, 1);
 	lua_Number size = lua_tonumber(L, 3);
 
 	if (!(size >= 1)) {
@@ -238,6 +248,13 @@ BOOL read_ca_text(INT_PTR address, BOOL wide, char *out, size_t size)
 	return TRUE;
 }
 
+int string_view_result(INT_PTR address, size_t char_size)
+{
+	StringView view;
+
+	return string_view(address, char_size, &view);
+}
+
 int push_string(lua_State *L, INT_PTR address, size_t char_size)
 {
 	StringView view;
@@ -278,7 +295,7 @@ int push_unistring(lua_State *L, INT_PTR address)
 
 static int l_read_string(lua_State *L)
 {
-	INT_PTR address = address_argument(L);
+	INT_PTR address = address_argument(L, 1);
 	BOOL is_pointer = flag_argument(L, 3);
 	size_t char_size = flag_argument(L, 4) ? sizeof(WCHAR) : sizeof(char);
 
@@ -290,7 +307,7 @@ static int l_read_string(lua_State *L)
 
 static int l_read_unistring(lua_State *L)
 {
-	check_read(L, push_unistring(L, address_argument(L)));
+	check_read(L, push_unistring(L, address_argument(L, 1)));
 	return 1;
 }
 
@@ -298,7 +315,7 @@ static int l_read_array(lua_State *L)
 {
 	CaVector vector;
 
-	read_or_fail(L, address_argument(L), &vector, sizeof vector);
+	read_or_fail(L, address_argument(L, 1), &vector, sizeof vector);
 	if (vector.size <= 0)
 		vector.data = 0;
 
@@ -312,7 +329,7 @@ static int l_read_array(lua_State *L)
 
 static int l_read_rowidx(lua_State *L)
 {
-	INT_PTR address = address_argument(L);
+	INT_PTR address = address_argument(L, 1);
 	INT_PTR base = check_pointer(L, 3);
 	INT64 row_size = (INT64)lua_tonumber(L, 4);
 	INT_PTR entry;
@@ -326,29 +343,172 @@ static int l_read_rowidx(lua_State *L)
 
 static int l_write(lua_State *L)
 {
-	INT_PTR address = address_argument(L);
+	INT_PTR address = address_argument(L, 1);
 	TypedValue *value = to_value(L, 3);
-	BOOL written;
+	BYTE byte;
+	float number;
+	const void *source;
+	size_t size;
 
 	if (lua_type(L, 3) == LUA_TBOOLEAN) {
-		BYTE byte = (BYTE)lua_toboolean(L, 3);
-		written = write_memory(address, &byte, sizeof byte);
+		byte = (BYTE)lua_toboolean(L, 3);
+		source = &byte;
+		size = sizeof byte;
 	} else if (lua_type(L, 3) == LUA_TNUMBER) {
-		float number = (float)lua_tonumber(L, 3);
-		written = write_memory(address, &number, sizeof number);
+		number = (float)lua_tonumber(L, 3);
+		source = &number;
+		size = sizeof number;
 	} else if (lua_type(L, 3) == LUA_TSTRING) {
-		size_t length;
-		const char *bytes = lua_tolstring(L, 3, &length);
-		written = write_memory(address, bytes, length);
+		source = lua_tolstring(L, 3, &size);
 	} else if (value) {
-		written = write_memory(address, &value->pointer, value_size(value->type));
+		source = &value->pointer;
+		size = value_size(value->type);
 	} else {
 		return luaL_error(L, "passed invalid argument type");
 	}
-
-	if (!written)
+	check_write(L, 1, "write", address, size);
+	if (!store(address, source, size))
 		return luaL_error(L, "failed to write memory");
 	return 0;
+}
+
+const IMAGE_NT_HEADERS *game_headers(void)
+{
+	const BYTE *base = (const BYTE *)GetModuleHandleA(NULL);
+
+	return (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+}
+
+BOOL in_game_image(INT_PTR address, size_t size)
+{
+	INT_PTR start = (INT_PTR)GetModuleHandleA(NULL);
+	INT_PTR end = start + (INT_PTR)game_headers()->OptionalHeader.SizeOfImage;
+
+	return address >= start && address + (INT_PTR)size <= end;
+}
+
+static DWORD writable(DWORD protection)
+{
+	if (protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+		return PAGE_EXECUTE_READWRITE;
+	return PAGE_READWRITE;
+}
+
+BOOL patch_memory(INT_PTR address, const char *bytes, size_t size)
+{
+	SYSTEM_INFO system;
+	MEMORY_BASIC_INFORMATION page;
+	DWORD old[PATCH_PAGES], unused;
+	INT_PTR first, at;
+	int pages = 0, i;
+	BOOL written;
+
+	GetSystemInfo(&system);
+	first = address & ~(INT_PTR)(system.dwPageSize - 1);
+	for (at = first; at < address + (INT_PTR)size; at += system.dwPageSize) {
+		if (!VirtualQuery((LPCVOID)at, &page, sizeof page) || page.State != MEM_COMMIT ||
+			(page.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || pages == PATCH_PAGES ||
+			!VirtualProtect((LPVOID)at, 1, writable(page.Protect), &old[pages]))
+			break;
+		pages++;
+	}
+	written = at >= address + (INT_PTR)size && guarded_copy((void *)address, bytes, size, FALSE);
+	for (i = 0; i < pages; i++)
+		VirtualProtect((LPVOID)(first + (INT_PTR)i * system.dwPageSize), 1, old[i], &unused);
+	FlushInstructionCache(GetCurrentProcess(), (LPCVOID)address, size);
+	return written;
+}
+
+enum PatchState { PATCH_EXPECTED, PATCH_DONE, PATCH_OTHER };
+
+static void site_error(lua_State *L, int number, int argument, const char *message)
+{
+	if (number)
+		luaL_error(L, "site %d: %s", number, message);
+	luaL_argerror(L, argument, message);
+}
+
+static int check_patch(lua_State *L, int index, int number, PatchSite *site)
+{
+	size_t new_size;
+
+	site->address = pointer_argument(L, index);
+	site->expected = luaL_checklstring(L, index + 1, &site->size);
+	site->bytes = luaL_checklstring(L, index + 2, &new_size);
+	if (site->size != new_size)
+		site_error(L, number, index + 2, "must be as long as the expected bytes");
+	if (site->size == 0 || site->size > MAX_PATCH_SIZE)
+		site_error(L, number, index + 1, lua_pushfstring(L, "must be 1 to %d bytes", MAX_PATCH_SIZE));
+	if (!in_game_image(site->address, site->size))
+		site_error(L, number, index, "address is outside the game's exe");
+	if (!may_write(site->address, site->size)) {
+		note_refusal(L, number ? "relocate_field" : "patch", site->address);
+		site_error(L, number, index, "refused: the exe's headers and import or export tables are never patched");
+	}
+	read_or_fail(L, site->address, site->current, site->size);
+	if (memcmp(site->current, site->bytes, site->size) == 0)
+		return PATCH_DONE;
+	return memcmp(site->current, site->expected, site->size) == 0 ? PATCH_EXPECTED : PATCH_OTHER;
+}
+
+static int l_patch(lua_State *L)
+{
+	PatchSite site;
+	int state = check_patch(L, 1, 0, &site);
+
+	if (state == PATCH_OTHER)
+		lua_pushnil(L);
+	if (state == PATCH_EXPECTED)
+		remember_original(site.address, site.size);
+	if (state == PATCH_EXPECTED && !patch_memory(site.address, site.bytes, site.size))
+		return luaL_error(L, "failed to patch memory");
+	if (state == PATCH_EXPECTED)
+		note_change(L, "patch", site.address, site.size);
+	lua_pushlstring(L, site.current, site.size);
+	return state == PATCH_OTHER ? 2 : 1;
+}
+
+static int check_site(lua_State *L, int index, PatchSite *site)
+{
+	int state;
+
+	lua_rawgeti(L, 1, index);
+	if (!lua_istable(L, -1))
+		luaL_error(L, "site %d is not a table {address, expected, bytes}", index);
+	lua_rawgeti(L, -1, 1);
+	lua_rawgeti(L, -2, 2);
+	lua_rawgeti(L, -3, 3);
+	state = check_patch(L, lua_gettop(L) - 2, index, site);
+	lua_pop(L, 4);
+	return state;
+}
+
+static int l_relocate_field(lua_State *L)
+{
+	PatchSite site;
+	int count, i;
+
+	luaL_checktype(L, 1, LUA_TTABLE);
+	count = (int)lua_objlen(L, 1);
+	if (count == 0)
+		return luaL_argerror(L, 1, "no sites");
+	for (i = 1; i <= count; i++) {
+		if (check_site(L, i, &site) == PATCH_OTHER) {
+			lua_pushnil(L);
+			lua_pushinteger(L, i);
+			return 2;
+		}
+	}
+	for (i = 1; i <= count; i++) {
+		if (check_site(L, i, &site) != PATCH_EXPECTED)
+			continue;
+		remember_original(site.address, site.size);
+		if (!patch_memory(site.address, site.bytes, site.size))
+			return luaL_error(L, "site %d: failed to patch memory after verifying every site", i);
+		note_change(L, "relocate_field", site.address, site.size);
+	}
+	lua_pushboolean(L, 1);
+	return 1;
 }
 
 const luaL_Reg memory_functions[] = {
@@ -370,5 +530,7 @@ const luaL_Reg memory_functions[] = {
 	{ "read_rowidx", l_read_rowidx },
 	{ "read", l_read },
 	{ "write", l_write },
+	{ "patch", l_patch },
+	{ "relocate_field", l_relocate_field },
 	{ NULL, NULL }
 };

@@ -16,7 +16,7 @@ static const size_t type_sizes[VALUE_TYPE_COUNT] = {
 };
 static const char *const operation_names[] = { "addition", "subtraction", "multiplication", "divide" };
 static const char *const comparison_symbols[] = { ">", "<", "==" };
-static const char interned_values_key = 0;
+static char interned_keys[VALUE_TYPE_COUNT];
 
 _Static_assert(offsetof(TypedValue, pointer) == 8 && sizeof(TypedValue) == 16, "TypedValue must match memreader's layout");
 
@@ -25,9 +25,9 @@ size_t value_size(int type)
 	return type_sizes[type];
 }
 
-static void push_interned_values(lua_State *L)
+static void push_interned_values(lua_State *L, int type)
 {
-	lua_pushlightuserdata(L, (void *)&interned_values_key);
+	lua_pushlightuserdata(L, &interned_keys[type]);
 	lua_rawget(L, LUA_REGISTRYINDEX);
 	if (!lua_isnil(L, -1))
 		return;
@@ -37,7 +37,7 @@ static void push_interned_values(lua_State *L)
 	lua_pushliteral(L, "v");
 	lua_setfield(L, -2, "__mode");
 	lua_setmetatable(L, -2);
-	lua_pushlightuserdata(L, (void *)&interned_values_key);
+	lua_pushlightuserdata(L, &interned_keys[type]);
 	lua_pushvalue(L, -2);
 	lua_rawset(L, LUA_REGISTRYINDEX);
 }
@@ -64,8 +64,8 @@ TypedValue *push_value(lua_State *L, int type, INT64 number)
 	TypedValue value, *interned;
 
 	set_value(&value, type, number);
-	push_interned_values(L);
-	lua_pushlstring(L, (const char *)&value, sizeof value);
+	push_interned_values(L, type);
+	lua_pushlightuserdata(L, (void *)value.pointer);
 	lua_pushvalue(L, -1);
 	lua_rawget(L, -3);
 	interned = lua_touserdata(L, -1);
@@ -170,6 +170,20 @@ INT_PTR check_pointer(lua_State *L, int index)
 		return (INT_PTR)bytes_to_integer(bytes, length, sizeof(INT_PTR));
 	}
 	return luaL_error(L, "expected pointer argument in the form of raw string or pointer type");
+}
+
+INT64 whole_argument(lua_State *L, int index, INT64 low, INT64 high, const char *name)
+{
+	lua_Number number = luaL_checknumber(L, index);
+
+	if (!(number >= (lua_Number)low && number <= (lua_Number)high) || number != (lua_Number)(INT64)number)
+		luaL_argerror(L, index, lua_pushfstring(L, "%s must be a whole number from %d to %d", name, (int)low, (int)high));
+	return (INT64)number;
+}
+
+INT_PTR address_argument(lua_State *L, int index)
+{
+	return check_pointer(L, index) + (INT_PTR)to_offset(L, index + 1);
 }
 
 static int make_value(lua_State *L, int type)

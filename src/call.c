@@ -131,7 +131,7 @@ INT_PTR pointer_argument(lua_State *L, int index)
 	TypedValue *value = to_value(L, index);
 	INT_PTR pointer;
 
-	if (lua_isnil(L, index))
+	if (lua_isnoneornil(L, index))
 		return 0;
 	if (value && value->type == VALUE_POINTER)
 		return value->pointer;
@@ -234,13 +234,30 @@ static BOOL guarded_call(INT_PTR function, const UINT64 *arguments, int count, U
 	return done;
 }
 
-static int crash_error(lua_State *L, const Fault *fault)
+static int call_crash_error(lua_State *L, const Fault *fault)
 {
 	if (is_memory_fault(fault->code))
 		return luaL_error(L, "the called function crashed at %p (%s at %p); the game may be unstable now",
 			fault->instruction, fault_name(fault->code), (void *)fault->address);
 	return luaL_error(L, "the called function crashed at %p (%s); the game may be unstable now", fault->instruction,
 		fault_name(fault->code));
+}
+
+BOOL call_native(INT_PTR function, const UINT64 *arguments, int count, UINT64 *result, Fault *fault)
+{
+	UINT64 float_result = 0;
+
+	return guarded_call(function, arguments, count, result, &float_result, fault);
+}
+
+UINT64 call_game(lua_State *L, INT_PTR function, const UINT64 *arguments, int count)
+{
+	UINT64 result = 0;
+	Fault fault = { 0, 0, NULL };
+
+	if (!call_native(function, arguments, count, &result, &fault))
+		call_crash_error(L, &fault);
+	return result;
 }
 
 BOOL is_float_type(int type)
@@ -285,7 +302,7 @@ int call_with_signature(lua_State *L, INT_PTR function, const Signature *signatu
 	if (!function)
 		return luaL_argerror(L, 1, "function address is NULL");
 	if (!guarded_call(function, arguments, signature->count, &result, &float_result, &fault))
-		return crash_error(L, &fault);
+		return call_crash_error(L, &fault);
 	if (signature->result == CALL_VOID)
 		return 0;
 	push_bits(L, signature->result, is_float_type(signature->result) ? float_result : result);
@@ -298,6 +315,10 @@ static int l_call(lua_State *L)
 	Signature signature;
 
 	parse_signature(L, luaL_checkstring(L, 2), &signature);
+	if (function && !in_exe_code(function) && !is_hook_original(function)) {
+		note_refusal(L, "call", function);
+		return luaL_argerror(L, 1, "refused: call takes only code in the game's exe or a hook's original");
+	}
 	return call_with_signature(L, function, &signature, 3);
 }
 
