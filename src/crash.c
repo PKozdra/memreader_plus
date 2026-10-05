@@ -1,4 +1,3 @@
-#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,20 +6,20 @@
 #include "MinHook.h"
 
 enum {
-	REPORT_SIZE = 16384,
-	DEBUG_RECORD_SIZE = 0x400,
-	MAX_FRAMES = 40,
-	MAX_LOCALS = 6,
-	MAX_LOCAL_TEXT = 80,
-	STAMP_LENGTH = sizeof "DDMMYY_HHMM" - 1
+	REPORT_SIZE = 48 * 1024,
+	STAMP_LENGTH = sizeof "DDMMYY_HHMM" - 1,
+	REPORT_WAIT_MS = 5000,
+	GAME_FILE_GRACE_SECONDS = 2,
+	TICKS_PER_SECOND = 10000000
 };
 
-typedef union {
-	lua_Debug fields;
-	char raw[DEBUG_RECORD_SIZE];
-} DebugRecord;
+typedef int (*GameHandler)(DWORD code, EXCEPTION_POINTERS *info);
 
-_Static_assert(offsetof(lua_Debug, short_src) == 0x38, "the game's lua_Debug starts like stock Lua 5.1 on x64");
+typedef struct {
+	EXCEPTION_POINTERS *info;
+	DWORD thread;
+	BOOL confirmed;
+} PendingFault;
 
 extern IMAGE_DOS_HEADER __ImageBase;
 
@@ -33,26 +32,26 @@ static const char game_handler_pattern[] =
 	"4C 8B F2 44 38 25 ?? ?? ?? ?? 8B D9 74 0A 48 83 C9 FF E8 ?? ?? ?? ?? CC B8 8D 00 00 C0";
 static const char game_file_format[] = "D%4d-%2d-%2d_T%2d-%2d-%2d";
 
-enum { GAME_FILE_GRACE_SECONDS = 2, TICKS_PER_SECOND = 10000000 };
-
-typedef int (*GameHandler)(DWORD code, EXCEPTION_POINTERS *info);
-
-static PVOID handler;
+static BOOL watching;
 static BOOL enabled = TRUE;
-static BOOL reported;
 static GameHandler game_handler;
+static BOOL game_handler_hooked;
 static FILETIME fault_time;
 static char script_log[MAX_PATH];
-static char written_path[MAX_PATH + sizeof report_format + STAMP_LENGTH];
+static char report_path[MAX_PATH + sizeof report_format + STAMP_LENGTH];
+static char written_path[sizeof report_path];
 static lua_State *watched;
 static DWORD script_thread;
+static HANDLE script_thread_handle;
 static ULONG_PTR own_start;
 static ULONG_PTR own_end;
 static LONG guarded_calls;
-static BOOL reporting;
-static char report_path[MAX_PATH + sizeof report_format + STAMP_LENGTH];
-static char report[REPORT_SIZE];
-static size_t used;
+static LONG reporting;
+static HANDLE wake_event;
+static HANDLE done_event;
+static PendingFault pending;
+static char report_buffer[REPORT_SIZE];
+static Text report = { report_buffer, sizeof report_buffer, 0 };
 
 void begin_guarded_call(void)
 {
@@ -79,18 +78,6 @@ void resume_guarded_calls(LONG paused)
 	InterlockedExchange(&guarded_calls, paused);
 }
 
-static void add(const char *format, ...)
-{
-	va_list arguments;
-
-	if (used >= sizeof report - 1)
-		return;
-	va_start(arguments, format);
-	_vsnprintf_s(report + used, sizeof report - used, _TRUNCATE, format, arguments);
-	va_end(arguments);
-	used += strlen(report + used);
-}
-
 static BOOL is_fatal(DWORD code)
 {
 	switch (code) {
@@ -104,56 +91,9 @@ static BOOL is_fatal(DWORD code)
 	return FALSE;
 }
 
-static void add_string_locals(lua_State *L, lua_Debug *frame)
+static UINT64 ticks_of(FILETIME time)
 {
-	int index;
-	const char *name;
-
-	for (index = 1; index <= MAX_LOCALS && (name = lua_getlocal(L, frame, index)) != NULL; index++) {
-		if (lua_type(L, -1) == LUA_TSTRING)
-			add("      %s = \"%.*s\"\n", name, MAX_LOCAL_TEXT, lua_tostring(L, -1));
-		lua_pop(L, 1);
-	}
-}
-
-static void add_lua_stack(lua_State *L)
-{
-	DebugRecord frame;
-	int level;
-
-	for (level = 0; level < MAX_FRAMES && lua_getstack(L, level, &frame.fields); level++) {
-		if (!lua_getinfo(L, "Sln", &frame.fields))
-			break;
-		frame.raw[DEBUG_RECORD_SIZE - 1] = '\0';
-		add("  #%d %s:%d in %s '%s' (%s)\n", level, frame.fields.short_src, frame.fields.currentline,
-			frame.fields.namewhat, frame.fields.name ? frame.fields.name : "?", frame.fields.what);
-		add_string_locals(L, &frame.fields);
-	}
-	if (level == 0)
-		add("  no Lua function was running: the fault is in native game code\n");
-}
-
-static const char *access_name(ULONG_PTR access)
-{
-	switch (access) {
-	case EXCEPTION_READ_FAULT:    return "read";
-	case EXCEPTION_EXECUTE_FAULT: return "execution";
-	default:                      return "write";
-	}
-}
-
-static void add_location(const EXCEPTION_RECORD *record)
-{
-	ULONG_PTR address = (ULONG_PTR)record->ExceptionAddress;
-	ULONG_PTR exe = (ULONG_PTR)GetModuleHandleA(NULL);
-	const IMAGE_NT_HEADERS *headers = (const IMAGE_NT_HEADERS *)(exe + ((const IMAGE_DOS_HEADER *)exe)->e_lfanew);
-
-	if (address >= exe && address < exe + headers->OptionalHeader.SizeOfImage)
-		add("at Warhammer3.exe+0x%llx", (unsigned long long)(address - exe));
-	else
-		add("at %p (outside the game exe)", record->ExceptionAddress);
-	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
-		add(", %s of %p", access_name(record->ExceptionInformation[0]), (void *)record->ExceptionInformation[1]);
+	return (UINT64)time.dwHighDateTime << 32 | time.dwLowDateTime;
 }
 
 static void write_report(void)
@@ -161,39 +101,92 @@ static void write_report(void)
 	HANDLE file = CreateFileA(report_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	const char *session;
 	size_t session_length;
-	DWORD written;
 
 	if (file == INVALID_HANDLE_VALUE)
 		return;
 	session = session_text(&session_length);
-	WriteFile(file, report, (DWORD)used, &written, NULL);
-	WriteFile(file, session, (DWORD)session_length, &written, NULL);
+	write_redacted(file, report.data, report.used);
+	write_redacted(file, session, session_length);
 	CloseHandle(file);
 	memcpy(written_path, report_path, sizeof written_path);
-	reported = TRUE;
 }
 
-static void build_report(const EXCEPTION_RECORD *record)
+static void make_report(void)
 {
-	SYSTEMTIME time;
+	CONTEXT script = { 0 };
+	CrashInput input = { pending.info, pending.thread, script_thread, NULL, watched, pending.confirmed, script_log };
+	SYSTEMTIME now;
+	BOOL paused = FALSE;
 
-	GetLocalTime(&time);
-	SystemTimeToFileTime(&time, &fault_time);
-	used = 0;
-	add("memreader Plus %s: the game hit a fatal fault on the script thread.\n", MEMREADER_PLUS_VERSION);
-	add("%04d-%02d-%02d %02d:%02d:%02d, exception 0x%08lx ", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
-		time.wSecond, record->ExceptionCode);
-	add_location(record);
-	if (script_log[0])
-		add("\nScript log of this Lua state: %s", script_log);
-	else
-		add("\nScript logging is off");
-	add("\nLua stack of the script thread, innermost first:\n");
-	__try {
-		add_lua_stack(watched);
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		add("  the Lua state could not be read any further\n");
+	GetLocalTime(&now);
+	SystemTimeToFileTime(&now, &fault_time);
+	input.time = fault_time;
+	if (pending.thread != script_thread && script_thread_handle && SuspendThread(script_thread_handle) != (DWORD)-1) {
+		paused = TRUE;
+		script.ContextFlags = CONTEXT_FULL;
+		if (GetThreadContext(script_thread_handle, &script))
+			input.script = &script;
 	}
+	build_crash_report(&report, &input);
+	if (paused)
+		ResumeThread(script_thread_handle);
+	write_report();
+}
+
+static void warm_up(void)
+{
+	char scratch[64];
+	Text text = { scratch, sizeof scratch, 0 };
+	MEMORY_BASIC_INFORMATION region;
+	ULONG64 image;
+
+	add_text(&text, "%s %.9g %p %llu", "x", 1.5, (void *)&text, 1ULL);
+	VirtualQuery(&text, &region, sizeof region);
+	RtlLookupFunctionEntry((DWORD64)(ULONG_PTR)warm_up, &image, NULL);
+	GetTickCount64();
+}
+
+static DWORD WINAPI report_worker(LPVOID unused)
+{
+	(void)unused;
+	warm_up();
+	for (;;) {
+		WaitForSingleObject(wake_event, INFINITE);
+		make_report();
+		SetEvent(done_event);
+	}
+}
+
+static void start_worker(void)
+{
+	HANDLE thread;
+
+	wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	done_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	thread = wake_event && done_event ? CreateThread(NULL, 0, report_worker, NULL, 0, NULL) : NULL;
+	if (thread)
+		CloseHandle(thread);
+	else
+		wake_event = NULL;
+}
+
+static BOOL report_fault(EXCEPTION_POINTERS *info, BOOL confirmed)
+{
+	if (!enabled || !report_path[0] || (confirmed && written_path[0]) || InterlockedCompareExchange(&reporting, 1, 0))
+		return FALSE;
+	written_path[0] = '\0';
+	pending.info = info;
+	pending.thread = GetCurrentThreadId();
+	pending.confirmed = confirmed;
+	if (!wake_event) {
+		make_report();
+	} else {
+		SetEvent(wake_event);
+		if (WaitForSingleObject(done_event, REPORT_WAIT_MS) != WAIT_OBJECT_0)
+			return FALSE;
+	}
+	InterlockedExchange(&reporting, 0);
+	return written_path[0] != '\0';
 }
 
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
@@ -201,13 +194,9 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
 	const EXCEPTION_RECORD *record = info->ExceptionRecord;
 	ULONG_PTR address = (ULONG_PTR)record->ExceptionAddress;
 
-	if (!enabled || !is_fatal(record->ExceptionCode) || !watched || GetCurrentThreadId() != script_thread || reporting ||
-		guarded_calls > 0 || (address >= own_start && address < own_end))
-		return EXCEPTION_CONTINUE_SEARCH;
-	reporting = TRUE;
-	build_report(record);
-	write_report();
-	reporting = FALSE;
+	if (is_fatal(record->ExceptionCode) && watched && GetCurrentThreadId() == script_thread && guarded_calls == 0 &&
+		(address < own_start || address >= own_end))
+		report_fault(info, FALSE);
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -228,7 +217,12 @@ static void remember_state(lua_State *L)
 	lua_setmetatable(L, -2);
 	lua_rawset(L, LUA_REGISTRYINDEX);
 	watched = L;
+	if (script_thread == GetCurrentThreadId() && script_thread_handle)
+		return;
+	if (script_thread_handle)
+		CloseHandle(script_thread_handle);
 	script_thread = GetCurrentThreadId();
+	script_thread_handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, script_thread);
 }
 
 static FILETIME process_start(void)
@@ -295,11 +289,6 @@ static BOOL find_report_path(void)
 	return TRUE;
 }
 
-static UINT64 ticks_of(FILETIME time)
-{
-	return (UINT64)time.dwHighDateTime << 32 | time.dwLowDateTime;
-}
-
 static BOOL game_file_time(const char *name, FILETIME *time)
 {
 	SYSTEMTIME parts = { 0 };
@@ -347,37 +336,46 @@ static void note_game_files(void)
 	CloseHandle(file);
 }
 
-static BOOL is_recent(FILETIME time)
-{
-	SYSTEMTIME parts;
-	FILETIME now;
-
-	GetLocalTime(&parts);
-	SystemTimeToFileTime(&parts, &now);
-	return ticks_of(now) <= ticks_of(time) + (UINT64)GAME_FILE_GRACE_SECONDS * TICKS_PER_SECOND;
-}
-
 static int after_game_handler(DWORD code, EXCEPTION_POINTERS *info)
 {
-	BOOL same_fault = reported && is_recent(fault_time);
+	BOOL wrote = report_fault(info, TRUE);
 	int result = game_handler(code, info);
 
-	if (same_fault)
+	if (wrote)
 		note_game_files();
-	reported = FALSE;
 	return result;
 }
 
 static void hook_game_handler(void)
 {
-	int count;
-	const BYTE *target = find_code(game_handler_pattern, &count);
+	INT_PTR target = find_unique(game_handler_pattern);
+	BYTE window[SAVED_BYTES];
 
-	if (count != 1 || MH_CreateHook((LPVOID)target, (LPVOID)after_game_handler, (LPVOID *)&game_handler) != MH_OK)
+	if (!target || MH_CreateHook((LPVOID)target, (LPVOID)after_game_handler, (LPVOID *)&game_handler) != MH_OK)
 		return;
-	save_handler_code((INT_PTR)target);
-	if (MH_EnableHook((LPVOID)target) != MH_OK)
+	capture_code(target, window);
+	if (MH_EnableHook((LPVOID)target) == MH_OK) {
+		remember_code(target, window);
+		game_handler_hooked = TRUE;
+	} else {
 		MH_RemoveHook((LPVOID)target);
+	}
+}
+
+static int l_set_crash_context(lua_State *L)
+{
+	const char *name = luaL_checkstring(L, 1);
+	const char *value = lua_isnoneornil(L, 2) ? NULL : luaL_checkstring(L, 2);
+
+	set_crash_context(name, value);
+	return 0;
+}
+
+static int l_note_crash_event(lua_State *L)
+{
+	if (lua_type(L, 1) == LUA_TSTRING)
+		note_crash_event(lua_tostring(L, 1));
+	return 0;
 }
 
 static int l_set_crash_reports(lua_State *L)
@@ -390,24 +388,34 @@ static int l_set_crash_reports(lua_State *L)
 
 const luaL_Reg crash_functions[] = {
 	{ "set_crash_reports", l_set_crash_reports },
+	{ "set_crash_context", l_set_crash_context },
+	{ "note_crash_event", l_note_crash_event },
 	{ NULL, NULL }
 };
+
+static void start_watching(void)
+{
+	const IMAGE_NT_HEADERS *headers = (const IMAGE_NT_HEADERS *)((ULONG_PTR)&__ImageBase + __ImageBase.e_lfanew);
+	HMODULE module;
+
+	watching = TRUE;
+	describe_session();
+	prepare_native_report();
+	own_start = (ULONG_PTR)&__ImageBase;
+	own_end = own_start + headers->OptionalHeader.SizeOfImage;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(void *)on_exception, &module))
+		return;
+	start_worker();
+	hook_game_handler();
+	if (!game_handler_hooked)
+		AddVectoredExceptionHandler(1, on_exception);
+}
 
 void watch_crashes(lua_State *L)
 {
 	if (!find_report_path())
 		return;
-	if (!handler) {
-		describe_session();
-		hook_game_handler();
-		const IMAGE_NT_HEADERS *headers = (const IMAGE_NT_HEADERS *)((ULONG_PTR)&__ImageBase + __ImageBase.e_lfanew);
-		HMODULE module;
-
-		own_start = (ULONG_PTR)&__ImageBase;
-		own_end = own_start + headers->OptionalHeader.SizeOfImage;
-		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(void *)on_exception, &module))
-			return;
-		handler = AddVectoredExceptionHandler(1, on_exception);
-	}
+	if (!watching)
+		start_watching();
 	remember_state(L);
 }

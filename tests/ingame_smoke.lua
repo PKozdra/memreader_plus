@@ -141,7 +141,7 @@ local function check_call()
 	mr.write(text, 0, key)
 	check(mr.tostring(mr.call(murmur, 'uint32(pointer, uint32)', text, #key)) == '1628994413', 'call murmur_hash3_32')
 	local ok, err = pcall(mr.call, mr.pointer('\16\0\0\0\0\0\0\0'), 'void()')
-	check(not ok and err:match('access violation') ~= nil, 'call of a bad address is a Lua error')
+	check(not ok and err:match('refused') ~= nil, 'call of an address outside the exe is refused')
 	check(not pcall(mr.call, murmur, 'uint32(pointer, uint32)', text, 0x61187b6d), 'call refuses an inexact number')
 	check(not pcall(mr.call, murmur, 'uint32(pointer, uint32)', key, #key), 'call refuses text as a pointer')
 	if mr.read_uint8(murmur, -1) == 0xCC then

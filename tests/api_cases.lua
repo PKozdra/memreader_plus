@@ -557,6 +557,49 @@ fix('find_pattern across a protection change', function(mr)
 	test_protect(pointer_bytes(mr, page), PAGE_SIZE, old)
 	return count > 0 and split_count == count, mr.eq(split_address, address)
 end)
+fix('find_patterns across a protection change', function(mr)
+	local headers = mr.read_int32(mr.base, 0x3C)
+	local first_section = headers + 0x18 + mr.read_uint16(mr.base, headers + 0x14)
+	local page = mr.add(mr.base, mr.read_uint32(mr.base, first_section + 0x0C) + PAGE_SIZE)
+	local pattern = hex_pattern(mr.read(mr.add(page, -8), 0, 16))
+	local before = mr.find_patterns({ pattern })
+	local old = test_protect(pointer_bytes(mr, page), PAGE_SIZE, PAGE_EXECUTE_READWRITE)
+	local split, counts = mr.find_patterns({ pattern })
+	test_protect(pointer_bytes(mr, page), PAGE_SIZE, old)
+	return counts[1] > 0, mr.eq(split[1], before[1])
+end)
+fix('find_patterns agrees with a plain search', function(mr)
+	local headers = mr.read_int32(mr.base, 0x3C)
+	local first_section = headers + 0x18 + mr.read_uint16(mr.base, headers + 0x14)
+	local start = mr.add(mr.base, mr.read_uint32(mr.base, first_section + 0x0C))
+	local code = mr.read(start, 0, mr.read_uint32(mr.base, first_section + 0x08))
+	local function exact(bytes)
+		return (bytes
+			:gsub('.', function(char)
+				return string.format('%02X ', char:byte())
+			end)
+			:gsub(' $', ''))
+	end
+	local function plain_count(bytes)
+		local count, at = 0, 1
+		while true do
+			at = string.find(code, bytes, at, true)
+			if not at then return count end
+			count, at = count + 1, at + 1
+		end
+	end
+	local samples = { code:sub(1, 24), code:sub(-5), code:sub(-2), '\195\204\204' }
+	local patterns = {}
+	for i, bytes in ipairs(samples) do
+		patterns[i] = exact(bytes)
+	end
+	local _, counts = mr.find_patterns(patterns)
+	for i, bytes in ipairs(samples) do
+		local single = select(2, mr.find_pattern(patterns[i]))
+		if counts[i] ~= plain_count(bytes) or single ~= counts[i] then return false, i, counts[i], plain_count(bytes), single end
+	end
+	return true
+end)
 
 local function inline(text)
 	return text .. string.rep('\0', 15 - #text) .. string.char(0x80 + #text)
@@ -798,9 +841,9 @@ fix('call crash', function(mr)
 		err:match('the called function crashed at %x+ %(access violation at 0000000000000010%); the game may be unstable now$') ~= nil,
 		mr.call(test_address(mr, 'is_positive'), 'boolean(int32)', 1)
 end)
-fix('call bad address', function(mr)
+fix('call outside the exe', function(mr)
 	local ok, err = pcall(mr.call, mr.pointer(P), 'void()')
-	return ok, err == 'the called function crashed at 0000000000000010 (access violation at 0000000000000010); the game may be unstable now'
+	return ok, err == "bad argument #1 to '?' (refused: call takes only code in the game's exe or a hook's original)"
 end)
 fix('call Lua error inside', function(mr)
 	local ok, err = pcall(mr.call, test_address(mr, 'raise_lua_error'), 'void(pointer)', mr.pointer(test_state()))
@@ -963,6 +1006,16 @@ fix('hook unhook then error', function(mr)
 	mr.hook(target, HOOK_TARGET, callback)
 	return mr.call(target, HOOK_TARGET, 1, 2), mr.hook_info(target).attached
 end)
+fix('unhook with a match count', function(mr)
+	local target = test_address(mr, 'hook_target')
+	mr.hook(target, HOOK_TARGET, function()
+		return 7
+	end)
+	local ok, err = pcall(mr.unhook, target, 1)
+	local still = mr.hook_info(target).attached
+	mr.unhook(target)
+	return ok, err:match('function expected, got number') ~= nil, still, mr.hook_info(target).attached
+end)
 fix('hook signature while running', function(mr)
 	local target = test_address(mr, 'hook_target')
 	local ok, err
@@ -1029,6 +1082,387 @@ fix('alloc', function(mr)
 end)
 fix('alloc size', function(mr)
 	return mr.alloc(0)
+end)
+local function int64_bytes(n)
+	return string.char(n, 0, 0, 0, 0, 0, 0, 0)
+end
+local function game_vector(mr, values)
+	local header = mr.alloc(16)
+	local data = mr.game_alloc(#values * 8)
+	for i, value in ipairs(values) do
+		mr.write(data, (i - 1) * 8, int64_bytes(value))
+	end
+	mr.write(header, 0, mr.uint32(#values))
+	mr.write(header, 4, mr.int32(#values))
+	mr.write(header, 8, data)
+	return header
+end
+local function vector_values(mr, header)
+	return table.concat(mr.read_vector(header, 0, { 0, 'int32' }, 8), ' ')
+end
+local function patch_target(mr)
+	return mr.pointer(test_function('patch_target'))
+end
+local MOV_EAX_1 = '\184\1\0\0\0'
+local MOV_EAX_2 = '\184\2\0\0\0'
+
+fix('game_alloc and game_free', function(mr)
+	local before = test_heap_blocks()
+	local block = mr.game_alloc(32)
+	local zeroed = mr.read(block, 0, 32) == string.rep('\0', 32)
+	local during = test_heap_blocks() - before
+	mr.game_free(block)
+	return zeroed, during, test_heap_blocks() - before
+end)
+fix('game_alloc size', function(mr)
+	return mr.game_alloc(0)
+end)
+fix('game_free NULL', function(mr)
+	return mr.game_free(mr.pointer(NULL))
+end)
+fix('game_free deferred', function(mr)
+	local before = test_heap_blocks()
+	mr.game_free(mr.game_alloc(8), true)
+	return test_heap_blocks() - before
+end)
+fix('patch code', function(mr)
+	local f = patch_target(mr)
+	local before = mr.call(f, 'int32()')
+	local old = mr.patch(f, MOV_EAX_1, MOV_EAX_2)
+	local after = mr.call(f, 'int32()')
+	local again = mr.patch(f, MOV_EAX_1, MOV_EAX_2)
+	mr.patch(f, MOV_EAX_2, MOV_EAX_1)
+	return before, old, after, again, mr.call(f, 'int32()')
+end)
+fix('patch mismatch', function(mr)
+	return mr.patch(patch_target(mr), '\184\9\0\0\0', MOV_EAX_2)
+end)
+fix('function_start', function(mr)
+	local f = mr.pointer(test_function('call_directly'))
+	local start, finish = mr.function_start(f)
+	local mid_start, mid_finish = mr.function_start(mr.add(f, 4))
+	return mr.eq(start, f), mr.eq(mid_start, f), mr.eq(finish, mid_finish), mr.eq(mr.function_start(mr.add(finish, -1)), f)
+end)
+fix('function_start outside a function', function(mr)
+	return mr.function_start(mr.add(mr.base, DOS_HEADER_SP)) == nil
+end)
+fix('function_start outside the exe', function(mr)
+	return mr.function_start(mr.alloc(4))
+end)
+fix('relocate_field', function(mr)
+	local site = test_address(mr, 'pattern_target')
+	local original = mr.read(site, 0, 2)
+	local ok = mr.relocate_field({ { site, original, 'AB' } })
+	local changed = mr.read(site, 0, 2)
+	mr.relocate_field({ { site, 'AB', original } })
+	return ok, changed, mr.read(site, 0, 2) == original
+end)
+fix('relocate_field all or nothing', function(mr)
+	local site = test_address(mr, 'pattern_target')
+	local original = mr.read(site, 0, 2)
+	local result, which = mr.relocate_field({ { site, original, 'AB' }, { mr.add(site, 4), 'ZZ', 'QQ' } })
+	return result, which, mr.read(site, 0, 2) == original
+end)
+fix('relocate_field already applied', function(mr)
+	local site = test_address(mr, 'pattern_target')
+	local original = mr.read(site, 0, 2)
+	return mr.relocate_field({ { site, original, original } }), mr.read(site, 0, 2) == original
+end)
+fix('relocate_field no sites', function(mr)
+	return mr.relocate_field({})
+end)
+fix('relocate_field site lengths', function(mr)
+	return mr.relocate_field({ { mr.add(mr.base, DOS_HEADER_SP), 'AB', 'ABC' } })
+end)
+fix('patch text address', function(mr)
+	return mr.patch('MZ', 'AB', 'CD')
+end)
+fix('patch read-only code', function(mr)
+	local at = test_address(mr, 'pattern_target')
+	local original = mr.read(at, 0, 2)
+	local old = mr.patch(at, original, 'AB')
+	local changed = mr.read(at, 0, 2)
+	mr.patch(at, 'AB', original)
+	return old == original, changed, mr.read(at, 0, 2) == original
+end)
+fix('patch outside the exe', function(mr)
+	return mr.patch(mr.alloc(4), '\0\0\0\0', '\1\0\0\0')
+end)
+fix('patch lengths', function(mr)
+	return mr.patch(mr.base, 'MZ', 'M')
+end)
+fix('patch empty', function(mr)
+	return mr.patch(mr.base, '', '')
+end)
+fix('vector_insert', function(mr)
+	local v = game_vector(mr, { 10, 20, 30 })
+	local at = mr.vector_insert(v, 0, 8, 2, int64_bytes(15))
+	local inserted = mr.read_int32(at, 0)
+	mr.vector_insert(v, 0, 8, 1, int64_bytes(5))
+	mr.vector_insert(v, 0, 8, 6)
+	return vector_values(mr, v), mr.read_uint32(v, 0), inserted
+end)
+fix('vector_insert into an empty vector', function(mr)
+	local header = mr.alloc(16)
+	mr.vector_insert(header, 0, 8, 1, int64_bytes(7))
+	return vector_values(mr, header), mr.read_uint32(header, 0)
+end)
+fix('vector_erase', function(mr)
+	local v = game_vector(mr, { 1, 2, 3, 4, 5 })
+	mr.vector_erase(v, 0, 8, 2)
+	mr.vector_erase(v, 0, 8, 2, 2)
+	return vector_values(mr, v), mr.read_int32(v, 4), mr.read_int32(mr.read_pointer(v, 8), 16)
+end)
+fix('vector_reserve', function(mr)
+	local v = game_vector(mr, { 1, 2 })
+	local data = mr.read_pointer(v, 8)
+	mr.vector_reserve(v, 0, 8, 2)
+	local same = mr.eq(mr.read_pointer(v, 8), data)
+	mr.vector_reserve(v, 0, 8, 100)
+	return same, mr.eq(mr.read_pointer(v, 8), data), mr.read_uint32(v, 0), vector_values(mr, v)
+end)
+fix('vector stride', function(mr)
+	return mr.vector_insert(mr.alloc(16), 0, 0)
+end)
+fix('vector position', function(mr)
+	return mr.vector_insert(game_vector(mr, { 1 }), 0, 8, 3)
+end)
+fix('vector element size', function(mr)
+	return mr.vector_insert(game_vector(mr, { 1 }), 0, 8, 1, 'abc')
+end)
+fix('vector broken header', function(mr)
+	local header = mr.alloc(16)
+	mr.write(header, 0, mr.uint32(1))
+	mr.write(header, 4, mr.int32(2))
+	return mr.vector_erase(header, 0, 8, 1)
+end)
+fix('vector_erase empty', function(mr)
+	return mr.vector_erase(mr.alloc(16), 0, 8, 1)
+end)
+fix('vector_erase count', function(mr)
+	return mr.vector_erase(game_vector(mr, { 1, 2 }), 0, 8, 2, 2)
+end)
+fix('string_set', function(mr)
+	local field = mr.alloc(16)
+	local long = 'a text longer than fourteen characters'
+	mr.write(field, 0, inline('old'))
+	local before = test_heap_blocks()
+	mr.string_set(field, 0, long)
+	local set_long = mr.read_string(field, 0) == long
+	local grew = test_heap_blocks() - before
+	mr.string_set(field, 0, 'short')
+	return set_long, grew, mr.read_string(field, 0), test_heap_blocks() - before
+end)
+fix('unistring_set', function(mr)
+	local field = mr.alloc(16)
+	local long = 'zażółć gęślą jaźń'
+	local before = test_heap_blocks()
+	mr.unistring_set(field, 0, long)
+	local set_long = mr.read_unistring(field, 0) == long
+	local grew = test_heap_blocks() - before
+	mr.unistring_set(field, 0, 'ok')
+	return set_long, grew, mr.read_unistring(field, 0), test_heap_blocks() - before
+end)
+fix('string_set zero byte', function(mr)
+	return mr.string_set(mr.alloc(16), 0, 'a\0b')
+end)
+fix('string_set not a string', function(mr)
+	local field = mr.alloc(16)
+	mr.write(field, 0, '\255\255\255\127' .. string.rep('\0', 12))
+	return mr.string_set(field, 0, 'x')
+end)
+fix('read_pack_file', function(mr)
+	local text = mr.read_pack_file('text/test/hello.txt')
+	return text, mr.read_pack_file('text\\test\\hello.txt') == text, test_open_streams()
+end)
+fix('read_pack_file binary and empty', function(mr)
+	return mr.read_pack_file('db/test_tables/binary'), mr.read_pack_file('text/test/empty.txt') == '', test_open_streams()
+end)
+fix('read_pack_file missing', function(mr)
+	return mr.read_pack_file('text/test/missing.txt'), test_open_streams()
+end)
+fix('pack_file_exists', function(mr)
+	return mr.pack_file_exists('text/test/hello.txt'), mr.pack_file_exists('text/test/missing.txt')
+end)
+fix('read_pack_file empty path', function(mr)
+	return mr.read_pack_file('')
+end)
+fix('read_pack_file disk paths', function(mr)
+	local refused = 0
+	for _, path in ipairs({ 'C:/Windows/win.ini', '../x', 'text/../../x', '//server/share/x', 'text/..' }) do
+		if not pcall(mr.read_pack_file, path) then refused = refused + 1 end
+	end
+	return refused, mr.pack_file_exists('text/a..b/c')
+end)
+fix('pack_file_exists drive', function(mr)
+	return mr.pack_file_exists('d:x')
+end)
+fix('pack_file_exists zero byte', function(mr)
+	return mr.pack_file_exists('text/a\0b')
+end)
+
+local MAP_BUCKETS = 0x18
+local MAP_HEADER = 0x30
+local NODE_INDEX = 0x20
+local NODE_SOURCE = 0x28
+local function empty_map(mr, buckets)
+	local map = mr.alloc(MAP_HEADER + (buckets + 1) * 8)
+	local finish = mr.add(map, 8)
+	local data = mr.add(map, MAP_HEADER)
+	mr.write(map, 0x10, finish)
+	mr.write(map, MAP_BUCKETS, mr.uint32(buckets + 1))
+	mr.write(map, MAP_BUCKETS + 4, mr.uint32(buckets + 1))
+	mr.write(map, MAP_BUCKETS + 8, data)
+	for i = 0, buckets do
+		mr.write(data, i * 8, finish)
+	end
+	mr.write(map, 0x28, 1.0)
+	return map
+end
+local function map_keys(mr, map)
+	local keys = mr.read_list(map, 0, { 0, 'struct', { key = { 0x10, 'string' }, index = { NODE_INDEX, 'uint32' } } })
+	local texts = {}
+	for i, node in ipairs(keys) do
+		texts[i] = node.key .. '=' .. node.index
+	end
+	return table.concat(texts, ' ')
+end
+local function map_index(mr, map, key)
+	local node = mr.map_find_key(map, key)
+	return node and mr.read_uint32(node, NODE_INDEX)
+end
+
+fix('map_add_key', function(mr)
+	local map = empty_map(mr, 7)
+	local source = mr.alloc(8)
+	local node, inserted = mr.map_add_key(map, 'alpha', 3, source)
+	mr.map_add_key(map, 'beta', 4)
+	mr.map_add_key(map, 'gamma', 5)
+	local again, inserted_again = mr.map_add_key(map, 'alpha', 9)
+	local found = mr.map_find_key(map, 'alpha')
+	return inserted,
+		inserted_again,
+		mr.eq(again, node),
+		mr.eq(found, node),
+		mr.eq(mr.read_pointer(node, NODE_SOURCE), source),
+		map_index(mr, map, 'beta'),
+		map_index(mr, map, 'gamma'),
+		mr.map_find_key(map, 'delta'),
+		mr.read_uint32(map, 0)
+end)
+fix('map_add_key one bucket', function(mr)
+	local map = empty_map(mr, 1)
+	mr.map_add_key(map, 'a', 0)
+	mr.map_add_key(map, 'b', 1)
+	return map_keys(mr, map), map_index(mr, map, 'a'), map_index(mr, map, 'b')
+end)
+fix('map_find_key hash', function(mr)
+	local key = 'wh2_main_hef_bow_arrow'
+	local map = empty_map(mr, 2047)
+	local node = mr.alloc(0x30)
+	local finish = mr.add(map, 8)
+	local data = mr.add(map, MAP_HEADER)
+	mr.write(node, 8, finish)
+	mr.write(node, 0x10, mr.uint32(#key))
+	mr.write(node, 0x14, mr.uint32(#key))
+	mr.write(node, 0x18, mr.add(string_address(mr, key), 0))
+	mr.write(map, 0, mr.uint32(1))
+	mr.write(map, 8, node)
+	mr.write(map, 0x10, node)
+	mr.write(data, 0, node)
+	mr.write(data, 8, node)
+	return mr.eq(mr.map_find_key(map, key), node), mr.map_find_key(map, 'wh2_main_hef_bow_arrows')
+end)
+fix('map_remove_key', function(mr)
+	local map = empty_map(mr, 7)
+	for i, key in ipairs({ 'a', 'b', 'c', 'd', 'e' }) do
+		mr.map_add_key(map, key, i)
+	end
+	local removed = mr.map_remove_key(map, 'c')
+	local first = mr.map_remove_key(map, 'a') and mr.map_remove_key(map, 'e')
+	return removed,
+		first,
+		mr.map_remove_key(map, 'c'),
+		map_keys(mr, map),
+		mr.map_find_key(map, 'c'),
+		map_index(mr, map, 'b'),
+		map_index(mr, map, 'd'),
+		mr.read_uint32(map, 0)
+end)
+fix('map_remove_key last', function(mr)
+	local map = empty_map(mr, 3)
+	mr.map_add_key(map, 'only', 0)
+	mr.map_remove_key(map, 'only')
+	local finish = mr.add(map, 8)
+	return mr.read_uint32(map, 0),
+		mr.eq(mr.read_pointer(map, 0x10), finish),
+		mr.is_null(mr.read_pointer(map, 8)),
+		mr.eq(mr.read_pointer(mr.read_pointer(map, 0x20), 0), finish)
+end)
+fix('map keys own their strings', function(mr)
+	local map = empty_map(mr, 3)
+	local before = test_heap_blocks()
+	mr.map_add_key(map, 'a key longer than fourteen bytes', 1)
+	local added = test_heap_blocks() - before
+	mr.map_remove_key(map, 'a key longer than fourteen bytes')
+	return added, test_heap_blocks() - before, mr.read_uint32(map, 0)
+end)
+fix('map not a map', function(mr)
+	return mr.map_find_key(mr.alloc(0x30), 'x')
+end)
+fix('map_add_key index', function(mr)
+	return mr.map_add_key(empty_map(mr, 1), 'x', -1)
+end)
+
+local function empty_list(mr)
+	local list = mr.alloc(0x18)
+	mr.write(list, 0x10, mr.add(list, 8))
+	return list
+end
+local function list_values(mr, list)
+	return table.concat(mr.read_list(list, 0, { 0x10, 'int32' }), ' ')
+end
+local function int32_bytes(n)
+	return string.char(n, 0, 0, 0)
+end
+
+fix('list_insert', function(mr)
+	local list = empty_list(mr)
+	local node = mr.list_insert(list, 0, 1, int32_bytes(1))
+	mr.list_insert(list, 0, 2, int32_bytes(3))
+	mr.list_insert(list, 0, 2, int32_bytes(2))
+	mr.list_insert(list, 0, 1, int32_bytes(0))
+	return list_values(mr, list), mr.read_int32(node, 0x10), mr.read_uint32(list, 0)
+end)
+fix('list_erase', function(mr)
+	local list = empty_list(mr)
+	for i = 1, 5 do
+		mr.list_insert(list, 0, i, int32_bytes(i))
+	end
+	mr.list_erase(list, 0, 2, 2)
+	local middle = list_values(mr, list)
+	mr.list_erase(list, 0, 3)
+	mr.list_erase(list, 0, 1)
+	local last = list_values(mr, list)
+	mr.list_erase(list, 0, 1)
+	return middle, last, mr.read_uint32(list, 0), mr.eq(mr.read_pointer(list, 0x10), mr.add(list, 8)), mr.is_null(mr.read_pointer(list, 8))
+end)
+fix('list_insert position', function(mr)
+	return mr.list_insert(empty_list(mr), 0, 2, 'x')
+end)
+fix('list_insert empty value', function(mr)
+	return mr.list_insert(empty_list(mr), 0, 1, '')
+end)
+fix('list_erase empty', function(mr)
+	return mr.list_erase(empty_list(mr), 0, 1)
+end)
+fix('list broken links', function(mr)
+	local list = empty_list(mr)
+	mr.list_insert(list, 0, 1, int32_bytes(1))
+	local node = mr.list_insert(list, 0, 2, int32_bytes(2))
+	mr.list_insert(list, 0, 3, int32_bytes(3))
+	mr.write(node, 0, mr.alloc(8))
+	return mr.list_erase(list, 0, 3)
 end)
 fix('alloc limit', function(mr)
 	local blocks = 0

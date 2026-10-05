@@ -178,6 +178,23 @@ static INT32 hook_target(INT32 a, INT32 b)
 	return a * 10 + b;
 }
 
+static volatile LONG exe_data;
+
+#pragma optimize("", off)
+static INT32 pattern_target(INT32 a, INT32 b)
+{
+	return a * 10 + b;
+}
+#pragma optimize("", on)
+
+static int l_exe_data_address(lua_State *L)
+{
+	void *address = (void *)&exe_data;
+
+	lua_pushlstring(L, (const char *)&address, sizeof address);
+	return 1;
+}
+
 static INT64 hook_single(INT64 x)
 {
 	return x * 3 + 1;
@@ -230,6 +247,36 @@ void throw_out(void);
 UINT64 leaf_add_one(UINT64 x);
 float leaf_add_floats(float a, float b);
 void call_keeping_registers(void *leaf, void *registers);
+INT64 frame_target(UINT64 *probe);
+INT64 frame_twin(UINT64 *probe);
+INT64 frame_xmm_target(UINT64 *probe);
+INT64 frame_pointer_target(UINT64 *probe);
+INT64 frame_call(void *function, UINT64 *probe);
+
+__declspec(noinline) void host_unwind_probe(UINT64 *probe)
+{
+	CONTEXT context;
+	DWORD64 image;
+	PVOID handler_data;
+	DWORD64 frame;
+	int i;
+
+	RtlCaptureContext(&context);
+	for (i = 0; i < 2; i++) {
+		PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, NULL);
+
+		if (!function) {
+			probe[0] = 0;
+			return;
+		}
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data, &frame, NULL);
+	}
+	probe[0] = context.Rip;
+	probe[1] = context.Rsp;
+	probe[2] = context.Rsi;
+	probe[3] = context.Rbx;
+	probe[6] = context.Xmm6.Low;
+}
 int game_crash_handler(DWORD code, EXCEPTION_POINTERS *info);
 
 void write_game_crash_file(void)
@@ -253,6 +300,24 @@ static int format(char *out, size_t size, const char *text, ...)
 	length = vsnprintf(out, size, text, arguments);
 	va_end(arguments);
 	return length;
+}
+
+LONG host_live_blocks(void);
+LONG host_open_streams(void);
+int patch_target(void);
+
+__declspec(thread) static char host_thread_data[64];
+
+static int l_test_open_streams(lua_State *L)
+{
+	lua_pushinteger(L, host_open_streams());
+	return 1;
+}
+
+static int l_test_heap_blocks(lua_State *L)
+{
+	lua_pushinteger(L, host_live_blocks() + host_thread_data[0]);
+	return 1;
 }
 
 static const struct {
@@ -297,6 +362,13 @@ static const struct {
 	{ "leaf_add_one", leaf_add_one },
 	{ "leaf_add_floats", leaf_add_floats },
 	{ "call_keeping_registers", call_keeping_registers },
+	{ "patch_target", patch_target },
+	{ "pattern_target", pattern_target },
+	{ "frame_target", frame_target },
+	{ "frame_twin", frame_twin },
+	{ "frame_xmm_target", frame_xmm_target },
+	{ "frame_pointer_target", frame_pointer_target },
+	{ "frame_call", frame_call },
 };
 
 static int l_test_function(lua_State *L)
@@ -333,6 +405,34 @@ static int l_test_execute_crash(lua_State *L)
 	page[0] = 0xC3;
 	((void (*)(void))page)();
 	return 0;
+}
+
+static DWORD WINAPI crash_thread(LPVOID unused)
+{
+	(void)unused;
+	return (DWORD)read_null();
+}
+
+static int l_test_thread_crash(lua_State *L)
+{
+	HANDLE thread = CreateThread(NULL, 0, crash_thread, NULL, 0, NULL);
+	WaitForSingleObject(thread, INFINITE);
+	return 0;
+}
+
+static int overflow(volatile int depth)
+{
+	volatile char padding[4096];
+	padding[0] = (char)depth;
+	if (depth < 0)
+		return 0;
+	return overflow(depth + 1) + padding[0];
+}
+
+static int l_test_stack_overflow(lua_State *L)
+{
+	lua_pushinteger(L, overflow(0));
+	return 1;
 }
 
 static int l_test_sleep(lua_State *L)
@@ -377,8 +477,13 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_crash", l_test_crash);
 	lua_register(L, "test_recovered_crash", l_test_recovered_crash);
 	lua_register(L, "test_execute_crash", l_test_execute_crash);
+	lua_register(L, "test_thread_crash", l_test_thread_crash);
+	lua_register(L, "test_stack_overflow", l_test_stack_overflow);
 	lua_register(L, "test_sleep", l_test_sleep);
 	lua_register(L, "test_protect", l_test_protect);
+	lua_register(L, "test_heap_blocks", l_test_heap_blocks);
+	lua_register(L, "test_open_streams", l_test_open_streams);
+	lua_register(L, "exe_data_address", l_exe_data_address);
 	lua_pushstring(L, argv[2]);
 	lua_setglobal(L, "ROOT");
 	lua_pushstring(L, argc > 3 ? argv[3] : "");
@@ -395,6 +500,32 @@ static int run_pass(char **argv, int argc, int pass)
 	return next_pass;
 }
 
+static bool handler_hidden;
+
+static int main_filter(DWORD code, EXCEPTION_POINTERS *info)
+{
+	if (!handler_hidden)
+		return game_crash_handler(code, info);
+	write_game_crash_file();
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *info)
+{
+	main_filter(info->ExceptionRecord->ExceptionCode, info);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void hide_game_handler(void)
+{
+	BYTE *first = (BYTE *)game_crash_handler;
+	DWORD old;
+	VirtualProtect(first, 1, PAGE_EXECUTE_READWRITE, &old);
+	*first = 0xCC;
+	VirtualProtect(first, 1, old, &old);
+	handler_hidden = true;
+}
+
 int main(int argc, char **argv)
 {
 	int pass = 1;
@@ -402,10 +533,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: lua_host <script.lua> <mod root> [scenario]\n");
 		return 2;
 	}
+	if (argc > 3 && strcmp(argv[3], "fault_report_fallback") == 0)
+		hide_game_handler();
+	SetUnhandledExceptionFilter(unhandled_filter);
 	__try {
 		while (run_pass(argv, argc, pass))
 			pass++;
-	} __except (game_crash_handler(GetExceptionCode(), GetExceptionInformation())) {
+	} __except (main_filter(GetExceptionCode(), GetExceptionInformation())) {
 	}
 	return 0;
 }

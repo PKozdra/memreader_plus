@@ -104,7 +104,7 @@ write uint8	uint32:16843013
 write pointer	pointer:0000000000000010
 write offset	uint32:256
 write negative offset	uint32:256
-write read-only page	error: failed to write memory
+write read-only page	error: bad argument #1 to 'write' (refused: Plus writes only to the game's exe and to data memory, not to other modules, executable memory or the exe's headers and import or export tables)
 modules	bytes:57617268616D6D6572332E657865, true, bytes:6E756D626572, bytes:737472696E67
 type(modules entry)	bytes:7461626C65
 ud_topointer	true, false

@@ -12,18 +12,41 @@ $failed = @()
 $skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
-    call_cpp_exception = -1073740791; call_stack_overflow = -1073741571; hook = 0
+    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; heap = 0; guard = 0; frame = 0; bench = 0
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash
-    fault_report_stale = $crash
+    fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
+    fault_report_cpp = -529697949; fault_report_fallback = $crash
 }
 $reports = @{
     fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'
-    fault_report_stale = 'started'
+    fault_report_stale = 'started'; fault_report_thread = 'started'; fault_report_native_thread = 'started'; fault_report_overflow = 'started'
+    fault_report_cpp = 'started'; fault_report_fallback = 'started'
 }
-$readOfNull = 'read of 0000000000000010'
+$readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
-    fault_report = $readOfNull; fault_report_no_log = 'execution of'; fault_report_in_callback = $readOfNull; fault_report_stale = $readOfNull
+    fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull
+    fault_report_stale = $readOfNull; fault_report_thread = $readOfNull; fault_report_native_thread = $readOfNull
+    fault_report_overflow = @('exception 0xc00000fd (stack overflow)'); fault_report_cpp = @('exception 0xe06d7363 (C++ exception, type .H)')
+    fault_report_fallback = $readOfNull
 }
+$nativeNeedles = @(
+    'Game running for ', 'Memory: game ', 'Native stack of the crashing thread, innermost first:', '  #0 ', ', offset +0x',
+    'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: ', 'DLLs from outside Windows and the game folder:'
+)
+$eventNeedles = @(
+    '  faction turn: wh_c', 'Recent script events, newest first:', '  CharacterTurnStart x3, last ', '  FactionTurnStart x1, last ',
+    'Recent memory writes by mods, newest first:', '  write x2 at '
+)
+$scenarioNeedles = @{
+    fault_report_in_callback = @('RUNNING (on the stack)', ', callback ')
+    fault_report_native_thread = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
+    fault_report_fallback = @('Written when the fault happened')
+}
+$contextNeedles = @(
+    'Game context set by script at safe moments:', '  mode: campaign', '  campaign: main_warhammer', '  campaign type: sp', '  difficulty: hard',
+    '  turn: 42', '  player: wh_a', '  humans: wh_a, wh_b', '  note: first second'
+)
+$contextAbsent = @('  temp: ', '  multiplayer: ')
 $gameFilesNote = "The game's own crash files for this crash, in the game crash folder: D"
 $commandLineStart = 'Command line: '
 $commandLineBuffer = 1039
@@ -93,15 +116,21 @@ foreach ($scenario in $expect.Keys) {
             if ($written.Count -ne 1 -or -not $report) { Get-ChildItem $work | ForEach-Object { "$($_.Name) created $($_.CreationTimeUtc.ToString('o'))" }; $failed += "$scenario (reports: $written, expected stamp $stamps)"; continue }
             $text = Get-Content -Raw -ErrorAction SilentlyContinue (Join-Path $work $report)
             $logLine = if ($scenario -eq 'fault_report') { 'Script log of this Lua state: script_log_010203_0405.txt' } else { 'Script logging is off' }
-            $needles = @('exception 0xc0000005', 'report_me', 'marker = "event-under-test"', $logLine, $faultNeedles[$scenario]) + $modNeedles
-            if ($scenario -ne 'fault_report_stale') { $needles += $gameFilesNote }
+            $needles = @('report_me', 'marker = "event-under-test"', $logLine) + $faultNeedles[$scenario] + $modNeedles + $nativeNeedles
+            if ($scenario -ne 'fault_report_stale') { $needles += $contextNeedles + $eventNeedles }
+            if ($scenario -ne 'fault_report_fallback') { $needles += $gameFilesNote; $needles += "The game's crash handler caught it" }
+            if ($scenario -ne 'fault_report_native_thread') { $needles += 'Thread: the script thread'; $needles += 'Code at rip:' }
+            if ($scenario -eq 'fault_report_thread') { $needles += 'Lua thread ' }
+            if ($scenarioNeedles.Contains($scenario)) { $needles += $scenarioNeedles[$scenario] }
             $missing = @($needles | Where-Object { -not $text -or -not $text.Contains($_) })
             foreach ($needle in $missing) { $failed += "$scenario (report lacks: $needle)" }
             if ($missing) { $text }
-            if ($scenario -eq 'fault_report_stale' -and $text -match "The game('s own| wrote no) crash files") { $failed += "$scenario (a later crash wrote into an old report)" }
             if ($scenario -eq 'fault_report_no_log') {
                 $line = $text -split "`n" | Where-Object { $_.StartsWith($commandLineStart) }
                 if (-not $line -or $line.Length -gt $commandLineStart.Length + $commandLineBuffer -or -not $line.EndsWith('x')) { $failed += "$scenario (long command line not cut at its buffer: $($line.Length) characters)" }
+            }
+            if ($scenario -ne 'fault_report_stale') {
+                foreach ($absent in $contextAbsent) { if ($text -and $text.Contains($absent)) { $failed += "$scenario (report shows $absent)" } }
             }
             if ($text -and $text.Contains($env:USERPROFILE)) { $failed += "$scenario (report shows the user profile path)" }
             if ($text -and $text.Contains('\\')) { $failed += "$scenario (report has a doubled backslash)" }

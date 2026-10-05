@@ -11,12 +11,12 @@ enum {
 	MAX_SHADOWED = 256,
 	MAX_SCRIPT_SIZE = 1 << 20,
 	MOD_ENTRY_SIZE = 0x20,
+	MOD_LIST_CALL_AT = 31,
 	PATHS_DATA = 0x18,
 	PATHS_COUNT = 0x20,
 	PATH_ENTRY_SIZE = 0x10,
 	GETTER_BYTES = 0x30,
-	RIP_INSTRUCTION_SIZE = 7,
-	CALL_SIZE = 5
+	RIP_INSTRUCTION_SIZE = 7
 };
 
 typedef struct {
@@ -38,12 +38,8 @@ typedef struct {
 	INT_PTR data;
 } ModArray;
 
-static const char mod_list_call[] =
-	"E8 ?? ?? ?? ?? 48 8B 58 08 E8 ?? ?? ?? ?? 8B 48 04 48 C1 E1 05 48 03 48 08 48 3B D9 0F 85";
-static const char search_paths_getter[] =
-	"48 83 EC 28 65 48 8B 04 25 58 00 00 00 BA ?? ?? ?? ?? 48 8B 08 8B 04 0A 39 05 ?? ?? ?? ?? 7F 0C 48 8B 05 ?? ?? ?? ?? "
-	"48 83 C4 28 C3 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? FF 75 DF B9 38 00 00 00 E8 ?? ?? ?? ?? 48 8B C8 "
-	"48 89 44 24 30 33 C0 48 85 C9 74 06 E8 ?? ?? ?? ?? 90 48 89 05";
+static const char mod_list_call[] = "48 89 78 20 41 56 48 81 EC ?? ?? ?? ?? E8 ?? ?? ?? ?? 80 3D ?? ?? ?? ?? 00 0F 85 ?? ?? ?? ?? E8";
+static const char search_paths_call[] = "E8 ?? ?? ?? ?? 48 8B 58 18 48 8B 78 20 48 C1 E7 04 48 03 FB 48 3B DF 0F 84 ?? ?? ?? ?? 48 8D 15";
 static const BYTE LEA_RAX[3] = { 0x48, 0x8D, 0x05 };
 static const BYTE MOV_RAX[3] = { 0x48, 0x8B, 0x05 };
 static const char workshop_marker[] = "\\workshop\\content\\1142710\\";
@@ -55,8 +51,8 @@ static char paths[MAX_PATHS][MAX_PATH];
 static int path_count;
 static Shadowed shadowed[MAX_SHADOWED];
 static int shadowed_count;
-static char text[SESSION_SIZE];
-static size_t used;
+static char session_buffer[SESSION_SIZE];
+static Text session = { session_buffer, sizeof session_buffer, 0 };
 static char profile[MAX_PATH];
 static size_t profile_length;
 static char command_line[4 * MAX_PATH];
@@ -66,27 +62,27 @@ static char script_name[MAX_PATH];
 static const char *mods_source = "none found";
 static BOOL described;
 
-static void add(const char *format, ...)
+void add_text(Text *text, const char *format, ...)
 {
 	va_list arguments;
 
-	if (used >= sizeof text - 1)
+	if (text->used >= text->size - 1)
 		return;
 	va_start(arguments, format);
-	_vsnprintf_s(text + used, sizeof text - used, _TRUNCATE, format, arguments);
+	_vsnprintf_s(text->data + text->used, text->size - text->used, _TRUNCATE, format, arguments);
 	va_end(arguments);
-	used += strlen(text + used);
+	text->used += strlen(text->data + text->used);
 }
 
 static void add_redacted(const char *value)
 {
-	while (*value && used < sizeof text - 1) {
+	while (*value && session.used < session.size - 1) {
 		if (profile_length && _strnicmp(value, profile, profile_length) == 0) {
-			add("%%USERPROFILE%%");
+			add_text(&session, "%%USERPROFILE%%");
 			value += profile_length;
 		} else {
-			text[used++] = *value++;
-			text[used] = '\0';
+			session.data[session.used++] = *value++;
+			session.data[session.used] = '\0';
 		}
 	}
 }
@@ -153,16 +149,16 @@ static BOOL read_path_string(INT_PTR address, char *out)
 
 static BOOL read_mods_from_memory(void)
 {
-	int count, i;
-	const BYTE *call = find_code(mod_list_call, &count);
+	INT_PTR call = find_unique(mod_list_call);
+	INT_PTR getter = call ? call_destination(call + MOD_LIST_CALL_AT) : 0;
 	const BYTE *array;
-	INT32 relative;
 	ModArray list;
 	char name[MAX_PATH];
+	int i;
 
-	if (count != 1 || !copy_memory(&relative, (INT_PTR)call + 1, sizeof relative))
+	if (!getter)
 		return FALSE;
-	array = getter_target(call + CALL_SIZE + relative, LEA_RAX);
+	array = getter_target((const BYTE *)getter, LEA_RAX);
 	if (!array || !copy_memory(&list, (INT_PTR)array, sizeof list) || list.count > MAX_MODS)
 		return FALSE;
 	for (i = 0; i < (int)list.count; i++) {
@@ -175,14 +171,15 @@ static BOOL read_mods_from_memory(void)
 
 static BOOL read_paths_from_memory(void)
 {
-	int count, i;
-	const BYTE *getter = find_code(search_paths_getter, &count);
+	INT_PTR call = find_unique(search_paths_call);
+	const BYTE *getter = call ? (const BYTE *)call_destination(call) : NULL;
 	const BYTE *slot;
+	int i;
 	INT_PTR collection, data;
 	UINT32 total;
 	char path[MAX_PATH];
 
-	if (count != 1 || !(slot = getter_target(getter, MOV_RAX)))
+	if (!getter || !(slot = getter_target(getter, MOV_RAX)))
 		return FALSE;
 	if (!copy_memory(&collection, (INT_PTR)slot, sizeof collection) || !collection ||
 		!copy_memory(&data, collection + PATHS_DATA, sizeof data) ||
@@ -383,7 +380,7 @@ static void add_workshop_id(const char *path)
 		at += sizeof workshop_marker - 1;
 		for (i = 0; at[i] >= '0' && at[i] <= '9'; i++)
 			;
-		add("  workshop %.*s", (int)i, at);
+		add_text(&session, "  workshop %.*s", (int)i, at);
 		return;
 	}
 }
@@ -394,19 +391,19 @@ static void add_mod_line(int index)
 	FILETIME local;
 	SYSTEMTIME time;
 
-	add("  %3d. %s", index + 1, mod->name);
+	add_text(&session, "  %3d. %s", index + 1, mod->name);
 	if (!mod->copies) {
-		add("  not found in any search path\n");
+		add_text(&session, "  not found in any search path\n");
 		return;
 	}
 	FileTimeToLocalFileTime(&mod->written, &local);
 	FileTimeToSystemTime(&local, &time);
-	add("  %llu bytes  %04d-%02d-%02d %02d:%02d", (unsigned long long)mod->size, time.wYear, time.wMonth, time.wDay,
+	add_text(&session, "  %llu bytes  %04d-%02d-%02d %02d:%02d", (unsigned long long)mod->size, time.wYear, time.wMonth, time.wDay,
 		time.wHour, time.wMinute);
 	add_workshop_id(mod->path);
-	add("  ");
+	add_text(&session, "  ");
 	add_redacted(mod->path);
-	add("\n");
+	add_text(&session, "\n");
 }
 
 static void add_game_version(void)
@@ -419,14 +416,14 @@ static void add_game_version(void)
 
 	if (!GetModuleFileNameW(NULL, exe, MAX_PATH) || !(size = GetFileVersionInfoSizeW(exe, &ignored)) ||
 		!(block = HeapAlloc(GetProcessHeap(), 0, size))) {
-		add("unknown version");
+		add_text(&session, "unknown version");
 		return;
 	}
 	if (GetFileVersionInfoW(exe, 0, size, block) && VerQueryValueW(block, L"\\", (void **)&info, &info_size))
-		add("%u.%u.%u.%u", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS), HIWORD(info->dwFileVersionLS),
+		add_text(&session, "%u.%u.%u.%u", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS), HIWORD(info->dwFileVersionLS),
 			LOWORD(info->dwFileVersionLS));
 	else
-		add("unknown version");
+		add_text(&session, "unknown version");
 	HeapFree(GetProcessHeap(), 0, block);
 }
 
@@ -459,29 +456,64 @@ void describe_session(void)
 	}
 	locate_packs();
 
-	add("\nGame: Warhammer3.exe ");
+	add_text(&session, "\nGame: Warhammer3.exe ");
 	add_game_version();
-	add(", memreader Plus %s\nCommand line: ", MEMREADER_PLUS_VERSION);
+	add_text(&session, ", memreader Plus %s\nCommand line: ", MEMREADER_PLUS_VERSION);
 	add_redacted(command_line);
-	add("\nGame crash folder: ");
+	add_text(&session, "\nGame crash folder: ");
 	add_redacted(crash_folder);
-	add("\nMods in load order (%d, from %s):\n", mod_count, mods_source);
+	add_text(&session, "\nMods in load order (%d, from %s):\n", mod_count, mods_source);
 	for (i = 0; i < mod_count; i++)
 		add_mod_line(i);
 	if (shadowed_count) {
-		add("Same name in a later search path, not loaded:\n");
+		add_text(&session, "Same name in a later search path, not loaded:\n");
 		for (i = 0; i < shadowed_count; i++) {
-			add("  %s  ", mods[shadowed[i].mod].name);
+			add_text(&session, "  %s  ", mods[shadowed[i].mod].name);
 			add_redacted(paths[shadowed[i].path]);
-			add("\n");
+			add_text(&session, "\n");
 		}
 	}
 }
 
+static char path_char(char c)
+{
+	if (c == '/')
+		return '\\';
+	return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+}
+
+static BOOL is_profile_at(const char *at)
+{
+	size_t i;
+
+	for (i = 0; i < profile_length; i++) {
+		if (path_char(at[i]) != path_char(profile[i]))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+void write_redacted(HANDLE file, const char *data, size_t length)
+{
+	static const char replacement[] = "%USERPROFILE%";
+	size_t start = 0, at;
+	DWORD written;
+
+	for (at = 0; profile_length && at + profile_length <= length; at++) {
+		if (is_profile_at(data + at)) {
+			WriteFile(file, data + start, (DWORD)(at - start), &written, NULL);
+			WriteFile(file, replacement, sizeof replacement - 1, &written, NULL);
+			at += profile_length - 1;
+			start = at + 1;
+		}
+	}
+	WriteFile(file, data + start, (DWORD)(length - start), &written, NULL);
+}
+
 const char *session_text(size_t *length)
 {
-	*length = used;
-	return text;
+	*length = session.used;
+	return session.data;
 }
 
 const char *game_crash_folder(void)
