@@ -336,16 +336,21 @@ static void run_section(Text *report, const CrashInput *input, Section section)
 	}
 }
 
-void build_crash_report(Text *report, const CrashInput *input)
+size_t build_crash_report(Text *report, const CrashInput *input)
 {
 	Text body = { report->data, report->size - CUT_ROOM, 0 };
+	size_t header = 0;
 	int i;
 
 	load_modules();
 	set_crash_stack((ULONG_PTR)input->info->ContextRecord->Rsp);
-	for (i = 0; i < (int)(sizeof sections / sizeof sections[0]); i++)
+	for (i = 0; i < (int)(sizeof sections / sizeof sections[0]); i++) {
 		run_section(&body, input, sections[i]);
+		if (i == 0)
+			header = body.used;
+	}
 	report->used = body.used;
 	if (body.used >= body.size - 1)
 		add_text(report, "\n(the report was cut here: it reached its size limit)\n");
+	return header;
 }

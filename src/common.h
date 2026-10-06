@@ -217,7 +217,7 @@ void add_memory_use(Text *text);
 void add_other_modules(Text *text);
 void set_crash_context(const char *name, const char *value);
 void note_crash_event(const char *name);
-void build_crash_report(Text *report, const CrashInput *input);
+size_t build_crash_report(Text *report, const CrashInput *input);
 void begin_guarded_call(void);
 void end_guarded_call(void);
 BOOL in_guarded_call(void);

@@ -96,7 +96,7 @@ static UINT64 ticks_of(FILETIME time)
 	return (UINT64)time.dwHighDateTime << 32 | time.dwLowDateTime;
 }
 
-static void write_report(void)
+static void write_report(size_t header)
 {
 	HANDLE file = CreateFileA(report_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	const char *session;
@@ -105,8 +105,10 @@ static void write_report(void)
 	if (file == INVALID_HANDLE_VALUE)
 		return;
 	session = session_text(&session_length);
-	write_redacted(file, report.data, report.used);
+	write_redacted(file, report.data, header);
 	write_redacted(file, session, session_length);
+	write_redacted(file, "\n", 1);
+	write_redacted(file, report.data + header, report.used - header);
 	CloseHandle(file);
 	memcpy(written_path, report_path, sizeof written_path);
 }
@@ -117,6 +119,7 @@ static void make_report(void)
 	CrashInput input = { pending.info, pending.thread, script_thread, NULL, watched, pending.confirmed, script_log };
 	SYSTEMTIME now;
 	BOOL paused = FALSE;
+	size_t header;
 
 	GetLocalTime(&now);
 	SystemTimeToFileTime(&now, &fault_time);
@@ -127,10 +130,10 @@ static void make_report(void)
 		if (GetThreadContext(script_thread_handle, &script))
 			input.script = &script;
 	}
-	build_crash_report(&report, &input);
+	header = build_crash_report(&report, &input);
 	if (paused)
 		ResumeThread(script_thread_handle);
-	write_report();
+	write_report(header);
 }
 
 static void warm_up(void)
