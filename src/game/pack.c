@@ -1,6 +1,6 @@
 #include <string.h>
 
-#include "common.h"
+#include "game.h"
 
 enum {
 	MAX_PATH_LENGTH = 1024,
@@ -70,21 +70,38 @@ static BOOL is_disk_path(const char *text, size_t length)
 	return FALSE;
 }
 
-static void open_name(lua_State *L, PackFile *file)
+static const char *path_problem(const char *path, size_t length, char *text)
 {
-	size_t length, i;
-	const char *path = luaL_checklstring(L, 1, &length);
-	char text[MAX_PATH_LENGTH + 1];
-	__declspec(align(16)) CaString name;
-	UINT64 arguments[2] = { 0, 0 };
+	size_t i;
 
 	if (length == 0 || length > MAX_PATH_LENGTH || strlen(path) != length)
-		luaL_argerror(L, 1, lua_pushfstring(L, "must be a path of 1 to %d bytes without a zero byte", MAX_PATH_LENGTH));
+		return "must be a path of 1 to 1024 bytes without a zero byte";
 	for (i = 0; i < length; i++)
 		text[i] = path[i] == '/' ? '\\' : path[i];
 	text[length] = '\0';
 	if (is_disk_path(text, length))
-		luaL_argerror(L, 1, "must be a path inside the packs: no drive letter, no leading \\\\ and no .. part");
+		return "must be a path inside the packs: no drive letter, no leading \\\\ and no .. part";
+	return NULL;
+}
+
+const char *pack_path_problem(const char *path, size_t length)
+{
+	char text[MAX_PATH_LENGTH + 1];
+
+	return path_problem(path, length, text);
+}
+
+static void open_name(lua_State *L, int index, PackFile *file)
+{
+	size_t length;
+	const char *path = luaL_checklstring(L, index, &length);
+	char text[MAX_PATH_LENGTH + 1];
+	const char *problem = path_problem(path, length, text);
+	__declspec(align(16)) CaString name;
+	UINT64 arguments[2] = { 0, 0 };
+
+	if (problem)
+		luaL_argerror(L, index, problem);
 	find_files(L);
 	name.heap.length = (INT32)length;
 	name.heap.capacity = (UINT32)length;
@@ -134,15 +151,15 @@ static int read_stream(lua_State *L)
 	return 1;
 }
 
-static int l_read_pack_file(lua_State *L)
+int push_game_file(lua_State *L, int index, INT_PTR open)
 {
 	PackFile file;
 	__declspec(align(16)) UINT64 holder[HOLDER_WORDS] = { 0 };
 	__declspec(align(16)) UINT64 options[OPTION_WORDS] = { 0 };
-	UINT64 arguments[4];
+	UINT64 arguments[5];
 	int status;
 
-	open_name(L, &file);
+	open_name(L, index, &file);
 	if (!exists(L, &file)) {
 		lua_pushnil(L);
 		return 1;
@@ -151,7 +168,8 @@ static int l_read_pack_file(lua_State *L)
 	arguments[1] = (UINT64)holder;
 	arguments[2] = (UINT64)&file.name;
 	arguments[3] = (UINT64)options;
-	call_game(L, files.open, arguments, 4);
+	arguments[4] = 0;
+	call_game(L, open ? open : files.open, arguments, 5);
 	if (!holder[0])
 		return luaL_error(L, "the game opened no stream for this file");
 	lua_pushcfunction(L, read_stream);
@@ -163,11 +181,16 @@ static int l_read_pack_file(lua_State *L)
 	return 1;
 }
 
+static int l_read_pack_file(lua_State *L)
+{
+	return push_game_file(L, 1, 0);
+}
+
 static int l_pack_file_exists(lua_State *L)
 {
 	PackFile file;
 
-	open_name(L, &file);
+	open_name(L, 1, &file);
 	lua_pushboolean(L, exists(L, &file));
 	return 1;
 }

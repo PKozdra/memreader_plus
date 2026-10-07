@@ -1,4 +1,6 @@
-#include "common.h"
+#include "core/common.h"
+#include "game/game.h"
+#include "file_edit/file_edit.h"
 
 #define MEMREADER_API_VERSION 1.2f
 
@@ -20,6 +22,7 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 	luaL_register(L, NULL, text_functions);
 	luaL_register(L, NULL, farhook_functions);
 	luaL_register(L, NULL, pack_functions);
+	luaL_register(L, NULL, file_edit_functions);
 	luaL_register(L, NULL, map_functions);
 	luaL_register(L, NULL, list_functions);
 	luaL_register(L, NULL, frame_functions);

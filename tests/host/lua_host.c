@@ -308,6 +308,7 @@ static int format(char *out, size_t size, const char *text, ...)
 LONG host_live_blocks(void);
 LONG host_open_streams(void);
 int patch_target(void);
+void register_file_edit_tests(lua_State *L);
 
 __declspec(thread) static char host_thread_data[64];
 
@@ -457,6 +458,21 @@ static int l_test_protect(lua_State *L)
 	return 1;
 }
 
+static LONG access_faults;
+
+static LONG CALLBACK count_access_fault(EXCEPTION_POINTERS *info)
+{
+	if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+		InterlockedIncrement(&access_faults);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static int l_test_access_faults(lua_State *L)
+{
+	lua_pushinteger(L, access_faults);
+	return 1;
+}
+
 static int l_test_ref(lua_State *L)
 {
 	lua_settop(L, 1);
@@ -487,9 +503,11 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_stack_overflow", l_test_stack_overflow);
 	lua_register(L, "test_sleep", l_test_sleep);
 	lua_register(L, "test_protect", l_test_protect);
+	lua_register(L, "test_access_faults", l_test_access_faults);
 	lua_register(L, "test_heap_blocks", l_test_heap_blocks);
 	lua_register(L, "test_open_streams", l_test_open_streams);
 	lua_register(L, "exe_data_address", l_exe_data_address);
+	register_file_edit_tests(L);
 	lua_pushstring(L, argv[2]);
 	lua_setglobal(L, "ROOT");
 	lua_pushstring(L, argc > 3 ? argv[3] : "");
@@ -542,6 +560,7 @@ int main(int argc, char **argv)
 	if (argc > 3 && strcmp(argv[3], "fault_report_fallback") == 0)
 		hide_game_handler();
 	SetUnhandledExceptionFilter(unhandled_filter);
+	AddVectoredExceptionHandler(1, count_access_fault);
 	__try {
 		while (run_pass(argv, argc, pass))
 			pass++;

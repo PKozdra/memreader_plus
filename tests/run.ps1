@@ -13,6 +13,7 @@ $skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
     call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
+    file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
     fault_report_cpp = -529697949; fault_report_fallback = $crash
@@ -31,13 +32,21 @@ $faultNeedles = @{
 }
 $nativeNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the crashing thread, innermost first:', '  #0 ', ', offset +0x',
-    'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: ', 'DLLs from outside Windows and the game folder:'
+    'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
 )
+$otherDll = 'fake_overlay64.dll'
+$otherDllCount = "Other programs' DLLs loaded: [1-9]"
+$steamScenario = 'fault_report_cpp'
+$steamCommandLine = '<Steam library>\steamapps\common\game\Warhammer3.exe'
 $eventNeedles = @(
     '  faction turn: wh_c', 'Recent script events, newest first:', '  CharacterTurnStart x3, last ', '  FactionTurnStart x1, last ',
     'Recent memory writes by mods, newest first:', '  write x2 at '
 )
 $scenarioNeedles = @{
+    fault_report = @(
+        '  relocate_field x40 at ', ', 4 bytes, from ', '  patch at ', '[string "later_patch"]:1', '[string "filler_patch_29"]:1',
+        '  ... 6 more patches not listed', '[string "newest_patch"]:1'
+    )
     fault_report_in_callback = @('RUNNING (on the stack)', ', callback ')
     fault_report_native_thread = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
     fault_report_fallback = @('Written when the fault happened')
@@ -94,14 +103,21 @@ foreach ($scenario in $expect.Keys) {
             $old.CreationTime = (Get-Date).AddDays(-1)
         }
         $extra = @()
+        $runExe = $exe
         if ($reports.Contains($scenario)) {
             New-ModFile $work
             New-Item -ItemType Directory (Join-Path $work 'crash_report') | Out-Null
+            Copy-Item (Join-Path $env:SystemRoot 'System32\version.dll') (Join-Path $work $otherDll)
             $extra = @('mods.txt;', 'appdata_folder', "$work;")
             if ($scenario -eq 'fault_report_no_log') { $extra += 'x' * ($commandLineBuffer + 100) }
+            if ($scenario -eq $steamScenario) {
+                $gameDir = New-Item -ItemType Directory (Join-Path $work 'library\steamapps\common\game')
+                Copy-Item $exe $gameDir
+                $runExe = Join-Path $gameDir 'Warhammer3.exe'
+            }
         }
         $before = Get-Date -Format 'ddMMyy_HHmm'
-        & $exe (Join-Path $PSScriptRoot 'offline.lua') ($root -replace '\\', '/') $scenario @extra
+        & $runExe (Join-Path $PSScriptRoot 'offline.lua') ($root -replace '\\', '/') $scenario @extra
         $after = Get-Date -Format 'ddMMyy_HHmm'
         if ($LASTEXITCODE -ne $expect[$scenario]) { $failed += $scenario; "exit $LASTEXITCODE, expected $($expect[$scenario])" }
         elseif ($LASTEXITCODE) { "crashed as expected (exit $('{0:X8}' -f $LASTEXITCODE))" }
@@ -133,6 +149,12 @@ foreach ($scenario in $expect.Keys) {
                 foreach ($absent in $contextAbsent) { if ($text -and $text.Contains($absent)) { $failed += "$scenario (report shows $absent)" } }
             }
             if ($text -and $text.Contains($env:USERPROFILE)) { $failed += "$scenario (report shows the user profile path)" }
+            if ($text -and $text.Contains($otherDll)) { $failed += "$scenario (report names another program's DLL)" }
+            if ($text -notmatch $otherDllCount) { $failed += "$scenario (report lacks the count of other programs' DLLs)" }
+            if ($scenario -eq $steamScenario) {
+                if (-not $text.Contains($steamCommandLine)) { $failed += "$scenario (report lacks: $steamCommandLine)" }
+                if ($text.Contains((Join-Path $work 'library'))) { $failed += "$scenario (report shows the Steam library path)" }
+            }
             if ($text -and $text.Contains('\\')) { $failed += "$scenario (report has a doubled backslash)" }
         }
     } finally { Pop-Location }

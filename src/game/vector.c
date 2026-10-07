@@ -1,4 +1,4 @@
-#include "common.h"
+#include "game.h"
 
 enum { MAX_STRIDE = 4096, FIRST_CAPACITY = 4 };
 

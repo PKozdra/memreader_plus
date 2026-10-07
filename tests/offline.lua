@@ -44,6 +44,9 @@ local function exists(name)
 	if f then f:close() end
 	return f ~= nil
 end
+local function load_other_program_dll()
+	if exists('fake_overlay64.dll') then package.loadlib('.\\fake_overlay64.dll', 'luaopen_fake_overlay64') end
+end
 
 local function context_script_env(listeners)
 	local model = {
@@ -86,6 +89,24 @@ local function context_script_env(listeners)
 		end,
 	}
 	return setmetatable({ core = core, cm = manager }, { __index = _G }), core
+end
+
+local function patch_from_chunk(name, mr, address)
+	assert(loadstring('local mr, address = ...; mr.patch(address, "\\0", "\\144")', name))(mr, address)
+end
+
+local function fill_code_patches(mr)
+	local filler = mr.pointer(test_function('filler_code'))
+	local sites = {}
+	for i = 1, 40 do
+		sites[i] = { mr.add(filler, i * 8), '\0\0\0\0', '\1\0\0\0' }
+	end
+	check(mr.relocate_field(sites) == true, 'relocate_field patches 40 sites in one batch')
+	patch_from_chunk('later_patch', mr, filler)
+	for i = 1, 35 do
+		patch_from_chunk('filler_patch_' .. i, mr, mr.add(filler, 1000 + i))
+	end
+	patch_from_chunk('newest_patch', mr, mr.add(filler, 2000))
 end
 
 local function fill_crash_context(mr)
@@ -887,8 +908,23 @@ elseif SCENARIO == 'guard' then
 	check(mr.read_uint32(data, 0) == 9, "write into the exe's data works")
 	local code = mr.pointer(test_function('pattern_target'))
 	local first = mr.read(code, 0, 1)
+	local faults = test_access_faults()
 	mr.write(code, 0, first)
 	check(mr.read(code, 0, 1) == first, "write into the exe's code works")
+	check(test_access_faults() == faults, "write into the exe's code raises no fault")
+	local read_only = mr.alloc(16)
+	local cell = mr.alloc(8)
+	mr.write(cell, 0, read_only)
+	local PAGE_READONLY, PAGE_READWRITE = 2, 4
+	test_protect(mr.read(cell, 0, 8), 16, PAGE_READONLY)
+	faults = test_access_faults()
+	local wrote, why = pcall(mr.write, read_only, 0, mr.uint32(1))
+	check(not wrote and string.find(why, 'failed to write memory', 1, true) ~= nil, 'write into read-only data memory fails: ' .. tostring(why))
+	check(test_access_faults() == faults + 1, 'write into read-only data memory outside the exe still tries the copy')
+	test_protect(mr.read(cell, 0, 8), 16, PAGE_READWRITE)
+	faults = test_access_faults()
+	mr.write(read_only, 0, mr.uint32(3))
+	check(mr.read_uint32(read_only, 0) == 3 and test_access_faults() == faults, 'write into data memory works without a fault')
 
 	local function refuse_call()
 		return pcall(mr.call, mr.base, 'void()')
@@ -1128,6 +1164,7 @@ elseif
 	or SCENARIO == 'fault_report_fallback'
 then
 	io.stdout:setvbuf('no')
+	load_other_program_dll()
 	local log = PASS == 1 and 'script_log_010203_0404.txt' or 'script_log_010203_0405.txt'
 	if SCENARIO == 'fault_report' then io.open(log, 'wb'):close() end
 	if SCENARIO == 'fault_report_thread' then
@@ -1148,6 +1185,7 @@ then
 	if SCENARIO == 'fault_report_off' and PASS > 1 then mr.set_crash_reports(false) end
 	check(not pcall(mr.set_crash_context), 'set_crash_context needs a name')
 	if PASS > 1 then fill_crash_context(mr) end
+	if PASS > 1 and SCENARIO == 'fault_report' then fill_code_patches(mr) end
 	if PASS == 1 then
 		NEXT_PASS = true
 	else
@@ -1191,6 +1229,7 @@ then
 	end
 elseif SCENARIO == 'fault_report_stale' then
 	io.stdout:setvbuf('no')
+	load_other_program_dll()
 	run_mod(OURS)
 	test_recovered_crash()
 	check(#io.popen('dir /b memreader_crash_report_*.txt 2>nul'):read('*a') == 0, 'a fault the game recovers from writes no report')
@@ -1322,6 +1361,780 @@ elseif SCENARIO == 'bench' then
 		mr.call(target, TARGET, 1, 2)
 	end)
 	mr.unhook(target)
+elseif SCENARIO:sub(1, 9) == 'file_edit' then
+	local logged = {}
+	ModLog = function(msg)
+		logged[#logged + 1] = msg
+		print('  log: ' .. msg)
+	end
+	local function log_count(text)
+		local count = 0
+		for _, line in ipairs(logged) do
+			if line:find(text, 1, true) then count = count + 1 end
+		end
+		return count
+	end
+	local spec_folder = 'vfs/script/memreader_plus/file_edits/'
+	os.execute('mkdir "' .. spec_folder:gsub('/', '\\') .. '"')
+	local function write(name, text)
+		local file = io.open(spec_folder .. name, 'wb')
+		file:write(text)
+		file:close()
+	end
+	write(
+		'good.lua',
+		[[return {
+	{ id = 'wide', path = 'ui/test/panel.twui.xml', ops = { { find = 'width="400"', with = 'width="500"' } } },
+	'not a table',
+	{ id = 'bad', path = 'ui/test/panel.twui.xml', ops = { { find = 'height="20"' } } },
+	{ id = 'box', path = 'ui/test/module.twui.xml', changes = { { set = 'root/box', values = { width = 9 } } } },
+	{ id = 'nobox', path = 'ui/test/module.twui.xml', changes = { { hide = 'nothing' } } },
+}]]
+	)
+	write('broken.lua', "error('boom')")
+	write('notable.lua', 'return 5')
+	table.insert(VFS, 1, 'vfs')
+	local lookup =
+		'script/memreader_plus/file_edits/good.lua,script/memreader_plus/file_edits/broken.lua,script/memreader_plus/file_edits/notable.lua,script/memreader_plus/file_edits/readme.txt'
+	os.execute('mkdir appdata')
+	common = {
+		filesystem_lookup = function()
+			return lookup
+		end,
+		get_appdata_screenshots_path = function()
+			return 'appdata/screenshots/'
+		end,
+	}
+	local panel = 'ui\\test\\panel.twui.xml'
+	if SCENARIO == 'file_edit_sites' then
+		for _, name in ipairs({
+			'parse_buffer',
+			'xml_document',
+			'xml_document_destroy',
+			'load_layout_file',
+			'fast_xml_parser',
+			'clear_from_cache',
+		}) do
+			test_twin_site(name)
+		end
+	elseif SCENARIO == 'file_edit_off' then
+		test_twin_site('load_buffer')
+	elseif SCENARIO == 'file_edit_saved_off' then
+		io.open('appdata/memreader_plus_file_edits_off.txt', 'wb'):close()
+		get_mct = function() end
+	end
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	check(mr ~= nil, 'Plus loaded although three spec files are broken')
+	local function edit(spec)
+		local ok, why = mr.file_edit(spec)
+		print('  file_edit ' .. tostring(spec.id) .. ': ' .. tostring(ok) .. ', ' .. tostring(why))
+		return ok, why
+	end
+	local function width(id, priority, value)
+		return edit({
+			owner = id,
+			id = 'w',
+			path = 'ui/test/panel.twui.xml',
+			priority = priority,
+			ops = { { find = 'width="400"', with = 'width="' .. value .. '"' } },
+		})
+	end
+	local function layout_has(text)
+		return test_load_layout(panel):find(text, 1, true) ~= nil
+	end
+	local function patch_line(path, prefix)
+		for _, file in ipairs(mr.file_edit_list()) do
+			if file.path == path then
+				for _, line in ipairs(file.patches) do
+					if line:sub(1, #prefix) == prefix then return line end
+				end
+			end
+		end
+	end
+	if SCENARIO == 'file_edit_off' then
+		local ok, why = width('x', 0, 500)
+		check(ok == nil and why == 'off: load_buffer found 2 times', 'a second load_buffer turns file edits off: ' .. tostring(why))
+		check(mr.file_edit_status().state == why, 'state names the site')
+		check(log_count('file edits off: load_buffer found 2 times') == 1, 'one log line for the site')
+		check(layout_has('width="400"'), 'layouts load as they ship')
+	elseif SCENARIO == 'file_edit_saved_off' then
+		check(mr.file_edit_status().enabled == false, 'the saved player switch is read when Plus loads')
+		check(log_count('file edits off: switched off by the player') == 1, 'spec files are refused with one log line')
+		local ok, why = width('x', 0, 500)
+		check(ok == nil and why == 'off: switched off by the player', 'file_edit says the player switched edits off')
+		check(layout_has('width="400"'), 'nothing applies')
+		mr.set_file_edits(true)
+		check(width('x', 0, 500) == true and layout_has('width="500"'), 'turned on again, edits register')
+	elseif SCENARIO == 'file_edit_sites' then
+		local ok, why = edit({ owner = 'x', id = 'model', path = 'models/test/unit.wsmodel', ops = { { find = 'skin_a', with = 'skin_b' } } })
+		check(ok == nil and why == 'off: fast_xml', 'FAST_XML edits are refused without parse_buffer and validation')
+		local status = mr.file_edit_status()
+		check(table.concat(status.off, ',') == 'fast_xml,validation,path_check,eviction', 'parts off: ' .. table.concat(status.off, ','))
+		check(status.state == 'on', 'the rest stays on')
+		check(
+			status.sites.parse_buffer == 'found 2 times: edits to FAST_XML files such as models and materials are refused',
+			'site text: ' .. tostring(status.sites.parse_buffer)
+		)
+		check(status.sites.load_buffer == true, 'load_buffer found')
+		ok, why = width('x', 0, 500)
+		check(ok == true and why == 'applies from the next parse only: the layout cache cannot be cleared', 'layout edit registers with the eviction note')
+		check(layout_has('width="500"'), 'content pairing works without the path check')
+		for _, name in ipairs({
+			'parse_buffer',
+			'xml_document',
+			'xml_document_destroy',
+			'load_layout_file',
+			'fast_xml_parser',
+			'clear_from_cache',
+		}) do
+			check(log_count('file edits: ' .. name .. ' found 2 times: ') == 1, 'one log line for ' .. name)
+		end
+		ok = edit({ owner = 'x', id = 'broken', path = 'ui/test/panel.twui.xml', priority = 1, ops = { { find = 'height="20"', with = 'height="20"<' } } })
+		check(ok == true, 'without validation a broken edit registers')
+		local text, parse = test_load_layout(panel)
+		check(parse == 0 and text:find('width="400"', 1, true) ~= nil, 'the hand-off parses the game bytes after the rejection')
+		check(mr.file_edit_list()[1].rejected == 1, 'rejected counted')
+	else
+		check(
+			log_count('file edit 2 of script/memreader_plus/file_edits/good.lua not registered: the entry is not a table') == 1,
+			'a non-table entry is skipped with a log line'
+		)
+		check(
+			log_count("file edit good/bad on ui/test/panel.twui.xml: file_edit: an op with find needs with ('' removes the text)") == 1,
+			'with = nil is refused with a log line'
+		)
+		check(log_count('file edits of script/memreader_plus/file_edits/broken.lua not loaded: ') == 1, 'a spec file that errors is skipped')
+		check(
+			log_count('file edits of script/memreader_plus/file_edits/notable.lua not loaded: it returns no table') == 1,
+			'a spec file without a table is skipped'
+		)
+		check(
+			log_count('file edits of script/memreader_plus/file_edits/readme.txt not loaded: the name does not end in .lua') == 1,
+			'a name without .lua is skipped'
+		)
+		check(layout_has('width="500"'), 'the good spec applies through LoadLayoutFile')
+		local status = mr.file_edit_status()
+		check(status.state == 'on' and #status.off == 0, 'all sites found')
+		local from_cache, key = test_cache_clears()
+		check(from_cache >= 2 and key == 'ui\\test\\module.twui.xml', 'the edited layouts were evicted: ' .. tostring(key))
+
+		local ok, why = width('aaa', 5, 650)
+		check(ok == true and layout_has('width="650"'), 'higher priority runs later and wins')
+		check(patch_line(panel, 'good/wide') == 'good/wide skipped: replaced by aaa/w, which runs later', 'the loser names the winner')
+		check(log_count('file edit good/wide on ui/test/panel.twui.xml: replaced by aaa/w, which runs later') == 1, 'the losing mod gets a log line')
+		ok, why = width('aaa', -1, 650)
+		check(ok == nil and why == 'replaced by good/wide, which runs later', 'lower priority loses: ' .. tostring(why))
+		check(layout_has('width="500"'), 'the higher one shows')
+		local before = test_cache_clears()
+		check(mr.file_edit_remove('aaa', 'w') == true and test_cache_clears() == before + 1, 'remove evicts')
+		check(layout_has('width="500"'), 'still the spec edit')
+
+		check(edit({ owner = 'x', id = 'ins', path = panel, ops = { { after = { '<layout>', '<panel' }, insert = ' extra="1"' } } }) == true, 'insert')
+		check(layout_has('<panel extra="1" id="a" width="500"'), 'insert lands after the last anchor')
+		ok, why = edit({
+			owner = 'x',
+			id = 'atomic',
+			path = panel,
+			ops = { { find = 'height="20"', with = 'height="30"' }, { after = 'nothing here', find = 'a', with = 'b' } },
+		})
+		check(ok == nil and why == 'op 2: anchor 1 not found' and layout_has('height="20"'), 'a patch applies all ops or none')
+		ok, why = edit({ owner = 'x', id = 'stop', path = panel, ops = { { after = '<panel', before = 'nothing', find = 'a', with = 'b' } } })
+		check(ok == nil and why == 'op 1: stop text not found', 'missing stop text')
+		ok, why = edit({ owner = 'x', id = 'broken', path = panel, ops = { { find = 'height="20"', with = 'height="20"<' } } })
+		check(ok == nil and why == 'the edited file does not parse (status 11)', 'validation refuses a broken edit')
+		check(layout_has('extra="1"') and layout_has('width="500"'), 'the other edits stay')
+		mr.file_edit_remove('x', 'broken')
+
+		local screen = 'ui\\loading_ui\\battle.twui.xml'
+		ok, why = edit({ owner = 'x', id = 'two', path = screen, ops = { { find = 'width="31"', with = 'width="22"' } } })
+		check(ok == nil and why == 'op 1: find text found 2 times, expected 1', 'count mismatch')
+		check(
+			edit({ owner = 'x', id = 'two', path = screen, once = true, ops = { { find = 'width="31"', with = 'width="22"', count = 2 } } }) == true,
+			'count 2'
+		)
+		check(test_load_screen(screen) == '<screen><card width="22"/><card width="22"/></screen>', 'once edit on a content-only read')
+		check(test_load_screen(screen):find('width="31"', 1, true) ~= nil, 'once: the next read gets the game bytes')
+		check(patch_line('ui\\loading_ui\\battle.twui.xml', 'x/two') == nil, 'used once edit swept')
+		check(
+			edit({ owner = 'x', id = 'first', path = screen, ops = { { after = '<card', before = '/>', find = 'width="31"', with = 'width="5"' } } }) == true,
+			'stop text bounds the find'
+		)
+		check(test_load_screen(screen) == '<screen><card width="5"/><card width="31"/></screen>', 'only the first card changed')
+
+		check(edit({ owner = 'x', id = 'ta', path = 'ui/test/twin_a.twui.xml', ops = { { find = '1', with = 'A' } } }) == true, 'twin a')
+		ok, why = edit({ owner = 'x', id = 'tb', path = 'ui/test/twin_b.twui.xml', ops = { { find = '1', with = 'B' } } })
+		check(
+			ok == true and why == 'same bytes as ui\\test\\twin_a.twui.xml: a reader that gives no path gets the edits of the file registered first',
+			'twin warning: ' .. tostring(why)
+		)
+		check(test_load_layout('ui\\test\\twin_b.twui.xml') == '<twin size="B"/>', 'the path check picks the named twin')
+		check(test_load_screen('ui\\test\\twin_b.twui.xml') == '<twin size="A"/>', 'a content-only read gets the first twin')
+
+		local evictions_before = test_cache_clears()
+		local tpl_ok, tpl_why = edit({ owner = 'x', id = 'tpl', path = 'ui/templates/button.twui.xml', ops = { { find = '10', with = '12' } } })
+		check(
+			tpl_ok == true
+				and tpl_why == 'applies to layouts read from now on: layouts the game already holds keep the old template'
+				and test_cache_clears() == evictions_before + 1,
+			'a template edit evicts only the template: ' .. tostring(tpl_why)
+		)
+
+		check(edit({ owner = 'x', id = 'model', path = 'models/test/unit.wsmodel', ops = { { find = 'skin_a', with = 'skin_b' } } }) == true, 'FAST_XML edit')
+		local text, parsed = test_fast_xml('models\\test\\unit.wsmodel')
+		check(text == '<model><material>skin_b</material></model>' and parsed == 1, 'FAST_XML hand-off gets the edit')
+		ok, why = edit({ owner = 'x', id = 'model2', path = 'models/test/unit.wsmodel', ops = { { find = '</model>', with = '</model' } } })
+		check(ok == nil and why == 'the edited file does not parse (status 11)', 'broken FAST_XML edit refused')
+
+		ok, why = edit({ owner = 'x', id = 'w', path = 'ui/test/wide.twui.xml', ops = { { find = 'a', with = 'b' } } })
+		check(ok == nil and why == 'no such file, or a UTF-16 file', 'UTF-16 refused')
+		ok, why = edit({ owner = 'x', id = 'm', path = 'ui/test/missing.twui.xml', ops = { { find = 'a', with = 'b' } } })
+		check(ok == nil and why == 'no such file, or a UTF-16 file', 'missing file refused')
+
+		local files_before = mr.file_edit_status().files
+		local nine = {}
+		for i = 1, 33 do
+			nine[i] = 'a'
+		end
+		local ops = {}
+		for i = 1, 4097 do
+			ops[i] = { find = 'x', with = 'y' }
+		end
+		local bad = {
+			{ 5, 'file_edit: takes a table' },
+			{ { owner = 'x', id = 'b', ops = {} }, 'file_edit: path must be a string' },
+			{ { owner = 'x', id = 'b', path = panel, ops = { { after = nine, find = 'a', with = 'b' } } }, 'file_edit: after takes at most 32 texts' },
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { { after = '', find = 'a', with = 'b' } } },
+				'file_edit: after must be a string of 1 byte or more without a zero byte',
+			},
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { { after = { 'a', 5 }, find = 'a', with = 'b' } } },
+				'file_edit: each text in after must be a string of 1 byte or more without a zero byte',
+			},
+			{ { owner = 'x', id = 'b', path = panel, ops = { { find = 'a' } } }, "file_edit: an op with find needs with ('' removes the text)" },
+			{ { owner = 'x', id = 'b', path = panel, priority = 0 / 0, ops = { { find = 'a', with = 'b' } } }, 'file_edit: priority must be a finite number' },
+			{
+				{ owner = 'x', id = 'b', path = panel, priority = math.huge, ops = { { find = 'a', with = 'b' } } },
+				'file_edit: priority must be a finite number',
+			},
+			{ { owner = 'x', id = 'b', path = panel, priority = '5', ops = { { find = 'a', with = 'b' } } }, 'file_edit: priority must be a number' },
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { { find = 'a', with = 'b', count = 1.5 } } },
+				'file_edit: count must be a whole number from 1 to 100000',
+			},
+			{ { owner = 'x', id = 'b', path = panel, ops = ops }, 'file_edit: at most 4096 ops per edit' },
+			{ { owner = 'x', id = 'b', path = panel, ops = { 'op' } }, 'file_edit: each op must be a table' },
+			{ { owner = 'x', id = 'b', path = panel, ops = {} }, 'file_edit: ops must list at least one op' },
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { { find = 'a', insert = 'b' } } },
+				'file_edit: each op needs one of find, insert, attribute or child',
+			},
+			{ { owner = 5, id = 'b', path = panel, ops = { { find = 'a', with = 'b' } } }, 'file_edit: owner must be a string' },
+			{ { owner = 'x', id = 'b', path = panel, prioriy = 1, ops = { { find = 'a', with = 'b' } } }, "file_edit: unknown key 'prioriy' in the edit" },
+			{ { owner = 'x', id = 'b', path = panel, ops = { { find = 'a', wiht = 'b' } } }, "file_edit: unknown key 'wiht' in an op" },
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { [1] = { find = 'a', with = 'b' }, [3] = { find = 'a', with = 'b' } } },
+				'file_edit: ops must be a list without gaps',
+			},
+			{ { owner = 'x', id = 'b', path = panel, once = 'yes', ops = { { find = 'a', with = 'b' } } }, 'file_edit: once must be true or false' },
+			{
+				{ owner = 'x', id = 'b', path = '../x.twui.xml', ops = { { find = 'a', with = 'b' } } },
+				'file_edit: path must be a path inside the packs: no drive letter, no leading \\\\ and no .. part',
+			},
+			{ { owner = 'x', id = 'b', path = panel, ops = { { attribute = 'w', value = '1' } } }, 'file_edit: an op with attribute or child needs after' },
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { { after = 'a', attribute = '1w', value = '1' } } },
+				'file_edit: attribute and child must be XML names',
+			},
+			{ { owner = 'x', id = 'b', path = panel, ops = { { after = 'a', attribute = 'w' } } }, 'file_edit: an op with attribute needs value' },
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { { after = 'a', insert = 'x', before = 'y' } } },
+				'file_edit: with, before and count go only with find',
+			},
+			{
+				{ owner = 'x', id = 'b', path = panel, ops = { { after = 'a', attribute = 'w', value = 'a\1' } } },
+				'file_edit: value holds a control character other than tab or a line break',
+			},
+			{ { owner = 'x', id = 'b', path = panel, ops = { { after = 'a', child = 'list' } } }, 'file_edit: an op with child needs insert' },
+		}
+		for _, case in ipairs(bad) do
+			local call_ok, result, message = pcall(mr.file_edit, case[1])
+			check(call_ok and result == nil and message == case[2], 'nil, why: ' .. tostring(message))
+		end
+		check(mr.file_edit_status().files == files_before, 'bad input registers nothing')
+
+		local edited, base = mr.file_edit_preview(panel)
+		check(edited:find('extra="1"', 1, true) and base:find('width="400"', 1, true), 'preview gives edited and base text')
+		check(mr.file_edit_list()[1].edited_size > 0, 'list gives the edited size')
+
+		mr.set_file_edits(false)
+		ok, why = width('y', 0, 700)
+		check(ok == nil and why == 'off: switched off by the player', 'player switch refuses new edits')
+		check(layout_has('width="400"'), 'player switch serves the game bytes')
+		mr.set_file_edits(true)
+		check(layout_has('width="500"'), 'back on')
+		mr.set_file_edits(false, panel)
+		check(layout_has('width="400"'), 'per-file switch')
+		mr.set_file_edits(true, panel)
+		check(layout_has('width="500"'), 'per-file switch back on')
+
+		local module = 'ui\\test\\module.twui.xml'
+		check(test_load_layout(module):find('width="9"', 1, true) ~= nil, 'a declared TWUI change applies through LoadLayoutFile')
+		check(
+			log_count('file edit good/nobox on ui/test/module.twui.xml: change 1, hide nothing: matches 0 components, expected 1') == 1,
+			'a broken selector is refused with one log line'
+		)
+		ok, why = mr.twui.edit({ owner = 'x', id = 'box', path = module, changes = { { set = 'box', values = { width = 9 }, expect = { width = 8 } } } })
+		check(ok == nil and why == 'change 1, set box: box width is "7", expected "8"', 'expect check: ' .. tostring(why))
+		local edited = mr.twui.preview({ path = module, changes = { { hide = 'root/box' } } })
+		check(edited and edited:find('width="7" visible="false"/>', 1, true) ~= nil, 'preview adds the attribute at the end of the tag')
+		ok, why = mr.twui.edit({ owner = 'x', id = 'same', path = module, changes = { { set = 'box', values = { width = 7 } } } })
+		check(ok == true and why == nil, 'a value the file already has still registers: ' .. tostring(why))
+		mr.file_edit_remove('x', 'same')
+
+		local twui = mr.twui
+		local layout = table.concat({
+			'<layout><hierarchy><root this="R"><panel this="0A-0B-0C-0D"><icon this="I1"/></panel><other this="O"><icon this="I2"/></other>',
+			'<bare this="N"/><tpl this="T"/></root></hierarchy><components><root this="R" id="root"/>',
+			'<panel this="0A-0B-0C-0D" id="panel" width="15"><callbackwithcontextlist><callback_with_context callback_id="Old"/></callbackwithcontextlist>',
+			'<states><a this="S1" name="a" width="10"><imagemetrics><image this="M1" width="10"/></imagemetrics></a><b this="S2" name="b" width="10"/></states>',
+			'<componentimages><component_image this="C1" imagepath="a.png"/></componentimages><LayoutEngine type="List" spacing="2"/></panel>',
+			'<icon this="I1" id="icon"/><other this="O" id="other"><states/></other><icon this="I2" id="icon"/><bare this="N" id="bare"/>',
+			'<tpl this="T" id="tpl" part_of_template="true"><states><s this="S3" width="1"/></states></tpl></components></layout>',
+		})
+		local function preview(...)
+			return twui.preview({ path = 'x', changes = { ... } }, layout)
+		end
+		local function refused(expected, ...)
+			local edited, problem = preview(...)
+			check(edited == nil and problem == expected, 'twui refuses: ' .. expected .. ' (got ' .. tostring(problem) .. ')')
+		end
+		local function previewed(label, wanted, op_count, ...)
+			local edited, ops = preview(...)
+			local found = edited ~= nil and edited:find(wanted, 1, true) ~= nil
+			check(found and #ops == op_count, ('twui %s: %s ops'):format(label, edited and #ops or tostring(ops)))
+			return edited, ops
+		end
+		previewed('component attribute', 'id="panel" width="12"', 1, { set = 'panel', values = { width = 12 } })
+		previewed('escaped value', 'id="bare" tooltip_text="a &lt; b &amp; &quot;c&quot;"/>', 1, { set = 'bare', values = { tooltip_text = 'a < b & "c"' } })
+		previewed('negative whole number', 'id="panel" width="-3"', 1, { set = 'panel', values = { width = -3 } })
+		local _, ops = previewed('all states', 'name="b" width="20"', 2, { set = 'panel', on = 'state', values = { width = 20 } })
+		check(ops[1].attribute == 'width' and ops[1].value == '20' and ops[1].find == nil, 'twui sets are attribute ops')
+		previewed('where', 'name="a" width="20"', 1, { set = 'panel', on = 'state', where = { name = 'a' }, values = { width = 20 } })
+		_, ops = previewed(
+			'state and image',
+			'this="M1" width="5"',
+			3,
+			{ set = 'panel', on = 'state', values = { width = 5 } },
+			{ set = 'panel', on = 'image', values = { width = 5 } }
+		)
+		check(ops[3].after[2] == 'this="M1"', 'twui anchors each element at its own GUID')
+		previewed('component_image', 'imagepath="b.png"', 1, { set = 'panel', on = 'component_image', values = { imagepath = 'b.png' } })
+		previewed('engine', 'type="List" spacing="4"', 1, { set = 'panel', on = 'engine', values = { spacing = 4 } })
+		previewed('engine insert', '<LayoutEngine type="List" spacing="2" margin="1"/>', 1, { set = 'panel', on = 'engine', values = { margin = 1 } })
+		previewed('GUID selector', 'width="15" visible="false">', 1, { hide = '0A-0B-0C-0D' })
+		previewed('id path', 'this="I2" id="icon" visible="false"', 1, { hide = 'root/other/icon' })
+		previewed('short id path', 'this="I1" id="icon" visible="false"', 1, { hide = 'panel/icon' })
+		refused('change 1, hide root/icon: matches 2 components, expected 1', { hide = 'root/icon' })
+		previewed('expect', 'id="panel" width="11"', 1, { set = 'panel', values = { width = 11 }, expect = { width = 15, id = 'panel' } })
+		previewed(
+			'existing callback list',
+			'<callbackwithcontextlist><callback_with_context callback_id="New" context_object_id="C"/><callback_with_context callback_id="Old"/>',
+			1,
+			{
+				add_callback = 'panel',
+				values = { callback_id = 'New', context_object_id = 'C' },
+			}
+		)
+		previewed('new callback list', 'id="other"><callbackwithcontextlist><callback_with_context callback_id="A"/></callbackwithcontextlist><states/>', 1, {
+			add_callback = 'other',
+			values = { callback_id = 'A' },
+		})
+		previewed('mixed changes', 'id="panel" width="12" visible="false">', 3, { set = 'panel', values = { width = 12 } }, { hide = 'panel' }, {
+			add_callback = 'panel',
+			values = { callback_id = 'New' },
+		})
+		previewed('later change wins', 'id="panel" width="13"', 1, { set = 'panel', values = { width = 12 } }, { set = 'panel', values = { width = 13 } })
+		previewed(
+			'callbacks share one new list',
+			'<callbackwithcontextlist><callback_with_context callback_id="A"/><callback_with_context callback_id="B"/></callbackwithcontextlist><states/>',
+			1,
+			{ add_callback = 'other', values = { callback_id = 'A' } },
+			{ add_callback = 'other', values = { callback_id = 'B' } }
+		)
+		local same, one = preview({ set = 'panel', values = { width = 15 } })
+		check(same == layout and #one == 1, 'twui preview of a value the file has gives the file back and one op')
+		refused('change 1, hide icon: matches 2 components, expected 1', { hide = 'icon' })
+		refused(
+			"change 1, hide nothing: matches 0 components, expected 1 (an id matches as written or as the layout's <hierarchy> block spells it)",
+			{ hide = 'nothing' }
+		)
+		refused('change 2, is not a table', { hide = 'bare' }, 5)
+		refused('change 1, needs set, hide or add_callback', { on = 'state' })
+		refused('change 1, has more than one of set, hide and add_callback', { set = 'bare', hide = 'bare' })
+		refused('change 1, set must be a component id path or GUID', { set = 5, values = { width = 1 } })
+		refused('change 1, set bare: values must be a table of attribute = value', { set = 'bare' })
+		refused('change 1, set bare: values must be a table of attribute = value', { set = 'bare', values = {} })
+		refused('change 1, set bare: values: 1a is not an attribute name', { set = 'bare', values = { ['1a'] = 1 } })
+		refused('change 1, set bare: values: width must be text or a whole number below 10000000', { set = 'bare', values = { width = 1.5 } })
+		refused('change 1, set bare: values: width must be text or a whole number below 10000000', { set = 'bare', values = { width = 1e8 } })
+		refused('change 1, set bare: values: width must be text or a whole number below 10000000', { set = 'bare', values = { width = true } })
+		refused('change 1, set bare: values: width holds a control character other than tab or a line break', { set = 'bare', values = { width = 'a\1' } })
+		refused(
+			'change 1, set bare: on must be component, state, image, text, component_image or engine',
+			{ set = 'bare', on = 'states', values = { width = 1 } }
+		)
+		refused('change 1, set bare: where must be a table of attribute = value', { set = 'bare', where = 5, values = { width = 1 } })
+		refused('change 1, set bare: expect must be a table of attribute = value', { set = 'bare', expect = {}, values = { width = 1 } })
+		refused('change 1, set bare: no state matches', { set = 'bare', on = 'state', values = { width = 1 } })
+		refused('change 1, set panel: no state matches', { set = 'panel', on = 'state', where = { name = 'c' }, values = { width = 1 } })
+		refused('change 1, set panel: panel height is missing, expected "1"', { set = 'panel', values = { width = 1 }, expect = { height = 1 } })
+		refused('change 1, set panel: a width is "10", expected "9"', { set = 'panel', on = 'state', values = { width = 1 }, expect = { width = 9 } })
+		refused(
+			'change 1, set tpl: it is part of a template: the game ignores its states, images, texts and engine, so edit the template',
+			{ set = 'tpl', on = 'state', values = { width = 2 } }
+		)
+		previewed('template part component attribute', 'part_of_template="true" width="2">', 1, { set = 'tpl', values = { width = 2 } })
+		refused('change 1, add_callback panel: values needs callback_id', { add_callback = 'panel', values = { x = 1 } })
+		refused('change 1, add_callback bare: bare has no body to add a callback to', { add_callback = 'bare', values = { callback_id = 'A' } })
+		local edited, problem = twui.preview({ path = 'x', changes = {} }, layout)
+		check(edited == nil and problem == 'changes must be a list of one or more changes', 'twui empty changes')
+		edited, problem = twui.preview({ path = 'x', changes = 'hide' }, layout)
+		check(edited == nil and problem == 'changes must be a list of one or more changes', 'twui changes not a table')
+		edited, problem = twui.preview({ changes = { { hide = 'bare' } } }, layout)
+		check(edited == nil and problem == 'takes an edit table with a path', 'twui spec without a path')
+		edited, problem = twui.preview(5)
+		check(edited == nil and problem == 'takes an edit table with a path', 'twui spec not a table')
+		edited, problem = twui.preview({ path = 'x', changes = { { hide = 'a' } } }, '\255\254<\0')
+		check(edited == nil and problem == 'the file is UTF-16', 'twui UTF-16')
+		edited, problem = twui.preview({ path = 'x', changes = { { hide = 'a' } } }, '<a/>')
+		check(edited == nil and problem == 'not a TWUI layout: <hierarchy> or <components> is missing', 'twui not a layout')
+		edited, problem = twui.preview({ path = 'x', changes = { { hide = 'a' } } }, '<l><hierarchy><a this="x"></hierarchy><components></components></l>')
+		check(edited == nil and problem == 'the <hierarchy> block does not parse', 'twui broken hierarchy')
+		edited, problem = twui.preview({ path = 'x', changes = { { hide = 'bare' } } }, (layout:gsub('<bare this="N" id="bare"/>', '')))
+		check(edited == nil and problem == 'change 1, hide bare: its definition is missing', 'twui definition missing')
+		edited, problem = twui.preview({ path = 'x', changes = { { hide = 'bare' } } }, (layout:gsub('<bare this="N" id="bare"/>', '%0%0')))
+		check(edited == nil and problem == 'change 1, hide bare: its GUID is defined twice', 'twui GUID twice')
+		edited = twui.preview({ path = 'x', ops = { { after = '<bare', before = '/>', find = 'this', with = 'that' } } }, layout)
+		check(edited and edited:find('<bare that="N"', 1, true) ~= nil, 'twui preview applies plain ops')
+		edited, problem = twui.preview({ path = 'x', ops = { { find = 'this', with = 'that' } } }, layout)
+		check(edited == nil and problem:find('^op 1: find text found %d+ times, expected 1') ~= nil, 'twui preview op problem: ' .. tostring(problem))
+		local files_before = #mr.file_edit_list()
+		edited = mr.file_edit_apply('<a x="1"/>', { { after = '<a', attribute = 'x', value = '2&' }, { after = '<a', attribute = 'y', value = '3' } })
+		check(edited == '<a x="2&amp;" y="3"/>', 'file_edit_apply runs the core ops on a text: ' .. tostring(edited))
+		edited, problem = mr.file_edit_apply('<a/>', { { after = '<b', insert = 'x' } })
+		check(edited == nil and problem == 'op 1: anchor 1 not found', 'file_edit_apply op problem: ' .. tostring(problem))
+		edited, problem = mr.file_edit_apply('<a/>', { { insert = 'x', count = 2 } })
+		check(
+			edited == nil and problem == 'file_edit: with, before and count go only with find',
+			'file_edit_apply checks ops like file_edit: ' .. tostring(problem)
+		)
+		edited, problem = mr.file_edit_apply('<a/>', {})
+		check(edited == nil and problem == 'file_edit: ops must list at least one op', 'file_edit_apply refuses no ops: ' .. tostring(problem))
+		edited, problem = mr.file_edit_apply(5, 'x')
+		check(edited == nil and problem == 'file_edit: ops must be a list of ops', 'file_edit_apply refuses ops that are not a list: ' .. tostring(problem))
+		check(#mr.file_edit_list() == files_before, 'file_edit_apply registers nothing')
+		edited = twui.preview({ path = module, changes = { { set = 'box', values = { width = 4 } } } })
+		check(edited and edited:find('id="box" width="4"', 1, true) ~= nil, 'twui preview reads the pack file')
+		edited, problem = twui.preview({ path = 'ui/test/none.twui.xml', changes = { { hide = 'box' } } })
+		check(edited == nil and problem == 'no such file: ui/test/none.twui.xml', 'twui preview of a missing file')
+		local states = {}
+		for i = 1, 4097 do
+			states[i] = ('<s%d this="Q%d"/>'):format(i, i)
+		end
+		local big = '<l><hierarchy><big this="G"/></hierarchy><components><big this="G" id="big"><states>'
+			.. table.concat(states)
+			.. '</states></big></components></l>'
+		edited, problem = twui.preview({ path = 'x', changes = { { set = 'big', on = 'state', values = { width = 1 } } } }, big)
+		check(edited == nil and problem == 'the changes need 4097 ops, at most 4096: split them into several edits', 'twui op cap: ' .. tostring(problem))
+
+		ok, why = twui.edit({ owner = 5, id = 'x', path = module, changes = { { hide = 'box' } } })
+		check(ok == nil and why == 'owner and id must be strings', 'twui edit owner check')
+		ok, why = twui.edit({ owner = 'x', id = 'x', path = 'ui/test/none.twui.xml', changes = { { hide = 'box' } } })
+		check(ok == nil and why == 'no such file: ui/test/none.twui.xml', 'twui edit of a missing file')
+		ok, why = twui.edit({ owner = 'x', id = 'x', path = module, priority = '5', changes = { { hide = 'box' } } })
+		check(ok == nil and why == 'file_edit: priority must be a number', 'twui edit passes priority on: ' .. tostring(why))
+		mr.file_edit_remove('good', 'box')
+		check(
+			twui.edit({ owner = 'x', id = 'once', path = module, once = true, changes = { { set = 'box', values = { width = 3 } } } }) == true,
+			'twui once edit'
+		)
+		check(test_load_screen(module):find('width="3"', 1, true) ~= nil, 'twui once edit applies')
+		check(test_load_screen(module):find('width="7"', 1, true) ~= nil, 'twui once edit used once')
+		ok, why = twui.edit({ owner = 'x', id = 'hide', path = module, changes = { { hide = 'box' } } })
+		check(ok == true and test_load_layout(module):find('visible="false"', 1, true) ~= nil, 'twui edit applies: ' .. tostring(why))
+		local unknown = "change 1, hide nothing: matches 0 components, expected 1 (an id matches as written or as the layout's <hierarchy> block spells it)"
+		ok, why = twui.edit({ owner = 'x', id = 'hide', path = module, changes = { { hide = 'nothing' } } })
+		check(ok == nil and why == unknown, 'twui edit refusal')
+		check(log_count('file edit x/hide on ' .. module .. ': ' .. unknown) == 1, 'twui edit refusal logged once')
+		ok, why = twui.edit({ owner = 'x', id = 'hide', path = module, changes = { { set = 'box', values = { width = 7 } } } })
+		check(ok == true and test_load_layout(module):find('visible="false"', 1, true) == nil, 'registering the id again replaces the old edit')
+		mr.file_edit_remove('x', 'hide')
+
+		local rich = 'ui/test/rich.twui.xml'
+		local rich_file = 'ui\\test\\rich.twui.xml'
+		local function count_text(text, needle)
+			local count, at = 0, text:find(needle, 1, true)
+			while at do
+				count = count + 1
+				at = text:find(needle, at + 1, true)
+			end
+			return count
+		end
+		local all_kinds = {
+			{ set = 'panel', values = { width = 20 } },
+			{ set = 'panel', on = 'state', where = { name = 'a' }, values = { width = 11 } },
+			{ set = 'panel', on = 'text', values = { font_m_size = 8 }, expect = { font_m_size = 12 } },
+			{ hide = 'panel/kills' },
+			{ add_callback = 'panel', values = { callback_id = 'A', context_object_id = 'x > y' } },
+		}
+		local previewed_text = twui.preview({ path = rich, changes = all_kinds })
+		ok, why = twui.edit({ owner = 'eq', id = 'all', path = rich, changes = all_kinds })
+		check(ok == true and test_load_layout(rich_file) == previewed_text, 'the core makes the same text as the module preview: ' .. tostring(why))
+		check(
+			previewed_text:find('<component_text font_m_size="8"/></a><b this="S2" name="b" width="10"><component_text font_m_size="8"/>', 1, true) ~= nil,
+			'on text sets every state text'
+		)
+		check(previewed_text:find('context_object_id="x &gt; y"', 1, true) ~= nil, 'callback values are escaped')
+		mr.file_edit_remove('eq', 'all')
+
+		ok = twui.edit({ owner = 'mod_a', id = 'a', path = rich, changes = { { set = 'panel', values = { width = 100 } }, { hide = 'kills' } } })
+		why = select(2, twui.edit({ owner = 'mod_b', id = 'b', path = rich, priority = 1, changes = { { set = 'panel', values = { width = 200 } } } }))
+		local text = test_load_layout(rich_file)
+		check(
+			ok == true and why == nil and text:find('width="200"', 1, true) and text:find('id="kills" visible="false"', 1, true),
+			'two mods set one attribute: the later wins, the earlier keeps its other changes'
+		)
+		check(patch_line('ui\\test\\rich.twui.xml', 'mod_a/a') == 'mod_a/a applied', 'the earlier mod stays applied')
+		twui.edit({ owner = 'mod_b', id = 'b', path = rich, priority = -1, changes = { { set = 'panel', values = { width = 200 } } } })
+		check(test_load_layout(rich_file):find('id="panel" width="100"', 1, true) ~= nil, 'with a lower priority it runs first and loses that attribute')
+		twui.edit({ owner = 'mod_b', id = 'b', path = rich, changes = { { hide = 'kills' }, { add_callback = 'panel', values = { callback_id = 'B' } } } })
+		twui.edit({ owner = 'mod_c', id = 'c', path = rich, changes = { { add_callback = 'panel', values = { callback_id = 'C' } } } })
+		text = test_load_layout(rich_file)
+		check(count_text(text, 'visible=') == 1, 'two mods hiding one component give one visible attribute')
+		check(
+			count_text(text, '<callbackwithcontextlist>') == 1 and text:find('callback_id="B"', 1, true) and text:find('callback_id="C"', 1, true),
+			'callbacks of two mods share one list'
+		)
+		ok, why =
+			mr.file_edit({ owner = 'raw_a', id = 'v', path = rich, ops = { { after = { '<components>', '<kills this="K"' }, insert = ' visible="true"' } } })
+		check(ok == nil and why == 'the edited file has an attribute twice in one tag', 'an insert that doubles an attribute is refused: ' .. tostring(why))
+		mr.file_edit_remove('raw_a', 'v')
+		ok, why = twui.edit({ owner = 'mod_d', id = 'd', path = rich, changes = { { hide = 'kill_ratio_PH' } } })
+		check(
+			ok == true and test_load_layout(rich_file):find('id="kill_ratio_PH" visible="false"', 1, true) ~= nil,
+			'a selector may use the component id as written: ' .. tostring(why)
+		)
+		for _, owner in ipairs({ 'mod_a', 'mod_b', 'mod_c', 'mod_d' }) do
+			mr.file_edit_remove(owner, owner:sub(-1))
+		end
+		check(#mr.file_edit_list(rich) == 0, 'file_edit_list takes a path')
+
+		local function stress_width(owner, priority, find, with, once)
+			return edit({ owner = owner, id = 'w', path = 'ui/stress/order.twui.xml', priority = priority, once = once, ops = { { find = find, with = with } } })
+		end
+		stress_width('k', -2, 'width="1"', 'width="500"')
+		stress_width('i', 0, 'width="1"', 'width="600"')
+		ok, why = stress_width('z', 9, '</layout>', '</layout><')
+		check(ok == nil and why == 'the edited file does not parse (status 11)', 'the broken edit is refused')
+		check(test_load_layout('ui\\stress\\order.twui.xml'):find('width="600"', 1, true) ~= nil, 'a refused edit of a third mod keeps the priority order')
+		check(patch_line('ui\\stress\\order.twui.xml', 'i/w') == 'i/w applied', 'the winner stays applied')
+		check(patch_line('ui\\stress\\order.twui.xml', 'k/w') == 'k/w skipped: replaced by i/w, which runs later', 'the loser names the winner')
+		check(log_count('file edit k/w on ui/stress/order.twui.xml: replaced by i/w, which runs later') == 1, 'the losing mod gets a log line')
+		for _, owner in ipairs({ 'k', 'i', 'z' }) do
+			mr.file_edit_remove(owner, 'w')
+		end
+		stress_width('p', 0, 'width="1"', 'width="5"')
+		stress_width('o', 1, 'width="1"', 'width="22"', true)
+		check(patch_line('ui\\stress\\order.twui.xml', 'p/w') == 'p/w skipped: replaced by o/w, which runs later', 'the once edit wins first')
+		check(test_load_screen('ui\\stress\\order.twui.xml'):find('width="22"', 1, true) ~= nil, 'the once edit applies once')
+		check(patch_line('ui\\stress\\order.twui.xml', 'p/w') == 'p/w applied', 'after the once edit is used the other edit says applied')
+		check(test_load_layout('ui\\stress\\order.twui.xml'):find('width="5"', 1, true) ~= nil, 'and applies')
+		mr.file_edit_remove('p', 'w')
+
+		edit({ owner = 'x', id = 'move', path = 'ui/stress/first.twui.xml', ops = { { after = '<box', insert = ' a="1"' } } })
+		edit({ owner = 'x', id = 'move', path = 'ui/stress/second.twui.xml', ops = { { after = '<box', insert = ' a="1"' } } })
+		check(
+			#mr.file_edit_list('ui/stress/first.twui.xml') == 0 and #mr.file_edit_list('ui/stress/second.twui.xml') == 1,
+			'owner and id name one edit across files'
+		)
+		mr.file_edit_remove('x', 'move')
+
+		ok = edit({ owner = 'f', id = 'fail', path = 'models/test/unit.wsmodel', priority = 5, ops = { { find = 'skin_b', with = 'fast_fail' } } })
+		local fast_text, fast_parsed = test_fast_xml('models\\test\\unit.wsmodel')
+		check(ok == true and fast_parsed == 0 and fast_text:find('fast_fail', 1, true) ~= nil, 'a FAST_XML parse that rejects the edit fails once')
+		fast_text, fast_parsed = test_fast_xml('models\\test\\unit.wsmodel')
+		check(fast_parsed == 1 and fast_text:find('skin_a', 1, true) ~= nil, 'the next read gets the game bytes')
+		mr.file_edit_remove('f', 'fail')
+
+		ok, why = twui.edit({ owner = 'x', id = 'p', path = '../x.twui.xml', changes = { { hide = 'box' } } })
+		check(
+			ok == nil and why == 'path must be a path inside the packs: no drive letter, no leading \\\\ and no .. part',
+			'twui.edit refuses a bad path: ' .. tostring(why)
+		)
+		ok, why = twui.preview({ path = 'C:/x.twui.xml', changes = { { hide = 'box' } } })
+		check(ok == nil and why == 'path must be a path inside the packs: no drive letter, no leading \\\\ and no .. part', 'twui.preview refuses a bad path')
+		ok, why = twui.preview({ path = 'x', prioriy = 1, changes = { { hide = 'bare' } } }, layout)
+		check(ok == nil and why == "unknown key 'prioriy' in the edit", 'twui refuses a misspelt edit key')
+		ok, why = twui.preview({ path = 'x', changes = { [1] = { hide = 'bare' }, [3] = { hide = 'bare' } } }, layout)
+		check(ok == nil and why == 'changes must be a list of one or more changes', 'twui refuses changes with a gap')
+		refused("change 1, set panel: unknown key 'exepct'", { set = 'panel', exepct = { width = 15 }, values = { width = 1 } })
+		refused("change 1, hide panel: unknown key 'values'", { hide = 'panel', values = { width = 1 } })
+		refused('change 1, hide panel: panel width is "15", expected "99"', { hide = 'panel', expect = { width = 99 } })
+
+		local function quirks(source, change)
+			return twui.preview({ path = 'x', changes = { change } }, '<l><hierarchy><box this="B"/></hierarchy><components>' .. source .. '</components></l>')
+		end
+		check(
+			(quirks('<box this="B" ctx="a > b" id="box" width="7"/>', { set = 'box', values = { width = 9 } }) or ''):find(
+				'ctx="a > b" id="box" width="9"/>',
+				1,
+				true
+			),
+			'a > in a value of the file'
+		)
+		check(
+			(quirks("<box this=\"B\" w='1' name='x'/>", { set = 'box', where = { name = 'x' }, values = { w = 2 } }) or ''):find('w="2" name=', 1, true),
+			'single-quoted attributes'
+		)
+		check(
+			(quirks('<!-- <box> --><box this="B" id="box"/>', { hide = 'box' }) or ''):find('id="box" visible="false"', 1, true),
+			'a comment before the component'
+		)
+		check(
+			(quirks('<box this="B" t="a&amp;b"/>', { set = 'box', values = { t = 'a\nb\tc>' }, expect = { t = 'a&b' } }) or ''):find(
+				't="a&#10;b&#9;c&gt;"',
+				1,
+				true
+			),
+			'line breaks and tabs become references, expect reads references'
+		)
+		check(
+			select(2, quirks('<box this = "B"/>', { hide = 'box' })) == 'change 1, hide box: its definition is missing',
+			'this with spaces around = is not found'
+		)
+		local hierarchy_names = '<l><hierarchy><upper_panel this="U"/></hierarchy><components><upper_panel this="U" id="upper panel"/></components></l>'
+		check(twui.preview({ path = 'x', changes = { { hide = 'upper panel' } } }, hierarchy_names) ~= nil, 'an id with a space matches its hierarchy name')
+		ok, why = twui.preview({ path = 'x', ops = { { after = '</l', attribute = 'a', value = '1' } } }, hierarchy_names)
+		check(ok == nil and why == 'op 1: the last anchor does not end inside a start tag', 'attribute op outside a start tag')
+
+		local switch = assert(loadfile('/script/memreader_plus/file_edit_switch'))()
+		local screenshots = common.get_appdata_screenshots_path
+		common.get_appdata_screenshots_path = function()
+			return 'appdata/\197\129ukasz/screenshots/'
+		end
+		switch.save(false)
+		check(
+			exists('memreader_plus_file_edits_off.txt') and switch.saved_off(),
+			'a user data path with non-ASCII bytes keeps the switch file in the game folder'
+		)
+		switch.save(true)
+		check(not exists('memreader_plus_file_edits_off.txt'), 'and removes it there')
+		common.get_appdata_screenshots_path = screenshots
+
+		local started = os.clock()
+		for i = 1, 200 do
+			check(
+				edit({ owner = 's', id = 'f' .. i, path = 'ui/stress/f' .. i .. '.twui.xml', ops = { { find = '"1"', with = '"2"' } } }) == true,
+				'file ' .. i
+			)
+		end
+		local after_files = os.clock()
+		for i = 1, 50 do
+			local spec = { owner = 'p' .. i, id = 'a', path = 'ui/stress/many.twui.xml', ops = { { after = '<box', insert = ' a' .. i .. '="1"' } } }
+			check(edit(spec) == true, 'patch ' .. i)
+		end
+		local after_patches = os.clock()
+		local many_ops = {}
+		for i = 1, 500 do
+			many_ops[i] = { after = '<layout>', insert = '<i/>' }
+		end
+		check(edit({ owner = 's', id = 'ops', path = 'ui/stress/ops.twui.xml', ops = many_ops }) == true, '500 ops in one edit')
+		local deep = {}
+		local stress_text = '<layout><box width="1"/></layout>'
+		for i = 1, 19 do
+			deep[i] = stress_text:sub(i, i)
+		end
+		for i = 20, 30 do
+			deep[i] = ' '
+		end
+		ok, why = edit({ owner = 's', id = 'deep', path = 'ui/stress/deep.twui.xml', ops = { { after = deep, find = '1', with = '3' } } })
+		check(ok == nil and why == 'op 1: anchor 20 not found', '30 anchors are read: ' .. tostring(why))
+		for i = 20, 30 do
+			deep[i] = nil
+		end
+		deep[20] = '"'
+		check(edit({ owner = 's', id = 'deep', path = 'ui/stress/deep.twui.xml', ops = { { after = deep, find = '1', with = '3' } } }) == true, 'deep anchors')
+		local done = os.clock()
+		local status = mr.file_edit_status()
+		print(
+			('  stress: 200 files %.0f ms, 50 patches %.0f ms, 500 ops and deep anchors %.0f ms, %d files, %d results'):format(
+				(after_files - started) * 1000,
+				(after_patches - after_files) * 1000,
+				(done - after_patches) * 1000,
+				status.files,
+				status.results
+			)
+		)
+		for _, file in ipairs(mr.file_edit_list()) do
+			if file.path == 'ui\\stress\\many.twui.xml' then check(#file.patches == 50, '50 patches listed') end
+			if file.path == 'ui\\stress\\ops.twui.xml' then check(file.edited_size == #stress_text + 2000, '500 inserts applied') end
+		end
+		local long_name = string.rep('n', 64)
+		ok, why = edit({ owner = long_name, id = 'x', path = panel, ops = { { find = 'a', with = 'b' } } })
+		check(ok == nil and why == 'file_edit: owner must be at most 63 bytes', 'long owner refused: ' .. tostring(why))
+		local too_deep = {}
+		for i = 1, 33 do
+			too_deep[i] = 'a'
+		end
+		ok, why = edit({ owner = 'x', id = 'x', path = panel, ops = { { after = too_deep, find = 'a', with = 'b' } } })
+		check(ok == nil and why == 'file_edit: after takes at most 32 texts', '33 anchors refused')
+		for i = 1, 200 do
+			mr.file_edit_remove('s', 'f' .. i)
+		end
+		for i = 1, 50 do
+			mr.file_edit_remove('p' .. i, 'a')
+		end
+		mr.file_edit_remove('s', 'ops')
+		mr.file_edit_remove('s', 'deep')
+		check(mr.file_edit_status().results == status.results - 203, 'removing frees the results: ' .. mr.file_edit_status().results)
+
+		local listeners = {}
+		local file_edits_setting = false
+		core = {
+			add_listener = function(_, _, event, _, callback)
+				listeners[event] = callback
+			end,
+		}
+		get_mct = function()
+			return {
+				get_mod_by_key = function()
+					return {
+						get_option_by_key = function(_, key)
+							if key ~= 'file_edits' then return nil end
+							return {
+								get_finalized_setting = function()
+									return file_edits_setting
+								end,
+							}
+						end,
+					}
+				end,
+			}
+		end
+		run_mod(PACK .. '/script/_lib/mod/memreader_plus_settings.lua')
+		local marker = 'appdata/memreader_plus_file_edits_off.txt'
+		listeners.MctFinalized()
+		check(exists(marker) and mr.file_edit_status().enabled == false, 'MCT switch off writes the marker and turns edits off')
+		check(log_count('file edits from mods turned off: the game reads files as they ship') == 1, 'switch off logged')
+		file_edits_setting = true
+		listeners.MctInitialized()
+		check(not exists(marker) and mr.file_edit_status().enabled == true, 'MCT switch on removes the marker and turns edits on')
+		check(log_count('file edits from mods turned on') == 1, 'switch on logged')
+		core = nil
+		get_mct = nil
+	end
 elseif SCENARIO == 'cpecific_bigread' then
 	io.stdout:setvbuf('no')
 	run_mod(THEIRS)

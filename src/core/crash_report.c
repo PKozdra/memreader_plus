@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -35,6 +36,18 @@ typedef void (*Section)(Text *report, const CrashInput *input);
 static ContextField context[MAX_CONTEXT];
 static EventEntry events[MAX_EVENTS];
 static UINT32 event_order;
+
+void add_text(Text *text, const char *format, ...)
+{
+	va_list arguments;
+
+	if (text->used >= text->size - 1)
+		return;
+	va_start(arguments, format);
+	_vsnprintf_s(text->data + text->used, text->size - text->used, _TRUNCATE, format, arguments);
+	va_end(arguments);
+	text->used += strlen(text->data + text->used);
+}
 
 static void copy_clean(char *destination, size_t size, const char *source)
 {
@@ -318,7 +331,7 @@ static void add_plus_changes(Text *report, const CrashInput *input)
 
 static void add_modules(Text *report, const CrashInput *input)
 {
-	add_other_modules(report);
+	add_other_module_count(report);
 	(void)input;
 }
 

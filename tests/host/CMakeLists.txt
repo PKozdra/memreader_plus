@@ -5,7 +5,7 @@ project(lua_host LANGUAGES C CXX ASM_MASM)
 set(LUA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/lua-5.1")
 file(GLOB LUA_SRC "${LUA_DIR}/*.c")
 
-add_executable(lua_host lua_host.c game.c exception.cpp registers.asm handler.asm heap.asm frame.asm ${LUA_SRC})
+add_executable(lua_host lua_host.c game.c file_edit_host.c exception.cpp registers.asm handler.asm heap.asm frame.asm file_edit.asm ${LUA_SRC})
 target_include_directories(lua_host PRIVATE "${LUA_DIR}")
 target_compile_definitions(lua_host PRIVATE LUA_BUILD_AS_DLL LUA_CORE _CRT_SECURE_NO_WARNINGS)
 if(MSVC)

@@ -1,6 +1,6 @@
 #include <string.h>
 
-#include "common.h"
+#include "game.h"
 
 typedef struct {
 	const char *constructor_pattern;

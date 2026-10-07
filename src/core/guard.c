@@ -31,6 +31,7 @@ static Change writes[MAX_WRITES];
 static int write_next;
 static Change patches[MAX_PATCHES];
 static int patch_count;
+static UINT32 patches_not_listed;
 
 static BOOL overlaps(INT_PTR address, size_t size, INT_PTR start, INT_PTR end)
 {
@@ -188,8 +189,10 @@ static void start_change(Change *change, const char *what, const char *where, IN
 	change->tick = GetTickCount64();
 }
 
-static void repeat_change(Change *change, INT_PTR address)
+static void repeat_change(Change *change, INT_PTR address, size_t size)
 {
+	if (size != change->size)
+		change->size = 0;
 	if (address < change->low)
 		change->low = address;
 	if (address > change->high)
@@ -205,16 +208,21 @@ static BOOL same_caller(const Change *change, const char *what, const char *wher
 
 static void note_patch(const char *what, const char *where, INT_PTR address, size_t size)
 {
+	Change *last = &patches[MAX_PATCHES - 1];
 	int i;
 
 	for (i = 0; i < patch_count; i++) {
-		if (patches[i].low == address && same_caller(&patches[i], what, where)) {
-			repeat_change(&patches[i], address);
+		if (same_caller(&patches[i], what, where)) {
+			repeat_change(&patches[i], address, size);
 			return;
 		}
 	}
-	if (patch_count < MAX_PATCHES)
+	if (patch_count < MAX_PATCHES) {
 		start_change(&patches[patch_count++], what, where, address, size);
+		return;
+	}
+	patches_not_listed += last->count;
+	start_change(last, what, where, address, size);
 }
 
 static void note_write(const char *what, const char *where, INT_PTR address, size_t size)
@@ -222,7 +230,7 @@ static void note_write(const char *what, const char *where, INT_PTR address, siz
 	Change *last = &writes[(write_next + MAX_WRITES - 1) % MAX_WRITES];
 
 	if (same_caller(last, what, where)) {
-		repeat_change(last, address);
+		repeat_change(last, address, size);
 		return;
 	}
 	start_change(&writes[write_next], what, where, address, size);
@@ -266,8 +274,11 @@ void add_changes(Text *report)
 
 	if (patch_count)
 		add_text(report, "Game code patched by mods this session:\n");
-	for (i = 0; i < patch_count; i++)
+	for (i = 0; i < patch_count; i++) {
+		if (i == MAX_PATCHES - 1 && patches_not_listed)
+			add_text(report, "  ... %u more patches not listed\n", patches_not_listed);
 		add_change(report, &patches[i], now);
+	}
 	if (writes[(write_next + MAX_WRITES - 1) % MAX_WRITES].count)
 		add_text(report, "Recent memory writes by mods, newest first:\n");
 	for (i = 1; i <= MAX_WRITES; i++) {

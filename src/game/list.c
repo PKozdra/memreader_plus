@@ -1,4 +1,4 @@
-#include "common.h"
+#include "game.h"
 
 enum { MAX_VALUE = 4096, MAX_NODES = 131072 };
 

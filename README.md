@@ -24,6 +24,8 @@ Mods written for memreader will keep working when memreader Plus is installed: `
 
 - `read_pack_file` reads any file from the loaded packs, text or binary, the same way the game reads its own files. See [Reading files from packs](#reading-files-from-packs).
 
+- `file_edit` changes the text of a game file, such as a UI layout, each time the game reads it. Several mods can edit the same vanilla file without shipping a copy of it. With `file_edit_list`, `file_edit_preview`, `file_edit_apply`, `file_edit_remove`, `file_edit_status` and `set_file_edits` you can look at the edits, try ops on a text, remove an edit and turn edits off. `memreader_plus.twui` writes the ops of a layout edit for you from component ids. See [Editing game files as they load](#editing-game-files-as-they-load).
+
 - There are new read functions for `CA::UniString` text (`read_unistring`), for 64-bit integers and doubles, and for null checks (`is_null`). `read_struct`, `read_vector`, `read_list` and `read_chain` read a whole structure in one call.
 
 ### Fixes
@@ -45,6 +47,7 @@ Every difference, with before and after values, is in [Differences from memreade
 - [Hooking game functions](#hooking-game-functions)
 - [Changing game data](#changing-game-data)
 - [Reading files from packs](#reading-files-from-packs)
+- [Editing game files as they load](#editing-game-files-as-they-load)
 - [Understanding userdata](#understanding-userdata)
 - [Crash reports](#crash-reports)
 - [Both mods installed](#both-mods-installed)
@@ -426,12 +429,14 @@ Call it inside a callback of `address`. It runs the next callback down with thes
 Removes that callback. Without `callback` it removes all of them, and the game calls the original function directly again. A second argument that is not a function is an error. This catches `mr.unhook(mr.find_pattern(pattern))`, which passes the match count as a second argument and would otherwise remove nothing. A callback may unhook itself or others while it runs. A callback that is already running finishes, and an unhooked one below it does not run any more. Until the running call returns, unhooked callbacks keep their place among the 16, and `hook` refuses a different signature for the address.
 #### `hook_info(address: pointer): table | nil`
 `nil` if the address was never hooked, else `{ original, attached, callbacks, calls, other_thread_calls, error }`. `original` is the original function. Calling it with `call` skips every other callback. `calls` counts how often the hook fired on the script thread. `other_thread_calls` counts the calls from the game's other threads, which skip the callbacks and run the original function. Both are plain numbers, exact up to 16,777,216, and both start again from 0 when a new chain starts. `error` holds the message of the last callback that failed.
+
+memreader Plus hooks four of the game's file reading functions itself once a mod calls `file_edit` (see [Editing game files as they load](#editing-game-files-as-they-load)). Your callbacks on those functions still work. They run first and see the file as it ships, and `hook_next` or `original` then goes through the file edits before the game's function.
 #### `hook_depth(): float`
 Returns the number of hook callbacks that are running (0 outside a callback).
 
 ### Rules for hooks
 
-- The patch stays for the whole game session, but callbacks last only one game mode. At every mode switch (frontend, campaign, battle) the game closes Lua and every callback is detached. Until a script hooks the address again, the game's calls run the original function directly. Your script must hook again in each mode, just as it registers its listeners again. At most 1000 hooked addresses per session.
+- The patch stays for the whole game session, but callbacks last only one game mode. At every mode switch (frontend, campaign, battle) the game closes Lua and every callback is detached. Until a script hooks the address again, the game's calls run the original function directly. Your script must hook again in each mode, just as it registers its listeners again. At most 1000 addresses can be hooked per session, and the file reading functions that `file_edit` hooks count toward them (up to four).
 
 - The hook writes a 5-byte jump over the first instructions of the function. The jump stays after `unhook` and in later game modes. Reads of those bytes return the jump, so read operands there with `read_original`. `patch`, `relocate_field`, `write` and `grow_frame` refuse to change the first instructions of a hooked function, because the game now runs a copy of them.
 
@@ -538,6 +543,151 @@ Both functions take a path inside the packs, with `/` or `\` between folders, 1 
 - A path must be 1 to 1024 bytes without a zero byte. A file over 64 MiB is an error.
 - The files come from the game's own file system, so this works in the frontend, in a campaign and in a battle. Call it from your script, not from inside a hook callback.
 
+## Editing game files as they load
+
+`file_edit` changes the text of a game file each time the game reads it, so your mod doesn't have to ship its own copy of a vanilla file. It works on UI layouts (`.twui.xml`, loading screens included) and on the XML the game reads for models and materials, such as `.wsmodel` and `.xml.material` files. Several mods can edit the same file, and each mod's edit still applies when another mod ships its own copy of that file, as long as the text it looks for is in that copy.
+
+```lua
+local ok, why = mr.file_edit({
+	owner = 'my_mod', -- your mod's name, the same for all your edits
+	id = 'wider_line', -- your name for this edit
+	path = 'ui/frontend ui/fe_line_test.twui.xml',
+	ops = {
+		-- find width="400" after these two texts and before the next <image, exactly once
+		{ after = { 'id="fe_line_test"', '<newstate' }, before = '<image', find = 'width="400"', with = 'width="650"' },
+	},
+})
+if not ok then
+	-- why says which op failed and how, e.g. 'op 1: find text found 0 times, expected 1'
+end
+```
+
+The edit is made once, when you call `file_edit`, and the game gets the edited text on every later read of that file in the session, in every game mode. A layout the game already holds in its layout cache is dropped from the cache when you register the edit, so the next panel or component made from it uses the edited text. Components that already exist keep their old look until the game creates them again.
+
+Templates in `ui/templates/` reach fewer layouts. Each layout in the cache carries its own copy of every template it uses, made when the game read the layout, so a template edit reaches only layouts the game reads after the edit. `file_edit` says so in its second result. On its first start the game reads its templates and its common layouts before any mod script runs, so in the main menu those layouts keep the old templates. When a campaign loads, the game reads the campaign's layouts after the `campaign/mod` scripts have loaded, so a template edit made in a declared file or when your campaign script loads reaches them.
+
+#### `file_edit(edit: table): true | nil, string`
+Registers an edit and returns `true`, or `nil` and the reason when it was skipped. A wrong field also gives `nil` and the reason, never an error, and so does a key that `file_edit` doesn't know, such as a misspelt `prioriy`. The fields of `edit`:
+
+- `owner`, `id`: strings of up to 63 bytes. Together they name one edit across all files. Registering the same `owner` and `id` again replaces the earlier edit, also when the new one is on another file.
+- `path`: the file inside the packs, with `/` or `\`, any case, up to 259 bytes. A path with a drive letter or a `..` part is refused.
+- `ops`: a list of 1 to 4096 ops, without gaps. All of them apply, or none of them.
+- `priority`: a number, default 0. Edits on one file run from the lowest priority to the highest, then by `owner` and `id`, and each one works on the text the earlier ones made.
+- `once`: `true` makes the edit apply to the next read of the file only. Use it for edits you register again each time, such as a loading screen sized for the next battle.
+
+Each op starts at the top of the file and looks for each text in `after` in order (a string or a list of up to 32 strings). Then it does one of four things:
+
+- `find` and `with`: replaces `find` with `with` between the last `after` text and the next `before` text, or the end of the file without `before`. `with = ''` removes the text, and an op without `with` is refused. `find` must occur exactly `count` times there (a whole number from 1 to 100000, default 1), and every occurrence is replaced. `before` and `count` go only with `find`.
+- `insert`: puts the text right after the last `after` text, or at the top of the file when the op has no `after`.
+- `attribute` and `value`: sets an attribute of the XML tag that the last `after` text ends in, whatever its value is now, and adds the attribute when the tag doesn't have it. memreader Plus writes `&`, `<`, `>`, `"`, tabs and line breaks in `value` as character references, the way CA's files do. Other control characters are refused.
+- `child` and `insert`: puts the text at the start of the first child element named `child` of the element whose tag the last `after` text ends in. When the element has no such child, memreader Plus adds one around the text. An element or child written as a single tag that closes itself, such as `<callbackwithcontextlist/>`, has no body to insert into, and the op is refused with `the element has no body` or `the child <name> has no body`.
+
+The last two need `after`, and the last `after` text must end inside the tag, before its `>`. They work on the text as the earlier edits left it, so several mods can set the same attribute: the edit that runs later wins, and each edit keeps its other changes. Use them for anything another mod may also change. This op sets the width of one component:
+
+```lua
+{ after = { '<components>', 'this="DE199156-E9F2-443F-8E2AB30457AEE911"' }, attribute = 'width', value = '290' }
+```
+
+When a `find` op no longer finds its text because an earlier edit changed it, the edit that runs later wins as well. The earlier one is skipped with a reason like `replaced by other_mod/wide_panel, which runs later`, so a higher priority beats a lower one.
+
+`file_edit` also checks that the edited file still reads as valid XML and that no tag has an attribute twice. An edit that breaks either is skipped with a reason like `the edited file does not parse (status 11)` or `the edited file has an attribute twice in one tag`, and the other edits on that file stay. If the game's UI reader ever rejects an edited layout, it reads the layout as it ships. The reader of models and materials has no such second try. If it rejects an edited file, that one read gets whatever the reader made of the text, probably a broken model, and the next read gets the file as it ships. Up to 4096 files can carry edits at a time, with up to 4096 edits each.
+
+Only XML files can be edited. An edit to a script, a DB table or any other file that isn't XML fails the XML check and is skipped with `the edited file does not parse (status ...)`. A file saved as UTF-16, such as a `.loc` file, is refused with `no such file, or a UTF-16 file`, the same reason a path that no pack has gets.
+
+`file_edit` returns a second result with `true` in three cases:
+
+- A template edit gives `applies to layouts read from now on: ...`, as explained above.
+- If memreader Plus can't find the game's function that clears the layout cache, every layout edit gives `applies from the next parse only: ...`. Layouts the game already holds then keep the old text, and only layouts it reads for the first time get the edit.
+- A file with exactly the same bytes as another registered file gives `same bytes as <path>: ...`. A loading screen, or another reader that doesn't name the file it reads, gets the edits of the file registered first.
+
+A reason that starts with `off:` means memreader Plus can't make this edit now, so give your mod a fallback for it:
+
+- `off: switched off by the player`: the player turned file edits off.
+- `off: fast_xml`: after a game patch memreader Plus can't edit or check model and material files. Layout edits still work.
+- `off: load_buffer not found` and the like: memreader Plus can't find the game's file reader after a patch. Every file loads as it ships.
+
+memreader Plus writes one line in `lua_mod_log.txt` for each skipped edit, once per game mode. That includes an edit of another mod that a new edit replaced, so both mods' authors see it. It also writes one line for each game function it can't find.
+
+#### `file_edit_remove(owner: string, id: string): boolean`
+Removes the edit, and the next read of the file gets the text without it. Returns `false` when there was no such edit.
+#### `file_edit_list([path: string]): table`
+One entry per edited file, or only the entry of `path`: `path`, `size`, `edited_size`, `disabled`, `hits` (reads that got the edited text), `rejected` (reads where the game's reader refused the edited text), `vetoes` (reads of a file with the same bytes under another path, which got no edits), `misses` (reads of this path whose bytes differ from the ones registered) and `patches`, a list of strings like `my_mod/wider_line applied` or `my_mod/wider_line skipped: <reason>`.
+#### `file_edit_preview(path: string): string | nil, string`
+Returns the edited text and the original text of a file you registered edits on, or nothing for other files.
+#### `file_edit_apply(text: string, ops: table): string | nil, string`
+Runs `ops` on `text` and returns the edited text, or `nil` and the reason. It checks the ops the same way `file_edit` does and registers nothing. It doesn't check that the result is still valid XML.
+#### `file_edit_status(): table`
+`state` (`on`, `not started` before the first `file_edit`, or `off: <reason>`), `enabled` (the player's switch), `files`, `results` (edited texts held in memory), `pugi_calls` and `fast_xml_calls` (how many times the game's layout reader and its model and material reader have read a file since the first `file_edit`), `off`, a list of the parts that don't work on this game build (`fast_xml`, `validation`, `path_check`, `eviction`), and `sites`, with `true` for each game function that was found or the reason it wasn't.
+#### `set_file_edits(enabled: boolean, [path: string]): true | nil, string`
+Without `path`, turns every file edit on or off for the session. While they are off, `file_edit` returns `nil, 'off: switched off by the player'` and keeps nothing, and edits registered earlier wait until they are turned on again. The edits that were refused come back only when their mods register them again, which most mods do at the next load. With MCT installed, players do the same with the option **File edits from mods** on memreader Plus's MCT page, which is ticked by default. memreader Plus remembers an unticked option in `memreader_plus_file_edits_off.txt` in the game's user data folder (`%APPDATA%\The Creative Assembly\Warhammer3\` unless the game was started with another one) and reads it as soon as it loads, so edits stay off even for files the game reads before MCT loads its settings. When the path of that folder has letters outside ASCII, the file goes into the game folder instead. Without MCT the file is ignored. memreader Plus also ignores it when another mod loads memreader Plus from a `_lib/mod` script that runs before MCT's own, and then edits stay on until MCT sends its settings. With `path`, turns off the edits of that one file. The files load as they ship from their next read, and layouts in the cache are dropped so the change shows the next time the game creates them.
+
+### Editing layouts by component
+
+`memreader_plus.twui` writes the ops for you from component ids, so your layout edit doesn't depend on how the file is formatted. When your script calls `twui.edit`, memreader Plus reads the layout the game will load (the vanilla file or another mod's copy), finds each component, checks the values you expect and registers one `file_edit` whose ops set attributes by the GUID of each element.
+
+```lua
+local twui = memreader_plus.twui
+local ok, why = twui.edit({
+	owner = 'my_mod',
+	id = 'small_cards',
+	path = 'ui/loading_ui/battle.twui.xml',
+	once = true,
+	changes = {
+		-- every state of unit_card_parent gets width 290, only if its width is 250 now
+		{ set = 'unit_card_parent', on = 'state', values = { width = 290 }, expect = { width = 250 } },
+		{ set = 'unit_card_small', on = 'image', values = { width = 22, height = 49 } },
+		{ hide = 'battle/docker/radar_frame' },
+	},
+})
+```
+
+#### `twui.edit(edit: table): true | nil, string`
+Takes the fields of `file_edit` (`owner`, `id`, `path`, `priority`, `once`) with `changes` in place of `ops`, and returns what `file_edit` returns. All changes of one call apply, or none of them. A key it doesn't know, a bad path or a missing file gives `nil` and the reason. A `set` registers even when the file already has the value, so it still wins over an earlier mod's edit of that attribute.
+#### `twui.preview(edit: table, [text: string]): string, table | nil, string`
+Returns the edited text and the list of ops that `twui.edit` would register, and registers nothing. `edit.path` is needed even when you pass `text`, which is then edited instead of the file. It also takes an edit with `ops` in place of `changes`. The ops run through `file_edit_apply` on the copy of the file the game would load, so the text shows what your ops do to that copy on their own. It leaves out the edits of other mods, the order that `priority` sets and the XML check, so an edit that previews well can still be skipped or replaced when you register it.
+
+Each change names one component with a selector:
+
+- An id path such as `'radar_frame/frame'`. The last id is the component. Each id before it names one of its ancestors, in that order, at any depth. One id is enough when only one component in the layout has it. The ids are the names in the layout's `<hierarchy>` block, which writes each component's `id` in lower case with `_` for other characters. Both spellings work, so `kill_ratio_PH` and `kill_ratio_ph` name the same component.
+- A GUID such as `'DE199156-E9F2-443F-8E2AB30457AEE911'`, the component's `this` value.
+
+A selector that matches no component, or more than one, makes the call return `nil` and a reason like `change 2, hide frame: matches 3 components, expected 1`, and memreader Plus writes that line in `lua_mod_log.txt`.
+
+The changes:
+
+- `{ set = selector, values = { name = value }, on = ..., where = { ... }, expect = { ... } }` sets attributes. `on` picks the elements that get them: `'component'` (the default, the component's own element), `'state'` (each of its states), `'image'` (the image sizes in each state), `'text'` (the text settings in each state, such as `font_m_size`, `textxoffset` and `texthalign`), `'component_image'` (its list of images, where `imagepath` is) or `'engine'` (its `LayoutEngine`). `where` keeps only the elements whose attributes have these values, for example `where = { name = 'active' }` for one state. With `expect`, the call is refused unless every chosen element has these values now. An attribute the element doesn't have is added. Values are text or whole numbers below 10000000. memreader Plus escapes `&`, `<`, `>`, `"`, tabs and line breaks in them, so write context expressions as plain text.
+- `{ hide = selector, expect = { ... } }` sets `visible="false"` on the component.
+- `{ add_callback = selector, values = { callback_id = 'ContextListEngineItemsPerRowSetter', ... } }` adds a `callback_with_context` with these attributes to the component, and gives the component a callback list when it has none.
+
+A change with a key it doesn't take, such as `exepct`, is refused. To swap a template, `set` the component's `template_id`. Adding new components isn't supported.
+
+Several mods can change the same layout. When two of them `set` the same attribute of one element, the edit that runs later wins (higher priority, then `owner` and `id`), and both keep their other changes. Callbacks that two mods add to one component end up in one callback list. `expect` and `where` check the file as it ships, before any mod's edits.
+
+The game ignores states, images, texts and engines written on a component that is part of a template (`part_of_template="true"`), so `set` with any `on` other than `'component'` returns `nil` and the reason there. Edit the template file in `ui/templates/` instead. A template edit reaches only layouts the game reads after your call, as with `file_edit`.
+
+`twui.edit` works out the ops from the file that wins in the packs at the time of the call. After a game patch, an edit still applies when CA only moved or reformatted the component. When the id is gone, or a value in `expect` changed, the edit is skipped with a reason. The module reads layouts written the way CA writes them. A `>` inside a value, single quotes and comments are fine, but a component's `this="..."` must have no spaces around the `=`.
+
+### Edits declared in a file
+
+Edits that never change can go in `script/memreader_plus/file_edits/<your mod>.lua` in your pack. The file returns a list of edits without `owner`, and memreader Plus registers them right after it loads in each game mode, with the file name as the owner:
+
+```lua
+return {
+	{ id = 'wider_line', path = 'ui/frontend ui/fe_line_test.twui.xml', ops = { { find = 'width="400"', with = 'width="650"', after = 'id="fe_line_test"' } } },
+}
+```
+
+An entry with `changes` in place of `ops` is registered through `twui.edit`. The file runs with no access to the game or to Lua's libraries, so it can only build the table. A file that fails to load, or an entry that isn't a valid edit, is skipped with one line in `lua_mod_log.txt` naming the file, and the other files and entries still register.
+
+Name the file after your mod, for example after your pack. When two packs have a file at the same path, the game loads only one of them, and memreader Plus can't tell that the other existed. Leave commas out of the name, since the game lists the files to memreader Plus separated by commas.
+
+### When an edit reaches the game
+
+- An edit reaches every read after your call. Register campaign and battle layout edits in a declared file or when your `campaign/mod` script loads. A `_lib/mod` file can run before memreader Plus has loaded (see [Modders](#modders)), so register them there inside a function or a listener. Register loading screen edits before the loading screen starts: from the campaign for the battle's loading screen, from the battle script for the one after the battle.
+- The first time the game reaches the main menu, it reads the main menu layouts before any mod script runs. Edits to those layouts show from the second visit to the main menu in a session.
+- A model or material the game already loaded and keeps in memory probably stays as it was until the game loads it again.
+- File edits are local to each player's game. UI layouts, models and materials only change what is drawn on your screen, so editing them probably doesn't desync multiplayer.
+
 ## Understanding userdata
 
 Userdata is a block of bytes that C code allocates and Lua can hold. A script interface such as a character is userdata:
@@ -566,21 +716,21 @@ The first lines give the time, the exception and where it happened, as `Warhamme
 
 The Lua stack comes next, innermost first, with the source file, line and function of each frame and the string, number and boolean locals of the first 12 frames. A C function's frame shows its address in the exe, which tells you which game binding the script was calling. An event handler's `eventname` is one of the locals. If the stack says `no Lua function was running`, the fault is in the game's own code. For a crash on another thread, memreader Plus pauses the script thread for a moment and shows where it was.
 
-For the crashing thread, the report shows up to 32 frames of the native call stack, each with its function, then the registers and the bytes of code around the crash. A register that points somewhere gets a short note: an address in a module, the stack, an object and its vtable, or the start of a text. Frames found by searching the stack for return addresses, after the function tables run out, are marked `(stack scan)` and can be wrong.
+For the crashing thread, the report shows up to 32 frames of the native call stack, each with its function, then the registers and the bytes of code around the crash. A register that points somewhere gets a short note: an address in a module, the stack, an object and its vtable, or the start of a text. When a register points into a DLL of another program, the note says `another program's DLL` and leaves out the DLL's name. Frames found by searching the stack for return addresses, after the function tables run out, are marked `(stack scan)` and can be wrong.
 
-After that the report lists what mods did through memreader Plus. Hooks come first, the ones running when the game crashed at the top, each with the file and line of its callbacks. Then every piece of game code patched in this session, and the last 24 memory writes, newest first. Each patch and write names the script line that made it, and repeated writes from one line are counted in one entry with their address range.
+After that the report lists what mods did through memreader Plus. Hooks come first, the ones running when the game crashed at the top, each with the file and line of its callbacks. Then every piece of game code patched in this session, and the last 24 memory writes, newest first. Each patch and write names the script line that made it, and repeated patches or writes from one line are counted in one entry with their address range.
 
-The end of the report lists the DLLs loaded from outside the Windows folder and the game folder, the game version, the command line and the crash folder. It lists every mod in load order with its file size, date, Workshop id and folder. Last, it names the game's own crash files for the same crash (`.mdmp` and `.stack.txt`).
+Near the end, the report gives the number of DLLs that other programs loaded into the game, such as overlays and antivirus, from outside the Windows folder and the game folder. It doesn't name them, because people post these reports in public and the names would show what else runs on their PC. A DLL's name appears only where the DLL is part of the crash: as the module the fault happened in, or in a frame of the native or Lua stack. After the count come the game version, the command line and the crash folder. It lists every mod in load order with its file size, date, Workshop id and folder. Last, it names the game's own crash files for the same crash (`.mdmp` and `.stack.txt`).
 
 A short `Game context` block says what was going on: the mode (frontend, campaign or battle) and, in a campaign, the campaign, campaign type, whether it is multiplayer, difficulty, turn number, your faction, the human factions and the faction whose turn it is. In a battle it adds the battle type. A small script in memreader Plus's pack fills these in at safe moments, because the Lua state may be broken when the game crashes. In a campaign it runs on the first tick, at every new turn and at the start of every faction's turn, and in a battle when the battle scripts load. A turn number is the turn of the last update, so a crash in the middle of a round shows that round.
 
-A `Recent script events` block lists the last 32 different events the game sent to scripts, newest first, with how often each one came and how long before the crash it came last. The same script records them by wrapping `core:event_callback`. On the test host, recording an event costs 0.06 to 0.34 µs.
+A `Recent script events` block lists the last 32 different events the game sent to scripts, newest first, with how often each one came and how long before the crash it came last. The same script records them by wrapping `core:event_callback`, which adds about 0.06 to 0.34 µs to each event.
 
-Paths under your user profile, written with either kind of slash, show as `%USERPROFILE%`.
+Paths under your user profile show as `%USERPROFILE%`, and the folder of the Steam library the game is installed in shows as `<Steam library>`, whichever kind of slash the path uses. memreader Plus doesn't write your computer name, Steam account or IP address into the report.
 
 The time stamp in the report's file name is the same as in the name of the script log of that Lua state (`script_log_DDMMYY_HHMM.txt`), so you can find the log that belongs to a report. If script logging is off, the time stamp is the time the game started.
 
-Crash reports are on by default. With MCT installed, memreader Plus's MCT page has one option, **Enable better crash reporting**. To change the setting from Lua, call:
+Crash reports are on by default. With MCT installed, memreader Plus's MCT page has the option **Enable better crash reporting**. To change the setting from Lua, call:
 
 #### `set_crash_reports(enabled: boolean): boolean`
 Turns crash reports on or off and returns the previous setting.
@@ -627,7 +777,7 @@ The address of `Warhammer3.exe` in memory: `0x0000000140000000`. The game always
 #### `version: float`
 `1.2`, the memreader API version. memreader Plus keeps it at 1.2 on purpose (see [Both mods installed](#both-mods-installed)).
 #### `plus_version: string`
-The version of memreader Plus, for example `'0.6.0'`.
+The version of memreader Plus, for example `'0.8.0'`.
 
 ### Addition +
 #### `add(float, float): float`
@@ -750,7 +900,7 @@ mr.write(ptr, 0x0100, mr.uint16(0x4000)) -- uint16 0x4000
 mr.write(ptr, 0x0100, mr.uint8(0x40)) -- uint8 0x40
 ```
 
-`write` also writes into the game's code and read-only data. It copies directly when the memory is writable, and uses `WriteProcessMemory` otherwise, but only inside `Warhammer3.exe`. Outside the exe it writes only to data memory such as the game's heap.
+`write` also writes into the game's code. It copies directly when the memory is writable, and uses `WriteProcessMemory` otherwise, but only inside `Warhammer3.exe`. It can't write to the exe's read-only data, such as its constant tables and text, and fails there with `failed to write memory`. Use `patch` for those bytes, because `patch` makes the page writable for the write. Outside the exe, `write` writes only to data memory such as the game's heap.
 
 A `write` into the first instructions of a function that memreader Plus has hooked is refused with a Lua error. The game runs those instructions from the hook's copy, so a change there would never run.
 
@@ -856,7 +1006,7 @@ out(('took %.1f us'):format(mr.elapsed_us(start)))
 | `read_rowidx` | divides in float: off by one above 16 MiB | integer division; a row size below 1 is an error |
 | Padding bytes of typed values | not initialised | zeroed |
 | `write` to another DLL, to executable memory outside the exe, or to the exe's headers and import or export tables | writes it | refused with a Lua error |
-| New functions | | `int64`, `uint64`, `is_null`, `read_int64`, `read_uint64`, `read_double`, `read_unistring`, `read_struct`, `read_vector`, `read_list`, `read_chain`, `find_pattern`, `find_patterns`, `function_start`, `read_original`, `call`, `alloc`, `hook`, `hook_next`, `unhook`, `hook_info`, `hook_depth`, `game_alloc`, `game_free`, `patch`, `relocate_field`, `grow_frame`, `commit_stack`, `hop_slots`, `vector_reserve`, `vector_insert`, `vector_erase`, `string_set`, `unistring_set`, `map_find_key`, `map_add_key`, `map_remove_key`, `list_insert`, `list_erase`, `read_pack_file`, `pack_file_exists`, `ticks`, `elapsed_us`, `set_crash_reports`, `set_crash_context`, `note_crash_event`, and the field `plus_version` |
+| New functions | | `int64`, `uint64`, `is_null`, `read_int64`, `read_uint64`, `read_double`, `read_unistring`, `read_struct`, `read_vector`, `read_list`, `read_chain`, `find_pattern`, `find_patterns`, `function_start`, `read_original`, `call`, `alloc`, `hook`, `hook_next`, `unhook`, `hook_info`, `hook_depth`, `game_alloc`, `game_free`, `patch`, `relocate_field`, `grow_frame`, `commit_stack`, `hop_slots`, `vector_reserve`, `vector_insert`, `vector_erase`, `string_set`, `unistring_set`, `map_find_key`, `map_add_key`, `map_remove_key`, `list_insert`, `list_erase`, `read_pack_file`, `pack_file_exists`, `file_edit`, `file_edit_remove`, `file_edit_list`, `file_edit_preview`, `file_edit_apply`, `file_edit_status`, `set_file_edits`, `ticks`, `elapsed_us`, `set_crash_reports`, `set_crash_context`, `note_crash_event`, the field `plus_version` and the table `twui` |
 | Lua globals | `_G.memreader` | `_G.memreader_plus`, and `_G.memreader` for compatibility |
 | DLL in the game folder | `twwh3-memreader.dll`, rewritten only when the loaded `version` differs | `twwh3-memreader_plus.dll`, rewritten whenever its bytes differ from the pack |
 | Metatables | `memreader.module`, `memreader.snapshot` | none, so nothing collides when both DLLs load |

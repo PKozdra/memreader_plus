@@ -6,6 +6,7 @@ enum { MAX_ALLOCATED = 16 * 1024 * 1024, ALLOCATION_ALIGNMENT = 16, MAX_EXACT_IN
 
 static const char *const more_call_type_names[CALL_TYPE_COUNT - VALUE_TYPE_COUNT] = { "boolean", "float", "double", "void" };
 static const char allocations_key = 0;
+static LONG guarded_calls;
 
 UINT64 call_function(INT_PTR function, const UINT64 *arguments, UINT64 count, UINT64 *float_result);
 
@@ -164,6 +165,31 @@ UINT64 argument_bits(lua_State *L, int index, int type)
 		return bits;
 	}
 	return (UINT64)integer_argument(L, index, type);
+}
+
+static void begin_guarded_call(void)
+{
+	InterlockedIncrement(&guarded_calls);
+}
+
+static void end_guarded_call(void)
+{
+	InterlockedDecrement(&guarded_calls);
+}
+
+BOOL in_guarded_call(void)
+{
+	return guarded_calls > 0;
+}
+
+LONG pause_guarded_calls(void)
+{
+	return InterlockedExchange(&guarded_calls, 0);
+}
+
+void resume_guarded_calls(LONG paused)
+{
+	InterlockedExchange(&guarded_calls, paused);
 }
 
 static BOOL is_memory_fault(DWORD code)

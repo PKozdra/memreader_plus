@@ -21,7 +21,9 @@ typedef struct {
 typedef struct {
 	INT_PTR target;
 	int copied;
+	void *trampoline;
 	void *original;
+	const char *native;
 	Signature signature;
 	Callback callbacks[MAX_CALLBACKS];
 	int callback_count;
@@ -102,7 +104,7 @@ BOOL is_hook_original(INT_PTR address)
 	int i;
 
 	for (i = 0; i < hook_count; i++) {
-		if ((INT_PTR)hooks[i].original == address)
+		if ((INT_PTR)hooks[i].original == address || (INT_PTR)hooks[i].trampoline == address)
 			return TRUE;
 	}
 	return FALSE;
@@ -188,13 +190,44 @@ void prepare_hooks(void)
 		memory_near_game = AllocateBuffer(GetModuleHandleW(NULL));
 }
 
-static Hook *install_hook(lua_State *L, INT_PTR target)
+static MH_STATUS new_hook(INT_PTR target, Hook **made)
 {
 	BYTE window[SAVED_BYTES];
-	Hook *hook;
+	Hook *hook = &hooks[hook_count];
 	MH_STATUS status;
 
-	if (!in_exe_code(target) || !is_read_only_code(target)) {
+	hook->target = target;
+	hook->copied = copied_length(target);
+	hook->callback_count = 0;
+	capture_code(target, window);
+	status = MH_CreateHook((LPVOID)target, &stubs[hook_count], &hook->trampoline);
+	if (status == MH_OK) {
+		status = MH_EnableHook((LPVOID)target);
+		if (status != MH_OK)
+			MH_RemoveHook((LPVOID)target);
+	}
+	if (status == MH_ERROR_MEMORY_ALLOC)
+		status = install_far_hook(target, &stubs[hook_count], &hook->trampoline);
+	if (status != MH_OK)
+		return status;
+	remember_code(target, window);
+	hook->original = hook->trampoline;
+	hook_count++;
+	*made = hook;
+	return MH_OK;
+}
+
+static BOOL can_hook(INT_PTR target)
+{
+	return in_exe_code(target) && is_read_only_code(target);
+}
+
+static Hook *install_hook(lua_State *L, INT_PTR target)
+{
+	Hook *hook = NULL;
+	MH_STATUS status;
+
+	if (!can_hook(target)) {
 		note_refusal(L, "hook", target);
 		luaL_argerror(L, 1, "refused: hook takes only read-only code in the game's exe");
 	}
@@ -202,28 +235,29 @@ static Hook *install_hook(lua_State *L, INT_PTR target)
 		luaL_error(L, "at most %d addresses can be hooked per game session", MAX_HOOKS);
 	if (!start_hooking())
 		luaL_error(L, "cannot start hooking");
-	hook = &hooks[hook_count];
-	hook->target = target;
-	hook->copied = copied_length(target);
-	hook->callback_count = 0;
-	capture_code(target, window);
-	status = MH_CreateHook((LPVOID)target, &stubs[hook_count], &hook->original);
-	if (status == MH_OK) {
-		status = MH_EnableHook((LPVOID)target);
-		if (status != MH_OK)
-			MH_RemoveHook((LPVOID)target);
-	}
-	if (status == MH_ERROR_MEMORY_ALLOC)
-		status = install_far_hook(target, &stubs[hook_count], &hook->original);
+	status = new_hook(target, &hook);
 	if (status == MH_ERROR_MEMORY_ALLOC)
 		luaL_error(L, "cannot hook %p: no free memory near the game's code for the trampoline", (void *)target);
 	if (status == MH_ERROR_UNSUPPORTED_FUNCTION)
 		luaL_error(L, "cannot hook %p: its first bytes cannot run from far memory once the near area is full", (void *)target);
 	if (status != MH_OK)
 		luaL_error(L, "cannot hook %p: %s", (void *)target, MH_StatusToString(status));
-	remember_code(target, window);
-	hook_count++;
 	return hook;
+}
+
+BOOL hook_native(INT_PTR target, void *detour, const char *name, void **next)
+{
+	Hook *hook = find_hook(target);
+
+	if (!hook && (hook_count == MAX_HOOKS || !can_hook(target) || !start_hooking() || new_hook(target, &hook) != MH_OK))
+		return FALSE;
+	if (hook->native)
+		return FALSE;
+	*next = hook->trampoline;
+	MemoryBarrier();
+	hook->native = name;
+	hook->original = detour;
+	return TRUE;
 }
 
 static BOOL is_attached(const Callback *callback)
@@ -652,7 +686,7 @@ BOOL describe_hook_code(ULONG_PTR address, char *out, size_t size)
 		return TRUE;
 	}
 	for (i = 0; i < hook_count; i++) {
-		original = (ULONG_PTR)hooks[i].original;
+		original = (ULONG_PTR)hooks[i].trampoline;
 		if (original && address >= original && address < original + TRAMPOLINE_SIZE) {
 			if (out)
 				_snprintf_s(out, size, _TRUNCATE, "trampoline of the Plus hook on Warhammer3.exe+0x%llx",
@@ -686,6 +720,8 @@ static void add_hook_line(Text *report, lua_State *live, const Hook *hook)
 	add_text(report, "  Warhammer3.exe+0x%llx  calls %lu", (unsigned long long)exe_offset(hook->target), (unsigned long)hook->calls);
 	if (hook->other_thread_calls)
 		add_text(report, ", other threads %ld", hook->other_thread_calls);
+	if (hook->native)
+		add_text(report, ", native %s", hook->native);
 	if (hook->running)
 		add_text(report, ", RUNNING (on the stack)");
 	if (live) {

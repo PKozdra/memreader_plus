@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(memreader_plus VERSION 0.7.0 LANGUAGES C ASM_MASM)
+project(memreader_plus VERSION 0.8.0 LANGUAGES C ASM_MASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -20,35 +20,43 @@ add_library(minhook STATIC
 target_include_directories(minhook PUBLIC "${PROJECT_SOURCE_DIR}/vendor/minhook/include")
 
 add_library(memreader_plus SHARED
-	src/common.h
 	src/main.c
-	src/value.c
-	src/memory.c
-	src/process.c
-	src/scan.c
-	src/layout.c
-	src/call.c
-	src/hook.c
-	src/crash.c
-	src/crash_report.c
-	src/session.c
-	src/heap.c
-	src/vector.c
-	src/text.c
-	src/farhook.c
-	src/pack.c
-	src/map.c
-	src/list.c
-	src/frame.c
-	src/guard.c
-	src/native.c
-	src/thunk.asm)
+	src/core/common.h
+	src/core/value.c
+	src/core/memory.c
+	src/core/process.c
+	src/core/scan.c
+	src/core/layout.c
+	src/core/call.c
+	src/core/hook.c
+	src/core/farhook.c
+	src/core/frame.c
+	src/core/guard.c
+	src/core/native.c
+	src/core/crash_report.c
+	src/core/thunk.asm
+	src/game/game.h
+	src/game/crash.c
+	src/game/session.c
+	src/game/heap.c
+	src/game/vector.c
+	src/game/text.c
+	src/game/pack.c
+	src/game/map.c
+	src/game/list.c
+	src/file_edit/file_edit.h
+	src/file_edit/file_edit.c
+	src/file_edit/registry.c
+	src/file_edit/ops.c
+	src/file_edit/xml.c
+	src/file_edit/game.c)
 add_dependencies(memreader_plus game_import_lib)
 
 configure_file(src/config.h.in config.h @ONLY)
 
 target_include_directories(memreader_plus PRIVATE
 	"${PROJECT_BINARY_DIR}"
+	"${PROJECT_SOURCE_DIR}/src/core"
 	"${PROJECT_SOURCE_DIR}/vendor/lua-5.1"
 	"${PROJECT_SOURCE_DIR}/vendor/minhook/src")
 target_compile_definitions(memreader_plus PRIVATE LUA_BUILD_AS_DLL)

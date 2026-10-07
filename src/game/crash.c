@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "common.h"
+#include "game.h"
 #include "MinHook.h"
 
 enum {
@@ -45,38 +45,12 @@ static DWORD script_thread;
 static HANDLE script_thread_handle;
 static ULONG_PTR own_start;
 static ULONG_PTR own_end;
-static LONG guarded_calls;
 static LONG reporting;
 static HANDLE wake_event;
 static HANDLE done_event;
 static PendingFault pending;
 static char report_buffer[REPORT_SIZE];
 static Text report = { report_buffer, sizeof report_buffer, 0 };
-
-void begin_guarded_call(void)
-{
-	InterlockedIncrement(&guarded_calls);
-}
-
-void end_guarded_call(void)
-{
-	InterlockedDecrement(&guarded_calls);
-}
-
-BOOL in_guarded_call(void)
-{
-	return guarded_calls > 0;
-}
-
-LONG pause_guarded_calls(void)
-{
-	return InterlockedExchange(&guarded_calls, 0);
-}
-
-void resume_guarded_calls(LONG paused)
-{
-	InterlockedExchange(&guarded_calls, paused);
-}
 
 static BOOL is_fatal(DWORD code)
 {
@@ -197,7 +171,7 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
 	const EXCEPTION_RECORD *record = info->ExceptionRecord;
 	ULONG_PTR address = (ULONG_PTR)record->ExceptionAddress;
 
-	if (is_fatal(record->ExceptionCode) && watched && GetCurrentThreadId() == script_thread && guarded_calls == 0 &&
+	if (is_fatal(record->ExceptionCode) && watched && GetCurrentThreadId() == script_thread && !in_guarded_call() &&
 		(address < own_start || address >= own_end))
 		report_fault(info, FALSE);
 	return EXCEPTION_CONTINUE_SEARCH;

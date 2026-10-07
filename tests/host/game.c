@@ -80,9 +80,48 @@ static const struct {
 	{ "text\\test\\hello.txt", "hello from a pack", 17 },
 	{ "db\\test_tables\\binary", "\0\1\2\377", 4 },
 	{ "text\\test\\empty.txt", "", 0 },
+	{ "ui\\test\\panel.twui.xml", "<layout><panel id=\"a\" width=\"400\" height=\"20\"/><text>hello</text></layout>", 74 },
+	{ "ui\\templates\\button.twui.xml", "<template><button width=\"10\"/></template>", 41 },
+	{ "ui\\test\\twin_a.twui.xml", "<twin size=\"1\"/>", 16 },
+	{ "ui\\test\\twin_b.twui.xml", "<twin size=\"1\"/>", 16 },
+	{ "ui\\loading_ui\\battle.twui.xml", "<screen><card width=\"31\"/><card width=\"31\"/></screen>", 53 },
+	{ "models\\test\\unit.wsmodel", "<model><material>skin_a</material></model>", 42 },
+	{ "ui\\test\\wide.twui.xml", "\377\376<\0a\0/\0>\0", 10 },
+	{ "ui\\test\\module.twui.xml",
+		"<layout><hierarchy><root this=\"R\"><box this=\"B\"/></root></hierarchy><components><root this=\"R\" id=\"root\"/><box this=\"B\" id=\"box\" width=\"7\"/></components></layout>",
+		162 },
+	{ "ui\\test\\rich.twui.xml",
+		"<layout><hierarchy><root this=\"R\"><panel this=\"P\"><kills this=\"K\"/></panel><kill_ratio_ph this=\"Q\"/></root></hierarchy><components><root this=\"R\" id=\"root\"/><panel this=\"P\" id=\"panel\" width=\"15\"><states><a this=\"S1\" name=\"a\" width=\"10\"><component_text font_m_size=\"12\"/></a><b this=\"S2\" name=\"b\" width=\"10\"><component_text font_m_size=\"12\"/></b></states></panel><kills this=\"K\" id=\"kills\"/><kill_ratio_ph this=\"Q\" id=\"kill_ratio_PH\"/></components></layout>",
+		456 },
 };
 
+static const char stress_file[] = "<layout><box width=\"1\"/></layout>";
+static const char stress_prefix[] = "ui\\stress\\";
+
+static UINT64 stress_name(void)
+{
+	return sizeof host_files / sizeof host_files[0] + 1;
+}
+
 static volatile LONG open_streams;
+
+const char *host_file_bytes(const char *path, size_t *size)
+{
+	size_t i;
+
+	if (strncmp(path, stress_prefix, 10) == 0) {
+		*size = sizeof stress_file - 1;
+		return stress_file;
+	}
+	for (i = 0; i < sizeof host_files / sizeof host_files[0]; i++) {
+		if (strcmp(host_files[i].path, path) == 0) {
+			*size = host_files[i].size;
+			return host_files[i].data;
+		}
+	}
+	*size = 0;
+	return "";
+}
 static char host_vfs_object;
 extern char host_empty_string[16];
 
@@ -95,7 +134,7 @@ UINT64 *host_file_name(UINT64 *name, HostString *path)
 {
 	size_t i;
 
-	*name = 0;
+	*name = path->heap.length > 10 && memcmp(path->heap.data, stress_prefix, 10) == 0 ? stress_name() : 0;
 	for (i = 0; i < sizeof host_files / sizeof host_files[0]; i++) {
 		if (strlen(host_files[i].path) == (size_t)path->heap.length && memcmp(host_files[i].path, path->heap.data, path->heap.length) == 0)
 			*name = i + 1;
@@ -131,8 +170,8 @@ UINT64 *host_open_file(void *vfs, UINT64 *holder, UINT64 *name, UINT64 *options)
 	HostStream *stream = HeapAlloc(GetProcessHeap(), 0, sizeof *stream);
 
 	stream->vtable = host_stream_vtable;
-	stream->data = host_files[*name - 1].data;
-	stream->size = host_files[*name - 1].size;
+	stream->data = *name == stress_name() ? stress_file : host_files[*name - 1].data;
+	stream->size = *name == stress_name() ? sizeof stress_file - 1 : host_files[*name - 1].size;
 	holder[0] = (UINT64)stream;
 	holder[1] = holder[2] = holder[3] = options[0];
 	InterlockedIncrement(&open_streams);

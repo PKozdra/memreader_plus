@@ -11,6 +11,8 @@ enum {
 	MAX_UTF8_PER_WCHAR = 3
 };
 
+enum { WRITABLE = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY };
+
 typedef struct {
 	INT_PTR data;
 	size_t length;
@@ -69,11 +71,27 @@ BOOL copy_memory(void *destination, INT_PTR address, size_t size)
 	return guarded_copy(destination, (const void *)address, size, FALSE);
 }
 
+static BOOL is_writable(INT_PTR address, size_t size)
+{
+	MEMORY_BASIC_INFORMATION region;
+	INT_PTR at = address;
+
+	while (at < address + (INT_PTR)size) {
+		if (!VirtualQuery((LPCVOID)at, &region, sizeof region) || region.State != MEM_COMMIT ||
+			!(region.Protect & WRITABLE) || (region.Protect & PAGE_GUARD))
+			return FALSE;
+		at = (INT_PTR)region.BaseAddress + (INT_PTR)region.RegionSize;
+	}
+	return TRUE;
+}
+
 static BOOL store(INT_PTR address, const void *source, size_t size)
 {
-	if (guarded_copy((void *)address, source, size, FALSE))
+	if (!in_game_image(address, size))
+		return guarded_copy((void *)address, source, size, FALSE);
+	if (is_writable(address, size) && guarded_copy((void *)address, source, size, FALSE))
 		return TRUE;
-	return in_game_image(address, size) && WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
+	return WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
 }
 
 BOOL write_memory(INT_PTR address, const void *source, size_t size)

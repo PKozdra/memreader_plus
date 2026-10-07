@@ -1,8 +1,7 @@
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "common.h"
+#include "game.h"
 
 enum {
 	SESSION_SIZE = 1 << 17,
@@ -16,8 +15,17 @@ enum {
 	PATHS_COUNT = 0x20,
 	PATH_ENTRY_SIZE = 0x10,
 	GETTER_BYTES = 0x30,
-	RIP_INSTRUCTION_SIZE = 7
+	RIP_INSTRUCTION_SIZE = 7,
+	MAX_MASKS = 4,
+	MASK_SIZE = 3 * MAX_PATH,
+	SHORTEST_MASK = 4
 };
+
+typedef struct {
+	char text[MASK_SIZE];
+	size_t length;
+	const char *replacement;
+} Mask;
 
 typedef struct {
 	char name[MAX_PATH];
@@ -44,6 +52,7 @@ static const BYTE LEA_RAX[3] = { 0x48, 0x8D, 0x05 };
 static const BYTE MOV_RAX[3] = { 0x48, 0x8B, 0x05 };
 static const char workshop_marker[] = "\\workshop\\content\\1142710\\";
 static const char game_user_data[] = "\\The Creative Assembly\\Warhammer3";
+static const WCHAR steam_apps[] = L"\\steamapps\\";
 
 static Mod mods[MAX_MODS];
 static int mod_count;
@@ -53,8 +62,8 @@ static Shadowed shadowed[MAX_SHADOWED];
 static int shadowed_count;
 static char session_buffer[SESSION_SIZE];
 static Text session = { session_buffer, sizeof session_buffer, 0 };
-static char profile[MAX_PATH];
-static size_t profile_length;
+static Mask masks[MAX_MASKS];
+static int mask_count;
 static char command_line[4 * MAX_PATH];
 static char user_data[MAX_PATH];
 static char crash_folder[MAX_PATH];
@@ -62,29 +71,50 @@ static char script_name[MAX_PATH];
 static const char *mods_source = "none found";
 static BOOL described;
 
-void add_text(Text *text, const char *format, ...)
+static void add_mask(const WCHAR *path, UINT code_page, const char *replacement)
 {
-	va_list arguments;
+	Mask *mask;
+	int length;
 
-	if (text->used >= text->size - 1)
+	if (mask_count == MAX_MASKS)
 		return;
-	va_start(arguments, format);
-	_vsnprintf_s(text->data + text->used, text->size - text->used, _TRUNCATE, format, arguments);
-	va_end(arguments);
-	text->used += strlen(text->data + text->used);
+	mask = &masks[mask_count];
+	length = WideCharToMultiByte(code_page, 0, path, -1, mask->text, MASK_SIZE, NULL, NULL);
+	if (length <= SHORTEST_MASK)
+		return;
+	mask->length = (size_t)length - 1;
+	mask->replacement = replacement;
+	mask_count++;
 }
 
-static void add_redacted(const char *value)
+static void add_masks(const WCHAR *path, const char *replacement)
 {
-	while (*value && session.used < session.size - 1) {
-		if (profile_length && _strnicmp(value, profile, profile_length) == 0) {
-			add_text(&session, "%%USERPROFILE%%");
-			value += profile_length;
-		} else {
-			session.data[session.used++] = *value++;
-			session.data[session.used] = '\0';
-		}
+	add_mask(path, CP_UTF8, replacement);
+	add_mask(path, CP_ACP, replacement);
+}
+
+static WCHAR *find_steam_apps(WCHAR *path)
+{
+	for (; *path; path++) {
+		if (_wcsnicmp(path, steam_apps, ARRAYSIZE(steam_apps) - 1) == 0)
+			return path;
 	}
+	return NULL;
+}
+
+static void find_masks(void)
+{
+	WCHAR path[MAX_PATH];
+	WCHAR *library_end;
+	DWORD length = GetEnvironmentVariableW(L"USERPROFILE", path, MAX_PATH);
+
+	if (length && length < MAX_PATH)
+		add_masks(path, "%USERPROFILE%");
+	length = GetModuleFileNameW(NULL, path, MAX_PATH);
+	if (!length || length >= MAX_PATH || !(library_end = find_steam_apps(path)))
+		return;
+	*library_end = L'\0';
+	add_masks(path, "<Steam library>");
 }
 
 static const BYTE *rip_target(const BYTE *instruction)
@@ -401,9 +431,7 @@ static void add_mod_line(int index)
 	add_text(&session, "  %llu bytes  %04d-%02d-%02d %02d:%02d", (unsigned long long)mod->size, time.wYear, time.wMonth, time.wDay,
 		time.wHour, time.wMinute);
 	add_workshop_id(mod->path);
-	add_text(&session, "  ");
-	add_redacted(mod->path);
-	add_text(&session, "\n");
+	add_text(&session, "  %s\n", mod->path);
 }
 
 static void add_game_version(void)
@@ -443,9 +471,7 @@ void describe_session(void)
 	if (described)
 		return;
 	described = TRUE;
-	profile_length = GetEnvironmentVariableA("USERPROFILE", profile, MAX_PATH);
-	if (profile_length >= MAX_PATH)
-		profile_length = 0;
+	find_masks();
 	read_command_line();
 	find_user_data();
 	if (read_mods_from_memory() && read_paths_from_memory())
@@ -458,20 +484,14 @@ void describe_session(void)
 
 	add_text(&session, "\nGame: Warhammer3.exe ");
 	add_game_version();
-	add_text(&session, ", memreader Plus %s\nCommand line: ", MEMREADER_PLUS_VERSION);
-	add_redacted(command_line);
-	add_text(&session, "\nGame crash folder: ");
-	add_redacted(crash_folder);
-	add_text(&session, "\nMods in load order (%d, from %s):\n", mod_count, mods_source);
+	add_text(&session, ", memreader Plus %s\nCommand line: %s\nGame crash folder: %s\nMods in load order (%d, from %s):\n",
+		MEMREADER_PLUS_VERSION, command_line, crash_folder, mod_count, mods_source);
 	for (i = 0; i < mod_count; i++)
 		add_mod_line(i);
 	if (shadowed_count) {
 		add_text(&session, "Same name in a later search path, not loaded:\n");
-		for (i = 0; i < shadowed_count; i++) {
-			add_text(&session, "  %s  ", mods[shadowed[i].mod].name);
-			add_redacted(paths[shadowed[i].path]);
-			add_text(&session, "\n");
-		}
+		for (i = 0; i < shadowed_count; i++)
+			add_text(&session, "  %s  %s\n", mods[shadowed[i].mod].name, paths[shadowed[i].path]);
 	}
 }
 
@@ -482,30 +502,46 @@ static char path_char(char c)
 	return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
 }
 
-static BOOL is_profile_at(const char *at)
+static BOOL is_mask_at(const char *at, size_t left, const Mask *mask)
 {
 	size_t i;
 
-	for (i = 0; i < profile_length; i++) {
-		if (path_char(at[i]) != path_char(profile[i]))
+	if (mask->length > left)
+		return FALSE;
+	for (i = 0; i < mask->length; i++) {
+		if (path_char(at[i]) != path_char(mask->text[i]))
 			return FALSE;
 	}
 	return TRUE;
 }
 
+static const Mask *mask_at(const char *at, size_t left)
+{
+	int i;
+
+	for (i = 0; i < mask_count; i++) {
+		if (is_mask_at(at, left, &masks[i]))
+			return &masks[i];
+	}
+	return NULL;
+}
+
 void write_redacted(HANDLE file, const char *data, size_t length)
 {
-	static const char replacement[] = "%USERPROFILE%";
-	size_t start = 0, at;
+	const Mask *mask;
+	size_t start = 0, at = 0;
 	DWORD written;
 
-	for (at = 0; profile_length && at + profile_length <= length; at++) {
-		if (is_profile_at(data + at)) {
-			WriteFile(file, data + start, (DWORD)(at - start), &written, NULL);
-			WriteFile(file, replacement, sizeof replacement - 1, &written, NULL);
-			at += profile_length - 1;
-			start = at + 1;
+	while (at < length) {
+		mask = mask_at(data + at, length - at);
+		if (!mask) {
+			at++;
+			continue;
 		}
+		WriteFile(file, data + start, (DWORD)(at - start), &written, NULL);
+		WriteFile(file, mask->replacement, (DWORD)strlen(mask->replacement), &written, NULL);
+		at += mask->length;
+		start = at;
 	}
 	WriteFile(file, data + start, (DWORD)(length - start), &written, NULL);
 }

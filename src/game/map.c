@@ -1,6 +1,6 @@
 #include <string.h>
 
-#include "common.h"
+#include "game.h"
 
 enum {
 	BUCKETS = sizeof(CaList),

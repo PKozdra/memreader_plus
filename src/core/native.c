@@ -21,7 +21,7 @@ enum {
 typedef struct {
 	ULONG_PTR base;
 	ULONG_PTR end;
-	BOOL listed;
+	BOOL other_program;
 	char name[MODULE_NAME_SIZE];
 } Module;
 
@@ -104,7 +104,7 @@ static void add_module(const LDR_DATA_TABLE_ENTRY *entry)
 
 	module->base = (ULONG_PTR)entry->DllBase;
 	module->end = module->base + ((ULONG_PTR)entry->Reserved3[1] & 0xFFFFFFFF);
-	module->listed = !is_inside(&entry->FullDllName, windows_folder, windows_length) &&
+	module->other_program = !is_inside(&entry->FullDllName, windows_folder, windows_length) &&
 		!is_inside(&entry->FullDllName, game_folder, game_length);
 	copy_base_name(module->name, &entry->FullDllName);
 	module_count++;
@@ -145,6 +145,16 @@ void add_address(Text *text, ULONG_PTR address)
 		add_text(text, "%016llx (%s)", (unsigned long long)address, hook_code);
 	else
 		add_text(text, "%016llx", (unsigned long long)address);
+}
+
+static void add_pointer(Text *text, ULONG_PTR address)
+{
+	const Module *module = module_of(address);
+
+	if (module && module->other_program)
+		add_text(text, "another program's DLL");
+	else
+		add_address(text, address);
 }
 
 static void add_function_start(Text *text, ULONG_PTR address, ULONG_PTR inside)
@@ -312,7 +322,7 @@ static void add_value(Text *text, ULONG_PTR value)
 		return;
 	if (module_of(value) || describe_hook_code(value, NULL, 0)) {
 		add_text(text, "  -> ");
-		add_address(text, value);
+		add_pointer(text, value);
 		return;
 	}
 	if (on_crash_stack(value)) {
@@ -325,7 +335,7 @@ static void add_value(Text *text, ULONG_PTR value)
 	}
 	if (copy_memory(&first, (INT_PTR)value, sizeof first) && is_vtable(first)) {
 		add_text(text, "  object, vtable ");
-		add_address(text, first);
+		add_pointer(text, first);
 		return;
 	}
 	if (!add_text_preview(text, value))
@@ -429,17 +439,14 @@ void add_memory_use(Text *text)
 	add_text(text, "\n");
 }
 
-void add_other_modules(Text *text)
+void add_other_module_count(Text *text)
 {
-	const char *separator = "";
+	int count = 0;
 	int i;
 
-	add_text(text, "DLLs from outside Windows and the game folder:");
 	for (i = 1; i < module_count; i++) {
-		if (modules[i].listed) {
-			add_text(text, "%s %s", separator, modules[i].name);
-			separator = ",";
-		}
+		if (modules[i].other_program)
+			count++;
 	}
-	add_text(text, "\n");
+	add_text(text, "Other programs' DLLs loaded: %d\n", count);
 }

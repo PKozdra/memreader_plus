@@ -1,4 +1,4 @@
-#include "common.h"
+#include "game.h"
 
 enum { MAX_GAME_BLOCK = 64 * 1024 * 1024, MAX_TWINS = 4, FREE_CALL_AT = 13, FREE_HEADER = 16 };
 
