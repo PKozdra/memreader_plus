@@ -8,7 +8,9 @@ enum {
 	MAX_PATTERN_SIZE = 256,
 	MAX_PATTERNS = 64,
 	MAX_FOUND = 8,
-	MAX_SAVED_CODE = 1280,
+	MAX_SAVED_CODE = 4096,
+	MAX_CACHED = 1024,
+	MAX_ORIGINAL_READ = 4096,
 	HEAD_SIZE = 8,
 	BLOCK_SIZE = 16,
 	CALL_OPCODE = 0xE8,
@@ -64,9 +66,18 @@ typedef struct {
 	BYTE bytes[SAVED_BYTES];
 } SavedCode;
 
+typedef struct {
+	char *text;
+	Matches matches;
+} CachedSearch;
+
 static Search search;
 static SavedCode saved[MAX_SAVED_CODE];
 static int saved_count;
+static BOOL saved_full;
+static CachedSearch cache[MAX_CACHED];
+static int cache_count;
+static INT_PTR cache_base;
 
 void capture_code(INT_PTR address, BYTE *window)
 {
@@ -74,10 +85,49 @@ void capture_code(INT_PTR address, BYTE *window)
 		memset(window, 0, SAVED_BYTES);
 }
 
+static int saved_index(INT_PTR address)
+{
+	int i;
+
+	for (i = 0; i < saved_count; i++) {
+		if (address >= saved[i].start && address < saved[i].start + SAVED_BYTES)
+			return i;
+	}
+	return -1;
+}
+
+static BOOL is_saved(INT_PTR address, size_t size)
+{
+	size_t i;
+
+	for (i = 0; i < size; i++) {
+		if (saved_index(address + (INT_PTR)i) < 0)
+			return FALSE;
+	}
+	return TRUE;
+}
+
+static void report_full(void)
+{
+	char line[192];
+
+	if (saved_full)
+		return;
+	saved_full = TRUE;
+	_snprintf_s(line, sizeof line, _TRUNCATE,
+		"saved original code is full (%d ranges): find_pattern and read_original no longer see the original bytes of code changed from now on",
+		MAX_SAVED_CODE);
+	note_line(line);
+}
+
 void remember_code(INT_PTR address, const BYTE *window)
 {
-	if (saved_count == MAX_SAVED_CODE)
+	if (is_saved(address, SAVED_BYTES / 2))
 		return;
+	if (saved_count == MAX_SAVED_CODE) {
+		report_full();
+		return;
+	}
 	saved[saved_count].start = address - SAVED_BYTES / 2;
 	memcpy(saved[saved_count].bytes, window, SAVED_BYTES);
 	saved_count++;
@@ -322,15 +372,35 @@ static void scan_section(const BYTE *start, const BYTE *end)
 
 static BOOL original_byte(INT_PTR address, BYTE *byte)
 {
-	int i;
+	int i = saved_index(address);
 
-	for (i = 0; i < saved_count; i++) {
-		if (address >= saved[i].start && address < saved[i].start + SAVED_BYTES) {
-			*byte = saved[i].bytes[address - saved[i].start];
-			return TRUE;
-		}
+	if (i >= 0) {
+		*byte = saved[i].bytes[address - saved[i].start];
+		return TRUE;
 	}
 	return copy_memory(byte, address, 1);
+}
+
+static void overlay_saved(const SavedCode *code, INT_PTR address, BYTE *out, size_t size)
+{
+	INT_PTR from = code->start > address ? code->start : address;
+	INT_PTR to = code->start + SAVED_BYTES;
+
+	if (to > address + (INT_PTR)size)
+		to = address + (INT_PTR)size;
+	if (from < to)
+		memcpy(out + (from - address), code->bytes + (from - code->start), (size_t)(to - from));
+}
+
+static BOOL copy_original(INT_PTR address, BYTE *out, size_t size)
+{
+	int i;
+
+	if (!copy_memory(out, address, size))
+		return FALSE;
+	for (i = saved_count - 1; i >= 0; i--)
+		overlay_saved(&saved[i], address, out, size);
+	return TRUE;
 }
 
 static BOOL matches_original(INT_PTR at, const Pattern *pattern)
@@ -395,33 +465,77 @@ static void run_search(void)
 	}
 }
 
-static const BYTE *find_one(const char *text, int *count)
+static void clear_cache(void)
 {
+	int i;
+
+	for (i = 0; i < cache_count; i++)
+		HeapFree(GetProcessHeap(), 0, cache[i].text);
+	cache_count = 0;
+}
+
+static const Matches *cached_matches(const char *text)
+{
+	INT_PTR base = (INT_PTR)GetModuleHandleA(NULL);
+	int i;
+
+	if (base != cache_base) {
+		clear_cache();
+		cache_base = base;
+	}
+	for (i = 0; i < cache_count; i++) {
+		if (strcmp(cache[i].text, text) == 0)
+			return &cache[i].matches;
+	}
+	return NULL;
+}
+
+static const Matches *cache_matches(const char *text, const Matches *matches)
+{
+	size_t size = strlen(text) + 1;
+	char *copy;
+
+	if (cache_count == MAX_CACHED || !(copy = HeapAlloc(GetProcessHeap(), 0, size)))
+		return matches;
+	memcpy(copy, text, size);
+	cache[cache_count].text = copy;
+	cache[cache_count].matches = *matches;
+	return &cache[cache_count++].matches;
+}
+
+static const Matches *search_one(const char *text, int *error)
+{
+	const Matches *cached = cached_matches(text);
+
+	*error = PATTERN_OK;
+	if (cached)
+		return cached;
 	start_search();
-	*count = 0;
-	if (add_pattern(text) != PATTERN_OK)
+	*error = add_pattern(text);
+	if (*error != PATTERN_OK)
 		return NULL;
 	run_search();
-	*count = search.matches[0].count;
-	return search.matches[0].first;
+	return cache_matches(text, &search.matches[0]);
 }
 
 int find_code_all(const char *text, const BYTE **found, int max)
 {
-	int count, i;
+	int error, i;
+	const Matches *matches = search_one(text, &error);
 
-	find_one(text, &count);
-	for (i = 0; i < count && i < max && i < MAX_FOUND; i++)
-		found[i] = search.matches[0].found[i];
-	return count;
+	if (!matches)
+		return 0;
+	for (i = 0; i < matches->count && i < max && i < MAX_FOUND; i++)
+		found[i] = matches->found[i];
+	return matches->count;
 }
 
 INT_PTR find_unique(const char *text)
 {
-	int count;
-	const BYTE *at = find_one(text, &count);
+	int error;
+	const Matches *matches = search_one(text, &error);
 
-	return count == 1 ? (INT_PTR)at : 0;
+	return matches && matches->count == 1 ? (INT_PTR)matches->first : 0;
 }
 
 INT_PTR call_destination(INT_PTR call)
@@ -459,23 +573,35 @@ static void push_first(lua_State *L, const Matches *matches, BOOL nil_when_missi
 static int l_find_pattern(lua_State *L)
 {
 	int error;
+	const Matches *matches = search_one(luaL_checkstring(L, 1), &error);
 
-	start_search();
-	error = add_pattern(luaL_checkstring(L, 1));
 	if (error == PATTERN_TOO_LONG)
 		return luaL_error(L, "pattern longer than %d bytes", MAX_PATTERN_SIZE);
 	if (error == PATTERN_BAD_BYTE)
 		return luaL_argerror(L, 1, "expected hex bytes and ?? separated by spaces");
 	if (error == PATTERN_STARTS_UNKNOWN)
 		return luaL_argerror(L, 1, "pattern must start with a byte, not ??");
-	run_search();
-	push_first(L, &search.matches[0], TRUE);
-	lua_pushnumber(L, (lua_Number)search.matches[0].count);
+	push_first(L, matches, TRUE);
+	lua_pushnumber(L, (lua_Number)matches->count);
 	return 2;
+}
+
+static const char *pattern_at(lua_State *L, int index)
+{
+	const char *text;
+
+	lua_rawgeti(L, 1, index);
+	if (lua_type(L, -1) != LUA_TSTRING)
+		luaL_error(L, "pattern %d is not a string", index);
+	text = lua_tostring(L, -1);
+	lua_pop(L, 1);
+	return text;
 }
 
 static int l_find_patterns(lua_State *L)
 {
+	const Matches *results[MAX_PATTERNS];
+	int slots[MAX_PATTERNS];
 	int count, i;
 
 	luaL_checktype(L, 1, LUA_TTABLE);
@@ -483,27 +609,54 @@ static int l_find_patterns(lua_State *L)
 	if (count < 1 || count > MAX_PATTERNS)
 		return luaL_argerror(L, 1, lua_pushfstring(L, "must hold 1 to %d patterns", MAX_PATTERNS));
 	start_search();
-	for (i = 1; i <= count; i++) {
+	for (i = 0; i < count; i++) {
+		const char *text = pattern_at(L, i + 1);
 		int error;
 
-		lua_rawgeti(L, 1, i);
-		if (lua_type(L, -1) != LUA_TSTRING)
-			return luaL_error(L, "pattern %d is not a string", i);
-		error = add_pattern(lua_tostring(L, -1));
-		lua_pop(L, 1);
+		results[i] = cached_matches(text);
+		slots[i] = search.count;
+		if (results[i])
+			continue;
+		error = add_pattern(text);
 		if (error != PATTERN_OK)
-			return pattern_error(L, error, i);
+			return pattern_error(L, error, i + 1);
 	}
-	run_search();
+	if (search.count)
+		run_search();
+	for (i = 0; i < count; i++) {
+		const char *text = pattern_at(L, i + 1);
+
+		if (!results[i])
+			results[i] = cached_matches(text);
+		if (!results[i])
+			results[i] = cache_matches(text, &search.matches[slots[i]]);
+	}
 	lua_createtable(L, count, 0);
 	lua_createtable(L, count, 0);
 	for (i = 0; i < count; i++) {
-		push_first(L, &search.matches[i], FALSE);
+		push_first(L, results[i], FALSE);
 		lua_rawseti(L, -3, i + 1);
-		lua_pushnumber(L, (lua_Number)search.matches[i].count);
+		lua_pushnumber(L, (lua_Number)results[i]->count);
 		lua_rawseti(L, -2, i + 1);
 	}
 	return 2;
+}
+
+static int l_read_original(lua_State *L)
+{
+	int size_index = lua_gettop(L) == 2 ? 2 : 3;
+	INT_PTR address = size_index == 2 ? check_pointer(L, 1) : address_argument(L, 1);
+	lua_Number size = luaL_checknumber(L, size_index);
+	BYTE bytes[MAX_ORIGINAL_READ];
+
+	if (!(size >= 1 && size <= MAX_ORIGINAL_READ))
+		return luaL_argerror(L, size_index, lua_pushfstring(L, "must be 1 to %d bytes", MAX_ORIGINAL_READ));
+	if (!in_game_image(address, (size_t)size))
+		return luaL_argerror(L, 1, "address is outside the game's exe");
+	if (!copy_original(address, bytes, (size_t)size))
+		return luaL_error(L, "failed to read memory");
+	lua_pushlstring(L, (const char *)bytes, (size_t)size);
+	return 1;
 }
 
 PRUNTIME_FUNCTION primary_function_entry(PRUNTIME_FUNCTION entry, ULONG64 base)
@@ -547,5 +700,6 @@ const luaL_Reg scan_functions[] = {
 	{ "find_pattern", l_find_pattern },
 	{ "find_patterns", l_find_patterns },
 	{ "function_start", l_function_start },
+	{ "read_original", l_read_original },
 	{ NULL, NULL }
 };

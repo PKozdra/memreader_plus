@@ -12,7 +12,7 @@ $failed = @()
 $skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
-    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; heap = 0; guard = 0; frame = 0; bench = 0
+    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
     fault_report_cpp = -529697949; fault_report_fallback = $crash

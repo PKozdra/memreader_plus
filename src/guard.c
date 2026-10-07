@@ -153,6 +153,14 @@ static void write_log(const char *line)
 	CloseHandle(file);
 }
 
+void note_line(const char *line)
+{
+	if (logged_count == MAX_LOGGED || already_logged(line))
+		return;
+	strcpy_s(logged[logged_count++], LINE_SIZE, line);
+	write_log(line);
+}
+
 void note_refusal(lua_State *L, const char *what, INT_PTR address)
 {
 	char where[WHERE_SIZE], line[LINE_SIZE];
@@ -166,10 +174,7 @@ void note_refusal(lua_State *L, const char *what, INT_PTR address)
 		if ((BYTE)*at < ' ')
 			*at = ' ';
 	}
-	if (already_logged(line))
-		return;
-	strcpy_s(logged[logged_count++], LINE_SIZE, line);
-	write_log(line);
+	note_line(line);
 }
 
 static void start_change(Change *change, const char *what, const char *where, INT_PTR address, size_t size)
@@ -275,6 +280,10 @@ void add_changes(Text *report)
 
 void check_write(lua_State *L, int argument, const char *what, INT_PTR address, size_t size)
 {
+	if (in_hooked_prologue(address, size)) {
+		note_refusal(L, what, address);
+		luaL_argerror(L, argument, "refused: the first bytes of a hooked function run from the hook's copy, so a change there would never run");
+	}
 	if (may_write(address, size)) {
 		note_change(L, function_name(L, what), address, size);
 		return;

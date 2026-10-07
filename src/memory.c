@@ -448,6 +448,10 @@ static int check_patch(lua_State *L, int index, int number, PatchSite *site)
 	read_or_fail(L, site->address, site->current, site->size);
 	if (memcmp(site->current, site->bytes, site->size) == 0)
 		return PATCH_DONE;
+	if (in_hooked_prologue(site->address, site->size)) {
+		note_refusal(L, number ? "relocate_field" : "patch", site->address);
+		return PATCH_OTHER;
+	}
 	return memcmp(site->current, site->expected, site->size) == 0 ? PATCH_EXPECTED : PATCH_OTHER;
 }
 

@@ -15,6 +15,8 @@ $dll = Join-Path $build 'Release\memreader_plus.dll'
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory $stage | Out-Null
 Copy-Item -Recurse (Join-Path $root 'script') $stage
+$licenses = @(Get-Content -Raw (Join-Path $root 'LICENSE.md'); Get-Content -Raw (Join-Path $root 'vendor\minhook\LICENSE.txt'))
+Set-Content -Encoding utf8 (Join-Path $stage 'script\memreader_plus\third_party_licenses.txt') ($licenses -join "`r`n`r`n")
 Copy-Item $dll $dist
 python (Join-Path $root 'tools\dll_to_lua.py') $dll
 if ($LASTEXITCODE) { throw 'dll_to_lua failed' }

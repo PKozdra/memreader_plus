@@ -252,6 +252,9 @@ INT64 frame_twin(UINT64 *probe);
 INT64 frame_xmm_target(UINT64 *probe);
 INT64 frame_pointer_target(UINT64 *probe);
 INT64 frame_call(void *function, UINT64 *probe);
+INT64 frame_hooked(UINT64 *probe);
+INT32 prologue_target(void);
+void filler_code(void);
 
 __declspec(noinline) void host_unwind_probe(UINT64 *probe)
 {
@@ -369,6 +372,9 @@ static const struct {
 	{ "frame_xmm_target", frame_xmm_target },
 	{ "frame_pointer_target", frame_pointer_target },
 	{ "frame_call", frame_call },
+	{ "frame_hooked", frame_hooked },
+	{ "prologue_target", prologue_target },
+	{ "filler_code", filler_code },
 };
 
 static int l_test_function(lua_State *L)

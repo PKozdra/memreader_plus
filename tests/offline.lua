@@ -652,7 +652,7 @@ elseif SCENARIO == 'hook' then
 		)
 
 		check(hex_at(mixed, 16) ~= mixed_pattern, 'hooking changed the first bytes')
-		local found_after, count_after = mr.find_pattern(mixed_pattern)
+		local found_after, count_after = mr.find_pattern(mixed_pattern .. ' ')
 		check(found_after == mixed and count_after == count_before, 'find_pattern sees through our hook: ' .. tostring(count_after))
 		local cell = mr.alloc(4)
 		mr.hook(store, 'void(pointer, int32)', function(p, value)
@@ -956,7 +956,7 @@ elseif SCENARIO == 'frame' then
 	check(grown_unwinds, 'unwinding through the grown frame restores the caller frame and saved registers')
 	local twin_after_result, twin_after = run_probe('frame_twin')
 	check(twin_after_result == 0 and twin_after, 'the function sharing the old unwind info still unwinds correctly')
-	check(select(2, mr.find_pattern(original_target)) == before_grow, 'find_pattern still finds the grown function by its original bytes')
+	check(select(2, mr.find_pattern(original_target .. ' ')) == before_grow, 'find_pattern still finds the grown function by its original bytes')
 	local xmm_result, xmm_unwinds = run_probe('frame_xmm_target')
 	check(xmm_result == 0 and xmm_unwinds, 'frame_xmm_target runs and unwinds with xmm6 saved inside its frame')
 	check(mr.grow_frame(mr.pointer(test_function('frame_xmm_target')), 0x360) == true, 'grow_frame grows a frame with an xmm save inside it')
@@ -967,7 +967,7 @@ elseif SCENARIO == 'frame' then
 	local patch_pattern = code_pattern('patch_target')
 	local before_patch = select(2, mr.find_pattern(patch_pattern))
 	mr.patch(patch_site, '\184\1\0\0\0', '\184\2\0\0\0')
-	check(select(2, mr.find_pattern(patch_pattern)) == before_patch, 'find_pattern still finds a patched site by its original bytes')
+	check(select(2, mr.find_pattern(patch_pattern .. ' ')) == before_patch, 'find_pattern still finds a patched site by its original bytes')
 	mr.patch(patch_site, '\184\2\0\0\0', '\184\1\0\0\0')
 	check(mr.grow_frame(mr.pointer(test_function('frame_target')), 0x360) == true, 'a second grow_frame of the same function changes nothing')
 	check(run_probe('frame_target') == 0, 'the function still runs after the second call')
@@ -991,6 +991,131 @@ elseif SCENARIO == 'frame' then
 	check(counts[1] >= 1, 'find_patterns finds the frame function')
 	check(not pcall(mr.find_patterns, {}), 'find_patterns refuses an empty list')
 	check(not pcall(mr.find_patterns, { '?? 00' }), 'find_patterns refuses a pattern that starts with ??')
+elseif SCENARIO == 'hooked_code' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local FULL_LINE = 'saved original code is full'
+	local function log_text()
+		local log = io.open('memreader_plus_refused.txt', 'rb')
+		local text = log and log:read('*a') or ''
+		if log then log:close() end
+		return text
+	end
+	local function count_in(text, part)
+		local count, at = 0, 1
+		while true do
+			at = string.find(text, part, at, true)
+			if not at then return count end
+			count, at = count + 1, at + #part
+		end
+	end
+	local function hex(bytes)
+		return (bytes
+			:gsub('.', function(char)
+				return string.format('%02X ', char:byte())
+			end)
+			:gsub(' $', ''))
+	end
+	local function same_result(a, b)
+		return mr.eq(a[1] or mr.pointer(0), b[1] or mr.pointer(0)) and a[2] == b[2]
+	end
+
+	local patch_site = mr.pointer(test_function('patch_target'))
+	for _ = 1, 2500 do
+		mr.patch(patch_site, '\184\1\0\0\0', '\184\2\0\0\0')
+		mr.patch(patch_site, '\184\2\0\0\0', '\184\1\0\0\0')
+	end
+	check(count_in(log_text(), FULL_LINE) == 0, '5000 patches of one site save its original once and never fill the table')
+	check(mr.read_original(patch_site, 0, 5) == '\184\1\0\0\0', 'read_original of a site patched and restored gives the original bytes')
+
+	local target = mr.pointer(test_function('prologue_target'))
+	local ORIGINAL = '\83\86\87\144\184\1\0\0\0\95\94\91\195'
+	local pattern = hex(ORIGINAL)
+	check(mr.read(target, 0, #ORIGINAL) == ORIGINAL, 'prologue_target holds the expected bytes')
+	local first = { mr.find_pattern(pattern) }
+	check(mr.eq(first[1], target) and first[2] == 1, 'the prologue pattern is found once before hooking')
+	mr.hook(target, 'int32()', function()
+		return mr.hook_next(target)
+	end)
+	check(mr.tonumber(mr.call(target, 'int32()')) == 1, 'the hooked function still returns 1')
+	check(mr.read(target, 0, 1) == '\233', 'read of hooked code returns the jump the hook wrote')
+	check(mr.read_original(target, 0, #ORIGINAL) == ORIGINAL, 'read_original returns the bytes from before the hook')
+	check(mr.read_original(target, 4, 5) == '\184\1\0\0\0', 'read_original takes an offset like the reads')
+	check(mr.read_original(target, nil, 3) == ORIGINAL:sub(1, 3), 'read_original takes nil as the offset')
+	check(mr.read_original(mr.add(target, 4), 5) == '\184\1\0\0\0', 'read_original with two arguments takes the second as the size')
+	check(not pcall(mr.read_original, target, 0, 0), 'read_original refuses 0 bytes')
+	check(not pcall(mr.read_original, mr.alloc(4), 0, 4), 'read_original refuses an address outside the exe')
+	local cached = { mr.find_pattern(pattern) }
+	local fresh = { mr.find_pattern(pattern .. ' ') }
+	check(same_result(cached, first), 'the cached result of a function hooked after the first scan is the first result')
+	check(same_result(fresh, first), 'a fresh scan of the hooked function gives the same result as the cache')
+	local trampoline = mr.hook_info(target).original
+	check(mr.read(trampoline, 4, 5) == '\184\1\0\0\0', 'the trampoline holds the copied instructions')
+	check(mr.read(trampoline, 9, 2) == '\255\37', 'past the copied instructions the trampoline holds its jump back')
+
+	local site = mr.add(target, 5)
+	local old, current = mr.patch(site, '\1\0\0\0', '\2\0\0\0')
+	check(old == nil and current == '\1\0\0\0', 'patch inside the copied prologue gives nil and the bytes found')
+	check(mr.tonumber(mr.call(target, 'int32()')) == 1 and mr.read(site, 0, 4) == '\1\0\0\0', 'and writes nothing')
+	local done, index = mr.relocate_field({ { site, '\1\0\0\0', '\2\0\0\0' } })
+	check(done == nil and index == 1, 'relocate_field refuses a site inside the copied prologue')
+	local ok, err = pcall(mr.write, site, 0, mr.uint32(2))
+	check(not ok and string.find(tostring(err), 'refused: the first bytes of a hooked function', 1, true) ~= nil, 'write inside the copied prologue is refused')
+	check(not pcall(mr.write, target, 0, mr.uint8(0x90)), 'write over the hook jump is refused')
+	check(mr.read(site, 0, 4) == '\1\0\0\0', 'the refused write changed nothing')
+	local log = log_text()
+	check(count_in(log, 'patch refused at') == 1 and count_in(log, 'relocate_field refused at') == 1, 'the log names the refused patch and relocate_field')
+	check(count_in(log, 'write refused at') >= 1, 'the log names the refused write')
+	local after = mr.add(target, 9)
+	check(mr.patch(after, '\95', '\144') == '\95' and mr.read(after, 0, 1) == '\144', 'patch past the copied prologue still works')
+	mr.patch(after, '\144', '\95')
+
+	mr.patch(patch_site, '\184\1\0\0\0', '\184\2\0\0\0')
+	mr.hook(patch_site, 'int32()', function()
+		return mr.hook_next(patch_site)
+	end)
+	local jump = mr.read(patch_site, 0, 5)
+	local again, found = mr.patch(patch_site, '\184\1\0\0\0', '\184\2\0\0\0')
+	check(jump:sub(1, 1) == '\233' and again == nil and found == jump, 'a patch made before the hook and overlapping its jump gives nil and the jump bytes')
+	check(mr.tonumber(mr.call(patch_site, 'int32()')) == 2, 'the hook runs the earlier patch from its copy')
+	check(mr.read_original(patch_site, 5) == '\184\1\0\0\0', 'read_original under the hook gives the bytes from before the earlier patch')
+
+	local frame = mr.pointer(test_function('frame_hooked'))
+	check(mr.read(frame, 0, 3) == '\72\139\196', 'frame_hooked starts with mov rax, rsp')
+	local frame_pattern = hex(mr.read(frame, 0, 24))
+	mr.hook(frame, 'int64(pointer)', function(probe)
+		return mr.hook_next(frame, probe)
+	end)
+	local grown, why = mr.grow_frame(frame, 0x40)
+	check(grown == nil and why == 'the function is hooked', 'grow_frame refuses a hooked function: ' .. tostring(why))
+	check(mr.read(frame, 0, 1) == '\233' and mr.read_original(frame, 0, 3) == '\72\139\196', 'read_original sees mov rax, rsp under the hook jump')
+	local other = { mr.find_pattern(frame_pattern) }
+	check(mr.eq(other[1], frame) and other[2] == 1, 'a different pattern scans on its own and finds its function through the hook')
+
+	local list = { pattern, frame_pattern, 'C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3 C3' }
+	local fresh_list = {}
+	for i, text in ipairs(list) do
+		fresh_list[i] = text .. '  '
+	end
+	local found_a, counts_a = mr.find_patterns(list)
+	local found_b, counts_b = mr.find_patterns(fresh_list)
+	local agree = true
+	for i = 1, #list do
+		agree = agree and counts_a[i] == counts_b[i] and (found_a[i] == found_b[i] or mr.eq(found_a[i], found_b[i]))
+	end
+	check(agree, 'find_patterns from the cache agrees with a fresh scan')
+	check(counts_a[3] == 0 and found_a[3] == false, 'a missing pattern stays missing')
+
+	local filler = mr.pointer(test_function('filler_code'))
+	local zeros, nops = string.rep('\0', 4096), string.rep('\144', 4096)
+	for chunk = 0, 9 do
+		mr.patch(mr.add(filler, chunk * 4096), zeros, nops)
+	end
+	check(count_in(log_text(), FULL_LINE) == 1, 'a full table is reported once in the log')
+	check(mr.read_original(filler, 0, 16) == string.rep('\0', 16), 'the first ranges keep their original bytes')
+	check(mr.read_original(mr.add(filler, 9 * 4096), 0, 16) == string.rep('\144', 16), 'ranges changed after the table filled up show the new bytes')
+	mr.patch(mr.add(filler, 9 * 4096), nops, zeros)
+	check(count_in(log_text(), FULL_LINE) == 1, 'further changes do not repeat the report')
 elseif
 	SCENARIO == 'fault_report'
 	or SCENARIO == 'fault_report_no_log'
@@ -1148,20 +1273,36 @@ elseif SCENARIO == 'bench' then
 		mr.add(data, 16)
 	end)
 	local prologue = mr.tostring(mr.read(mr.pointer(test_function('pattern_target')), 0, 16)):gsub('%x%x', '%0 '):gsub(' $', '')
-	local start = mr.ticks()
-	for _ = 1, 20 do
-		mr.find_pattern(prologue)
+	local function fresh(round)
+		return prologue .. string.rep(' ', round)
 	end
-	print(string.format('  bench %-28s %7.0f us', 'find_pattern', mr.elapsed_us(start) / 20))
-	local list = {}
-	for i = 1, 30 do
-		list[i] = prologue
+	local function time_scans(label, scan)
+		local start = mr.ticks()
+		for round = 1, 20 do
+			scan(round)
+		end
+		print(string.format('  bench %-28s %7.0f us', label, mr.elapsed_us(start) / 20))
 	end
-	start = mr.ticks()
-	for _ = 1, 20 do
-		mr.find_patterns(list)
+	time_scans('find_pattern cold', function(round)
+		mr.find_pattern(fresh(round))
+	end)
+	time_scans('find_pattern cached', function()
+		mr.find_pattern(fresh(1))
+	end)
+	local function batch(round)
+		local list = {}
+		for i = 1, 30 do
+			list[i] = fresh(100 + round * 30 + i)
+		end
+		return list
 	end
-	print(string.format('  bench %-28s %7.0f us', 'find_patterns 30', mr.elapsed_us(start) / 20))
+	time_scans('find_patterns 30 cold', function(round)
+		mr.find_patterns(batch(round))
+	end)
+	local cached_batch = batch(1)
+	time_scans('find_patterns 30 cached', function()
+		mr.find_patterns(cached_batch)
+	end)
 	local target = mr.pointer(test_function('hook_target'))
 	local TARGET = 'int32(int32, int32)'
 	time('call', function()

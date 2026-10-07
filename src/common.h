@@ -183,6 +183,8 @@ BOOL patch_memory(INT_PTR address, const char *bytes, size_t size);
 BOOL may_write(INT_PTR address, size_t size);
 BOOL in_exe_code(INT_PTR address);
 BOOL is_hook_original(INT_PTR address);
+BOOL in_hooked_prologue(INT_PTR address, size_t size);
+void note_line(const char *line);
 void note_refusal(lua_State *L, const char *what, INT_PTR address);
 void check_write(lua_State *L, int argument, const char *what, INT_PTR address, size_t size);
 INT_PTR game_heap_alloc(lua_State *L, size_t size);

@@ -4,10 +4,11 @@
 #include "common.h"
 #include "MinHook.h"
 #include "buffer.h"
+#include "hde/hde64.h"
 
 enum { MAX_HOOKS = 1000, MAX_CALLBACKS = 16, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8, SAVED_REGISTERS = 6 };
 
-enum { TRAMPOLINE_SIZE = 64, MAX_REPORTED_HOOKS = 24 };
+enum { TRAMPOLINE_SIZE = 64, MAX_REPORTED_HOOKS = 24, SITE_JUMP = 5, PROLOGUE_READ = 32 };
 
 enum HookOutcome { RUN_ORIGINAL, RETURN_RESULT, RETURN_FLOAT_RESULT };
 
@@ -19,6 +20,7 @@ typedef struct {
 
 typedef struct {
 	INT_PTR target;
+	int copied;
 	void *original;
 	Signature signature;
 	Callback callbacks[MAX_CALLBACKS];
@@ -106,6 +108,35 @@ BOOL is_hook_original(INT_PTR address)
 	return FALSE;
 }
 
+BOOL in_hooked_prologue(INT_PTR address, size_t size)
+{
+	int i;
+
+	for (i = 0; i < hook_count; i++) {
+		if (address < hooks[i].target + hooks[i].copied && address + (INT_PTR)size > hooks[i].target)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static int copied_length(INT_PTR target)
+{
+	BYTE code[PROLOGUE_READ];
+	int length = 0;
+
+	if (!copy_memory(code, target, sizeof code))
+		return SITE_JUMP;
+	while (length < SITE_JUMP) {
+		hde64s hs;
+
+		hde64_disasm(code + length, &hs);
+		if (hs.flags & F_ERROR)
+			return SITE_JUMP;
+		length += hs.len;
+	}
+	return length;
+}
+
 static BOOL is_read_only_code(INT_PTR address)
 {
 	MEMORY_BASIC_INFORMATION region;
@@ -173,6 +204,7 @@ static Hook *install_hook(lua_State *L, INT_PTR target)
 		luaL_error(L, "cannot start hooking");
 	hook = &hooks[hook_count];
 	hook->target = target;
+	hook->copied = copied_length(target);
 	hook->callback_count = 0;
 	capture_code(target, window);
 	status = MH_CreateHook((LPVOID)target, &stubs[hook_count], &hook->original);

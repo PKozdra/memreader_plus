@@ -195,6 +195,21 @@ static void find_parts(Plan *plan, const FunctionTable *table)
 	}
 }
 
+static BOOL not_hooked(Plan *plan, const FunctionTable *table)
+{
+	int p;
+
+	for (p = 0; p < plan->part_count; p++) {
+		const RUNTIME_FUNCTION *part = plan->parts[p];
+
+		if (in_hooked_prologue((INT_PTR)table->base + part->BeginAddress, part->EndAddress - part->BeginAddress)) {
+			plan->error = "the function is hooked";
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
 static int base_register(const hde64s *hs)
 {
 	if (!(hs->flags & F_MODRM) || hs->modrm_mod == MOD_REGISTER)
@@ -439,7 +454,7 @@ static int l_grow_frame(lua_State *L)
 		return 2;
 	}
 	find_parts(&plan, &table);
-	if (read_unwind(&plan, &table, by) && plan_code(&plan, &table, by) && apply(&plan, &table, shares_unwind(&plan, &table))) {
+	if (not_hooked(&plan, &table) && read_unwind(&plan, &table, by) && plan_code(&plan, &table, by) && apply(&plan, &table, shares_unwind(&plan, &table))) {
 		grown[grown_count++] = plan.entry->BeginAddress;
 		note_change(L, "grow_frame", (INT_PTR)image + plan.entry->BeginAddress, 0);
 		lua_pushboolean(L, 1);

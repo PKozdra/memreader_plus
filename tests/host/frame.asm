@@ -115,4 +115,41 @@ returned:
 	ret
 frame_call ENDP
 
+frame_hooked PROC FRAME
+	mov rax, rsp
+	push rbp
+	.pushreg rbp
+	push rbx
+	.pushreg rbx
+	lea rbp, [rax - 180h]
+	sub rsp, 198h
+	.allocstack 198h
+	.endprolog
+	mov [rbp + 188h], rcx
+	mov rbx, rcx
+	call host_unwind_probe
+	mov rax, [rbp + 188h]
+	sub rax, rbx
+	add rsp, 198h
+	pop rbx
+	pop rbp
+	ret
+frame_hooked ENDP
+
+prologue_target PROC
+	push rbx
+	push rsi
+	push rdi
+	nop
+	mov eax, 1
+	pop rdi
+	pop rsi
+	pop rbx
+	ret
+prologue_target ENDP
+
+filler_code PROC
+	BYTE 40960 DUP (0)
+filler_code ENDP
+
 END
