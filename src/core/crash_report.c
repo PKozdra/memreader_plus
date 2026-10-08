@@ -16,6 +16,7 @@ enum {
 	MAX_EVENTS = 32,
 	EVENT_NAME_SIZE = 48,
 	CUT_ROOM = 64,
+	SETTINGS_SIZE = 16384,
 	ALLOCATOR_DEPTH = 4,
 	TICKS_PER_SECOND = 10000000
 };
@@ -34,9 +35,15 @@ typedef struct {
 
 typedef void (*Section)(Text *report, const CrashInput *input);
 
+static const char settings_cut_line[] = "... cut: the settings list reached its size limit\n";
+
 static ContextField context[MAX_CONTEXT];
 static EventEntry events[MAX_EVENTS];
 static UINT32 event_order;
+static char settings_text[2][SETTINGS_SIZE];
+static size_t settings_length[2];
+static ULONGLONG settings_tick[2];
+static volatile LONG settings_current;
 
 void add_text(Text *text, const char *format, ...)
 {
@@ -109,26 +116,89 @@ void note_crash_event(const char *name)
 	oldest->last_tick = GetTickCount64();
 }
 
-static void add_title(Text *report, const CrashInput *input)
+static void add_bytes(Text *text, const char *bytes, size_t length)
+{
+	if (text->used >= text->size - 1)
+		return;
+	if (length > text->size - 1 - text->used)
+		length = text->size - 1 - text->used;
+	memcpy(text->data + text->used, bytes, length);
+	text->used += length;
+	text->data[text->used] = '\0';
+}
+
+static void copy_settings_clean(char *destination, const char *source, size_t length)
+{
+	size_t index;
+
+	for (index = 0; index < length; index++)
+		destination[index] = (BYTE)source[index] < ' ' && source[index] != '\n' ? ' ' : source[index];
+}
+
+static size_t whole_lines(const char *text, size_t room)
+{
+	while (room > 0 && text[room - 1] != '\n')
+		room--;
+	return room;
+}
+
+static size_t cut_settings(char *destination, const char *source)
+{
+	size_t cut_length = sizeof settings_cut_line - 1;
+	size_t kept = whole_lines(source, SETTINGS_SIZE - cut_length);
+
+	copy_settings_clean(destination, source, kept);
+	memcpy(destination + kept, settings_cut_line, cut_length);
+	return kept + cut_length;
+}
+
+static size_t copy_settings(char *destination, const char *source, size_t length)
+{
+	BOOL open_line = length > 0 && source[length - 1] != '\n';
+
+	if (length + open_line > SETTINGS_SIZE)
+		return cut_settings(destination, source);
+	copy_settings_clean(destination, source, length);
+	if (open_line)
+		destination[length++] = '\n';
+	return length;
+}
+
+void set_crash_settings(const char *text, size_t length)
+{
+	LONG spare = 1 - settings_current;
+
+	settings_length[spare] = text ? copy_settings(settings_text[spare], text, length) : 0;
+	settings_tick[spare] = GetTickCount64();
+	InterlockedExchange(&settings_current, spare);
+}
+
+static void add_title(Text *report, const CrashInput *input, const char *kind)
 {
 	SYSTEMTIME time;
 
 	FileTimeToSystemTime(&input->time, &time);
-	add_text(report, "memreader Plus %s crash report\n", MEMREADER_PLUS_VERSION);
+	add_text(report, "memreader Plus %s %s\n", MEMREADER_PLUS_VERSION, kind);
 	add_text(report, "%04d-%02d-%02d %02d:%02d:%02d, ", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
 }
 
 static void add_header(Text *report, const CrashInput *input)
 {
-	add_title(report, input);
+	add_title(report, input, "crash report");
 	add_fault(report, input->info->ExceptionRecord);
 }
 
 static void add_exit_header(Text *report, const CrashInput *input)
 {
-	add_title(report, input);
+	add_title(report, input, "crash report");
 	add_text(report, "the game ended itself with exit code %lu (0x%08lx) through %s\n", input->exit_code, input->exit_code,
 		input->exit_call);
+}
+
+static void add_runtime_header(Text *report, const CrashInput *input)
+{
+	add_title(report, input, "runtime report");
+	add_text(report, "written on request, nothing crashed\n");
 }
 
 static void add_thread_name(Text *report, const CrashInput *input)
@@ -158,7 +228,7 @@ static void add_thread(Text *report, const CrashInput *input)
 	add_script_log(report, input);
 }
 
-static void add_exit_thread(Text *report, const CrashInput *input)
+static void add_thread_and_log(Text *report, const CrashInput *input)
 {
 	add_thread_name(report, input);
 	add_script_log(report, input);
@@ -192,6 +262,20 @@ static void add_context(Text *report, const CrashInput *input)
 		if (context[index].name[0])
 			add_text(report, "  %s: %s\n", context[index].name, context[index].value);
 	}
+	(void)input;
+}
+
+static void add_settings(Text *report, const CrashInput *input)
+{
+	LONG current = settings_current;
+	ULONGLONG seconds = (GetTickCount64() - settings_tick[current]) / 1000;
+
+	if (settings_length[current] == 0) {
+		add_text(report, "MCT settings: none recorded (MCT is not installed or has not loaded yet)\n");
+		return;
+	}
+	add_text(report, "MCT settings of the mods in this game (%llu seconds before this report):\n", seconds);
+	add_bytes(report, settings_text[current], settings_length[current]);
 	(void)input;
 }
 
@@ -380,12 +464,17 @@ static void add_modules(Text *report, const CrashInput *input)
 }
 
 static const Section crash_sections[] = {
-	add_header, add_thread, add_uptime, add_context, add_events, add_lua_part, add_crashed_stack,
+	add_header, add_thread, add_uptime, add_context, add_settings, add_events, add_lua_part, add_crashed_stack,
 	add_crashed_registers, add_crashed_memory, add_script_stack, add_plus_hooks, add_plus_changes, add_modules
 };
 
 static const Section exit_sections[] = {
-	add_exit_header, add_exit_thread, add_uptime, add_context, add_events, add_exit_stack, add_plus_hooks, add_plus_changes,
+	add_exit_header, add_thread_and_log, add_uptime, add_context, add_settings, add_events, add_exit_stack, add_plus_hooks,
+	add_plus_changes, add_modules
+};
+
+static const Section runtime_sections[] = {
+	add_runtime_header, add_thread_and_log, add_uptime, add_context, add_settings, add_events, add_plus_hooks, add_plus_changes,
 	add_modules
 };
 
@@ -425,4 +514,9 @@ size_t build_crash_report(Text *report, const CrashInput *input)
 size_t build_exit_report(Text *report, const CrashInput *input)
 {
 	return build_report(report, input, exit_sections, (int)(sizeof exit_sections / sizeof exit_sections[0]));
+}
+
+size_t build_runtime_report(Text *report, const CrashInput *input)
+{
+	return build_report(report, input, runtime_sections, (int)(sizeof runtime_sections / sizeof runtime_sections[0]));
 }

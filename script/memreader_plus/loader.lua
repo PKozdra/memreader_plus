@@ -29,6 +29,7 @@ end
 
 local memreader, load_error = load_dll()
 if not memreader then
+	_G.memreader_plus_load_error = load_error
 	log('not loaded: ' .. load_error)
 	return nil
 end

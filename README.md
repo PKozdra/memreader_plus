@@ -50,6 +50,7 @@ Every difference, with before and after values, is in [Differences from memreade
 - [Editing game files as they load](#editing-game-files-as-they-load)
 - [Understanding userdata](#understanding-userdata)
 - [Crash reports](#crash-reports)
+- [Runtime report](#runtime-report)
 - [Both mods installed](#both-mods-installed)
 - [API reference](#api-reference)
 - [Differences from memreader 1.2](#differences-from-memreader-12)
@@ -730,6 +731,8 @@ Near the end, the report gives the number of DLLs that other programs loaded int
 
 A short `Game context` block says what was going on: the mode (frontend, campaign or battle), the phase (main menu, loading a campaign, campaign, loading a battle, battle, or quitting after the player clicked Quit) and, in a campaign, the campaign, campaign type, whether it is multiplayer, difficulty, turn number, your faction, the human factions and the faction whose turn it is. In a battle it adds the battle type. A small script in memreader Plus's pack fills these in at safe moments, because the Lua state may be broken when the game crashes. In a campaign it runs on the first tick, at every new turn and at the start of every faction's turn, and in a battle when the battle scripts load. A turn number is the turn of the last update, so a crash in the middle of a round shows that round.
 
+The report also lists the MCT settings of the mods in your game, as they were the last time MCT loaded or you closed its panel after a change.
+
 A `Recent script events` block lists the last 32 different events the game sent to scripts, newest first, with how often each one came and how long before the crash it came last. The same script records them by wrapping `core:event_callback`, which adds about 0.06 to 0.34 µs to each event. When another mod replaces `core:event_callback` later, the script wraps the new one once the game has created its interface, at the first tick of a campaign and when a battle starts.
 
 Paths under your user profile show as `%USERPROFILE%`, and the folder of the Steam library the game is installed in shows as `<Steam library>`, whichever kind of slash the path uses. memreader Plus doesn't write your computer name, Steam account or IP address into the report.
@@ -746,6 +749,28 @@ Adds or changes one line of the report's `Game context` block. Without a value, 
 
 #### `note_crash_event(name: string)`
 Adds `name` to the report's `Recent script events` block, the way memreader Plus's own script records each game event. Your mod can use it to mark its own steps, for example right before it changes game data. A name is cut at 47 characters, and a value that is not a string is ignored.
+
+#### `set_crash_settings(text?: string): boolean`
+Sets the text of the report's MCT settings block and returns `true`. memreader Plus's own script calls it with the settings of every mod on MCT, so you only need it for a list of your own, and the next MCT refresh replaces your text. The text should hold one `[mod]` heading line and then one `  option = value` line for each setting. A text over 16384 bytes is cut after the last full line, and the line `... cut: the settings list reached its size limit` takes the place of what was left out. Control characters other than new lines become spaces. Without a string, or with an empty one, the block says that no settings are recorded. The report shows how many seconds ago the text was set.
+
+## Runtime report
+
+A runtime report shows what the game and your mods look like right now, without a crash. Use it when a mod misbehaves, the game freezes or memreader Plus does not start.
+
+With MCT installed, memreader Plus's MCT page has the button **Generate a runtime report**. Click it and memreader Plus writes `memreader_runtime_report_DDMMYY_HHMMSS.txt` into the game folder, next to `Warhammer3.exe` (Steam: Manage > Browse local files). The name includes the seconds, so a second report doesn't replace the first. A message in the game gives the file name, or the reason the file could not be written. The button works when **Enable better crash reporting** is off, because you asked for the report yourself.
+
+The report is plain text with the parts of a crash report that don't need a crash. It starts with the time and the line `written on request, nothing crashed`, then gives the thread that runs the scripts and the script log, how long the game has been running, memory, the game context and the recent script events. After those come the hooks, patches and memory writes that mods made through memreader Plus, the number of DLLs that other programs loaded into the game, the game version, the command line and the mod list in load order. Paths under your user profile show as `%USERPROFILE%` and the Steam library folder as `<Steam library>`, as in a crash report.
+
+It also lists the MCT settings of every enabled mod that has an MCT page: the mod's key and title, then each checkbox, slider, dropdown, radio and text option with its current value. Text values are cut at 80 characters. The list has room for about 16 KB, and a line says how many mods did not fit. memreader Plus's script updates the list when MCT loads and when you close the MCT panel after a change. A change you made in the panel and have not saved yet is not in it.
+
+If the scripts of memreader Plus fail to load its DLL, the button still works and writes a shorter report from the scripts, with `Lua only` in its first line. That report gives the reason the loader logged, the size of the DLL file in the game folder and whether it matches the copy in the pack, whether memreader Plus and the original memreader are loaded, the MCT settings and the last 60 lines of `lua_mod_log.txt` that mention memreader, with the same two path masks.
+
+When you report a problem, click the button while the problem is still there or right after it, because the report shows the game as it is when you click. Attach the file to your message, and attach the crash report too if the game crashed.
+
+Your own mod can ask for the same report with `write_runtime_report`. The MCT button calls the global function `memreader_plus_runtime_report()`, which also works when memreader Plus did not start. It returns `true` and the file name, or `false` and a message.
+
+#### `write_runtime_report(): string | nil, string`
+Writes a runtime report into the folder of the crash reports and returns its file name without the folder. If the report can't be written, it returns `nil` and a message: the folder is unknown, the report thread is busy or stopped, or the file could not be saved. It works when crash reports are off. The call waits up to 5 seconds for the report thread.
 
 ## Both mods installed
 

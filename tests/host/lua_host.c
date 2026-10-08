@@ -768,6 +768,21 @@ static void fault_move_fails(void)
 	fault_after_move_refusals(1000);
 }
 
+static DWORD WINAPI no_module_file_name(HMODULE module, LPSTR name, DWORD size)
+{
+	(void)module;
+	(void)name;
+	(void)size;
+	return 0;
+}
+
+static void fault_no_report_folder(void)
+{
+	void *original = NULL;
+
+	replace_plus_import("GetModuleFileNameA", (void *)no_module_file_name, &original);
+}
+
 static void write_move_calls(void)
 {
 	FILE *file;
@@ -802,6 +817,7 @@ static const struct {
 	{ "worker_dead", fault_worker_dead },
 	{ "move_retry", fault_move_retry },
 	{ "move_fails", fault_move_fails },
+	{ "no_report_folder", fault_no_report_folder },
 };
 
 static DWORD WINAPI fault_thread(LPVOID function)

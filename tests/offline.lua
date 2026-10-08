@@ -145,6 +145,147 @@ local function fill_crash_context(mr)
 	check(listeners.WorldStartRound ~= nil, 'the context script listens for every round')
 end
 
+local SETTINGS = table.concat({
+	'[alpha_mod] Alpha Mod',
+	'  enabled = true',
+	'  strength = 2.5',
+	'[beta_mod] Beta Mod',
+	'  mode = fast',
+	'  note = tab\tand\rreturn',
+	'[gamma_mod] Gamma Mod',
+	'  hours = 12',
+}, '\n')
+
+local function big_settings()
+	local lines = { '[big_mod] Big Mod' }
+	for i = 1, 2000 do
+		lines[#lines + 1] = ('  option_%04d = value'):format(i)
+	end
+	return table.concat(lines, '\n')
+end
+
+local function block_runtime_report_names()
+	local now = os.date('*t')
+	local day = ('%02d%02d%02d'):format(now.day, now.month, now.year % 100)
+	local start = now.hour * 3600 + now.min * 60 + now.sec
+	for second = start - 1, start + 3 do
+		local time = ('%02d%02d%02d'):format(math.floor(second / 3600), math.floor(second / 60) % 60, second % 60)
+		os.execute(('mkdir "memreader_runtime_report_%s_%s.txt" >nul 2>nul'):format(day, time))
+	end
+end
+
+local function set_report_settings(mr)
+	if SCENARIO == 'settings_none' then
+		mr.set_crash_settings(SETTINGS)
+		check(mr.set_crash_settings(nil) == true, 'set_crash_settings(nil) clears the snapshot')
+		mr.set_crash_settings(SETTINGS)
+		check(mr.set_crash_settings(5) == true, 'a value that is not a string clears the snapshot')
+	elseif SCENARIO == 'settings_cut' then
+		check(mr.set_crash_settings(big_settings()) == true, 'set_crash_settings takes a 40 KB snapshot')
+	else
+		check(mr.set_crash_settings(SETTINGS) == true, 'set_crash_settings returns true')
+	end
+end
+
+local function read_all(name)
+	local file = assert(io.open(name, 'rb'))
+	local text = file:read('*a')
+	file:close()
+	return text
+end
+
+local function stub_option(kind, value)
+	return {
+		get_type = function()
+			return kind
+		end,
+		get_finalized_setting = function()
+			return value
+		end,
+	}
+end
+
+local function failing_option(kind)
+	return {
+		get_type = function()
+			return kind
+		end,
+		get_finalized_setting = function()
+			error('getter failed', 0)
+		end,
+	}
+end
+
+local function stub_mod(title, options)
+	return {
+		get_title = function()
+			if title == nil then error('no title', 0) end
+			return title
+		end,
+		get_options = function()
+			if options == nil then error('no options', 0) end
+			return options
+		end,
+	}
+end
+
+local function install_mct(mods)
+	get_mct = function()
+		return {
+			get_mods = function()
+				return mods
+			end,
+		}
+	end
+end
+
+local function settings_mods()
+	return {
+		gamma_mod = stub_mod('Gamma Mod', { hours = stub_option('MCT.Option.Slider', 12) }),
+		alpha_mod = stub_mod('Alpha Mod', {
+			enabled = stub_option('MCT.Option.Checkbox', true),
+			strength = stub_option('MCT.Option.Slider', 2.5),
+			spacer = failing_option('MCT.Option.Dummy'),
+			button = failing_option('MCT.Option.Action'),
+		}),
+		beta_mod = stub_mod('Beta Mod', {
+			mode = stub_option('MCT.Option.Dropdown', 'fast'),
+			note = stub_option('MCT.Option.TextInput', 'tab\tand\rreturn'),
+		}),
+	}
+end
+
+local function installed_core(listeners)
+	core = {
+		add_listener = function(_, name, event, condition, callback, persistent)
+			listeners[#listeners + 1] = { name = name, event = event, condition = condition, callback = callback, persistent = persistent }
+			listeners[event] = callback
+		end,
+	}
+end
+
+local function many_options(count)
+	local options = {}
+	for i = 1, count do
+		options[('option_%03d'):format(i)] = stub_option('MCT.Option.Checkbox', 'x')
+	end
+	return options
+end
+
+local REPORT_NAME = '^memreader_runtime_report_%d%d%d%d%d%d_%d%d%d%d%d%d%.txt$'
+
+local function has(text, part)
+	return string.find(text, (string.gsub(part, '%W', '%%%0'))) ~= nil
+end
+
+local function count_lines(text, part)
+	local count = 0
+	for line in text:gmatch('[^\n]+') do
+		if has(line, part) then count = count + 1 end
+	end
+	return count
+end
+
 CHANGED = {
 	['uint8(bytes)'] = 'uint8:7',
 	['add(p,-16)'] = 'pointer:0000000000000000',
@@ -388,6 +529,8 @@ local function check_fixes(rows)
 end
 
 local OURS = PACK .. '/script/_lib/mod/memreader_plus.lua'
+local REPORT = PACK .. '/script/_lib/mod/memreader_plus_report.lua'
+local LOADER = PACK .. '/script/memreader_plus/loader.lua'
 local THEIRS = WORKSHOP_MR .. '/script/_lib/mod/memreader.lua'
 
 local function api(mr, label, small_only)
@@ -1184,6 +1327,9 @@ elseif
 	or SCENARIO == 'fault_report_fallback'
 	or SCENARIO == 'fault_report_clues'
 	or SCENARIO == 'exit_report_quiet'
+	or SCENARIO == 'runtime_report_then_crash'
+	or SCENARIO == 'settings_cut'
+	or SCENARIO == 'settings_none'
 	or HOST_FAULTS[SCENARIO]
 then
 	io.stdout:setvbuf('no')
@@ -1212,7 +1358,12 @@ then
 	if (SCENARIO == 'fault_report_off' or SCENARIO == 'exit_report_off') and PASS > 1 then mr.set_crash_reports(false) end
 	check(not pcall(mr.set_crash_context), 'set_crash_context needs a name')
 	if PASS > 1 then fill_crash_context(mr) end
+	if PASS > 1 then set_report_settings(mr) end
 	if PASS > 1 and SCENARIO == 'fault_report' then fill_code_patches(mr) end
+	if PASS > 1 and SCENARIO == 'runtime_report_then_crash' then
+		local name = mr.write_runtime_report()
+		check(type(name) == 'string' and exists(name), 'a runtime report is written before the crash: ' .. tostring(name))
+	end
 	if PASS == 1 then
 		NEXT_PASS = true
 	else
@@ -1275,6 +1426,30 @@ elseif SCENARIO == 'fault_report_stale' then
 	report_me()
 	print('did not crash')
 	os.exit(0)
+elseif SCENARIO:sub(1, 14) == 'runtime_report' then
+	io.stdout:setvbuf('no')
+	load_other_program_dll()
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	if SCENARIO == 'runtime_report_no_folder' and PASS == 1 then
+		test_fault('no_report_folder', false, mr.set_crash_context)
+		NEXT_PASS = true
+	else
+		fill_crash_context(mr)
+		set_report_settings(mr)
+		if SCENARIO == 'runtime_report_reports_off' then mr.set_crash_reports(false) end
+		if SCENARIO == 'runtime_report_write_fails' then block_runtime_report_names() end
+		local name, why = mr.write_runtime_report()
+		if SCENARIO == 'runtime_report_no_folder' or SCENARIO == 'runtime_report_write_fails' then
+			check(name == nil and type(why) == 'string' and why ~= '', 'write_runtime_report gives nil and a message: ' .. tostring(why))
+		else
+			check(
+				type(name) == 'string' and name:match('^memreader_runtime_report_%d%d%d%d%d%d_%d%d%d%d%d%d%.txt$') ~= nil,
+				'write_runtime_report returns the file name: ' .. tostring(name)
+			)
+			check(exists(name), 'the named file is in the report folder')
+		end
+	end
 elseif SCENARIO == 'bench' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus
@@ -2168,6 +2343,387 @@ elseif SCENARIO:sub(1, 9) == 'file_edit' then
 		core = nil
 		get_mct = nil
 	end
+elseif SCENARIO == 'report_snapshot' then
+	local logged = {}
+	ModLog = function(msg)
+		logged[#logged + 1] = msg
+		print('  log: ' .. msg)
+	end
+	local function log_count(part)
+		local count = 0
+		for _, line in ipairs(logged) do
+			if has(line, part) then count = count + 1 end
+		end
+		return count
+	end
+	local pushed = {}
+	local seen_by_native = nil
+	_G.memreader_plus = {
+		set_crash_settings = function(text)
+			pushed[#pushed + 1] = { text = text }
+			return true
+		end,
+		write_runtime_report = function()
+			seen_by_native = pushed[#pushed].text
+			return 'memreader_runtime_report_010203_040506.txt'
+		end,
+	}
+	local listeners = {}
+	installed_core(listeners)
+	local enabled_now = true
+	local enabled = stub_option('MCT.Option.Checkbox', true)
+	enabled.get_finalized_setting = function()
+		return enabled_now
+	end
+	install_mct({
+		alpha_mod = stub_mod('Alpha Mod', {
+			broken = failing_option('MCT.Option.Checkbox'),
+			dd = stub_option('MCT.Option.Dropdown', 'fast'),
+			enabled = enabled,
+			nothing = stub_option('MCT.Option.Checkbox', nil),
+			pad = failing_option('MCT.Option.Dummy'),
+			radio = stub_option('MCT.Option.RadioButton', 'second'),
+			run = failing_option('MCT.Option.Action'),
+			strength = stub_option('MCT.Option.Slider', 2.5),
+			tabled = stub_option('MCT.Option.Checkbox', { 1, 2 }),
+			tiny = stub_option('MCT.Option.Slider', 0.1),
+			words = stub_option('MCT.Option.TextInput', 'tab\tand\rreturn\nline'),
+		}),
+		beta_mod = stub_mod('Beta Mod', { long = stub_option('MCT.Option.TextInput', string.rep('x', 300)) }),
+		big_mod = stub_mod('Big Mod', many_options(400)),
+		gamma_mod = stub_mod(nil, { hours = stub_option('MCT.Option.Slider', 12) }),
+		zeta_mod = stub_mod('Zeta Mod', nil),
+	})
+	run_mod(REPORT)
+	check(type(_G.memreader_plus_runtime_report) == 'function', 'the report script defines memreader_plus_runtime_report')
+	check(#listeners == 2 and listeners[1].event == 'MctInitialized' and listeners[2].event == 'MctFinalized', 'two listeners, registered once')
+	check(listeners[1].persistent == true and listeners[2].persistent == true, 'both listeners are persistent')
+	check(#pushed == 0, 'nothing is pushed while the file loads')
+
+	local expected = {
+		'[alpha_mod] Alpha Mod',
+		'  dd = fast',
+		'  enabled = true',
+		'  radio = second',
+		'  strength = 2.5',
+		'  tiny = 0.1',
+		'  words = tab and return line',
+		'[beta_mod] Beta Mod',
+		'  long = ' .. string.rep('x', 80),
+		'[big_mod] Big Mod',
+	}
+	for i = 1, 352 do
+		expected[#expected + 1] = ('  option_%03d = x'):format(i)
+	end
+	expected[#expected + 1] = '  ... 48 more options'
+	expected[#expected + 1] = '[gamma_mod]'
+	expected[#expected + 1] = '  hours = 12'
+	expected[#expected + 1] = '[zeta_mod] (its settings could not be read)'
+	local expected_text = table.concat(expected, '\n')
+
+	listeners.MctInitialized()
+	local text = pushed[#pushed].text
+	if text ~= expected_text then
+		local i = 1
+		while text:sub(i, i) == expected_text:sub(i, i) do
+			i = i + 1
+		end
+		print(('  first difference at byte %d: got %q, expected %q'):format(i, text:sub(i, i + 40), expected_text:sub(i, i + 40)))
+	end
+	check(text == expected_text, 'the snapshot text matches exactly (' .. #text .. ' bytes)')
+	check(#text <= 16384, 'the snapshot fits the native limit')
+	listeners.MctFinalized()
+	check(#pushed == 2 and pushed[2].text == expected_text, 'MctFinalized pushes the same text again')
+	check(log_count('cannot read option broken of mod alpha_mod: getter failed') == 1, 'the failing option is logged once, by name, in two refreshes')
+	check(log_count('cannot read the options of mod zeta_mod: no options') == 1, 'the failing mod is logged once, by name')
+	check(
+		log_count('option pad') + log_count('option run') + log_count('option nothing') + log_count('option tabled') == 0,
+		'dummy, action, nil and table options are never read as errors'
+	)
+	check(logged[1]:sub(1, 22) == '[memreader_plus_report', 'log lines carry the file tag')
+
+	enabled_now = false
+	local done, name = _G.memreader_plus_runtime_report()
+	check(done == true and name == 'memreader_runtime_report_010203_040506.txt', 'the report function returns true and the native file name')
+	check(seen_by_native ~= nil and has(seen_by_native, '  enabled = false'), 'the snapshot is refreshed right before the native report is requested')
+	check(log_count('runtime report written: memreader_runtime_report_010203_040506.txt') == 1, 'the result is logged')
+	_G.memreader_plus.write_runtime_report = function()
+		return nil, 'no folder'
+	end
+	done, name = _G.memreader_plus_runtime_report()
+	check(done == false and name == 'no folder', 'a native failure comes back as false and its message')
+	check(log_count('runtime report failed: no folder') == 1, 'the failure is logged')
+	_G.memreader_plus.write_runtime_report = function()
+		error('exploded', 0)
+	end
+	done, name = _G.memreader_plus_runtime_report()
+	check(done == false and name == 'exploded', 'an error inside the native call comes back as false and its message')
+
+	local big = {}
+	for _, key in ipairs({ 'big_a', 'big_b', 'big_c', 'big_d' }) do
+		big[key] = stub_mod(key:sub(-1):upper(), many_options(400))
+	end
+	install_mct(big)
+	listeners.MctFinalized()
+	text = pushed[#pushed].text
+	check(text:match('%.%.%. 2 more mods$') ~= nil, 'mods that do not fit are replaced by a "more mods" line')
+	check(has(text, '[big_a] A') and has(text, '[big_b] B') and not has(text, '[big_c]'), 'whole mods are kept or left out')
+	check(#text <= 16384, 'four 400-option mods still fit the native limit: ' .. #text)
+
+	get_mct = nil
+	listeners.MctFinalized()
+	check(#pushed > 0 and pushed[#pushed].text == nil, 'without MCT the snapshot is cleared')
+	_G.memreader_plus = nil
+	check(pcall(listeners.MctFinalized), 'without the DLL the listener does nothing and raises nothing')
+
+	local calls = {}
+	local function recorder()
+		return setmetatable({}, {
+			__index = function(_, name)
+				return function(_, ...)
+					calls[name] = { ... }
+				end
+			end,
+		})
+	end
+	local action = {}
+	local mod = recorder()
+	mod.add_new_option = recorder
+	mod.add_new_action = function(_, key, text, callback)
+		action.key, action.text, action.callback = key, text, callback
+		return recorder()
+	end
+	get_mct = function()
+		return {
+			register_mod = function()
+				return mod
+			end,
+		}
+	end
+	local popups = {}
+	GLib = {
+		TriggerPopup = function(key, text, two_buttons)
+			popups[#popups + 1] = { key = key, text = text, two_buttons = two_buttons }
+		end,
+	}
+	_G.memreader_plus_runtime_report = function()
+		return true, 'memreader_runtime_report_010203_040506.txt'
+	end
+	run_mod(PACK .. '/script/mct/settings/memreader_plus.lua')
+	check(
+		action.key == 'runtime_report' and action.text == ' ',
+		'the settings file adds the report button with a blank row label, so MCT gives the whole row to the button'
+	)
+	check(
+		calls.set_button_text[1] == 'Generate a runtime report' and calls.set_is_global[1] == true,
+		'the button carries the words, global so MP clients can use it'
+	)
+	check(has(calls.set_tooltip_text[1], 'memreader_runtime_report_<date>_<time>.txt'), 'the tooltip stays on the row')
+	action.callback()
+	check(#popups == 1 and popups[1].two_buttons == false and popups[1].key == 'memreader_plus_runtime_report', 'a click shows one popup with a single button')
+	check(
+		has(popups[1].text, 'saved as memreader_runtime_report_010203_040506.txt') and has(popups[1].text, 'next to Warhammer3.exe'),
+		'it names the file and the folder'
+	)
+	_G.memreader_plus_runtime_report = function()
+		return false, 'no folder'
+	end
+	action.callback()
+	check(has(popups[2].text, 'could not be written: no folder'), 'a failure is told to the player')
+	_G.memreader_plus_runtime_report = function()
+		error('exploded', 0)
+	end
+	action.callback()
+	check(has(popups[3].text, 'could not be written: exploded'), 'an error in the report function is told to the player')
+	GLib = nil
+	check(pcall(action.callback) and log_count('cannot show the runtime report result') == 1, 'without the popup helper the click only logs')
+elseif SCENARIO == 'report_native' then
+	io.stdout:setvbuf('no')
+	load_other_program_dll()
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	fill_crash_context(mr)
+	installed_core({})
+	install_mct(settings_mods())
+	run_mod(REPORT)
+	local done, name = _G.memreader_plus_runtime_report()
+	check(done == true and type(name) == 'string' and name:match(REPORT_NAME) ~= nil, 'the report goes through the DLL: ' .. tostring(name))
+	check(exists(name), 'the named file exists')
+	local text = read_all(name)
+	check(has(text, '[beta_mod] Beta Mod') and has(text, '  note = tab and return'), 'it lists the settings built by the Lua snapshot')
+	check(not has(text, 'Lua only'), 'it is the native report')
+elseif SCENARIO == 'report_lua_only' then
+	local logged = {}
+	ModLog = function(msg)
+		logged[#logged + 1] = msg
+		print('  log: ' .. msg)
+	end
+	run_mod(OURS)
+	_G.memreader_plus = nil
+	_G.memreader = nil
+	_G.memreader_plus_load_error = 'cannot write C:\\Users\\Alice\\twwh3-memreader_plus.dll: Permission denied'
+	installed_core({})
+	local mods = settings_mods()
+	mods.delta_mod = stub_mod('Delta Mod', { folder = stub_option('MCT.Option.TextInput', 'C:\\Users\\Alice\\Documents\\notes') })
+	install_mct(mods)
+	run_mod(REPORT)
+
+	local lines = {}
+	for i = 1, 75 do
+		lines[#lines + 1] = ('[memreader_plus] line %03d C:\\Users\\Alice\\AppData\\Roaming'):format(i)
+		if i % 10 == 0 then lines[#lines + 1] = '[other_mod] noise ' .. i .. ' C:\\Users\\Bob\\secret' end
+	end
+	lines[#lines + 1] = '[memreader_plus] loaded from D:\\Program Files (x86)\\Steam\\steamapps\\common\\Total War WARHAMMER III\\data\\memreader_plus.pack'
+	lines[#lines + 1] = 'MEMREADER caps c:/Games/SteamLibrary/SteamApps/common/x and C:/USERS/Alice/y'
+	lines[#lines + 1] = '[other_mod] unrelated C:\\Users\\Bob\\other'
+	lines[#lines + 1] = '[memreader_plus] ' .. string.rep('z', 400)
+	local log_file = assert(io.open('lua_mod_log.txt', 'wb'))
+	log_file:write(table.concat(lines, '\r\n'), '\r\n')
+	log_file:close()
+
+	local function tmp_files()
+		return #io.popen('dir /b memreader_runtime_report_*.tmp 2>nul'):read('*a')
+	end
+	local done, name = _G.memreader_plus_runtime_report()
+	check(done == true and type(name) == 'string' and name:match(REPORT_NAME) ~= nil, 'the Lua-only report is written: ' .. tostring(name))
+	check(tmp_files() == 0, 'no temporary file is left')
+	local text = read_all(name)
+	local needles = {
+		'memreader Plus runtime report (Lua only: the DLL is not loaded)\n',
+		', written on request, nothing crashed\n',
+		'Loader:\n',
+		'  load error: cannot write %USERPROFILE%\\twwh3-memreader_plus.dll: Permission denied\n',
+		'  memreader_plus: not loaded\n',
+		'  old memreader: not loaded\n',
+		'DLL file the loader writes:\n',
+		'  twwh3-memreader_plus.dll: ',
+		' bytes, the same bytes as the copy inside the pack\n',
+		'MCT settings of the mods in this game:\n',
+		'[alpha_mod] Alpha Mod\n  enabled = true\n  strength = 2.5\n',
+		'[beta_mod] Beta Mod\n  mode = fast\n  note = tab and return\n',
+		'[delta_mod] Delta Mod\n  folder = %USERPROFILE%\\Documents\\notes\n',
+		'Lines of lua_mod_log.txt that mention memreader (newest 60 at most):\n',
+		'  [memreader_plus] line 075 %USERPROFILE%\\AppData\\Roaming\n',
+		'  [memreader_plus] line 019 %USERPROFILE%\\AppData\\Roaming\n',
+		'  [memreader_plus] loaded from <Steam library>\\steamapps\\common\\Total War WARHAMMER III\\data\\memreader_plus.pack\n',
+		'  MEMREADER caps <Steam library>/SteamApps/common/x and %USERPROFILE%/y\n',
+	}
+	for _, needle in ipairs(needles) do
+		check(has(text, needle), 'Lua-only report holds: ' .. needle:gsub('\n', '|'))
+	end
+	check(text:match('\n%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d, written') ~= nil, 'it carries the date and time')
+	check(not has(text, 'line 018'), 'only the newest 60 matching lines are kept')
+	check(not has(text, 'noise') and not has(text, 'unrelated'), 'lines without memreader are left out')
+	check(not has(text, 'Alice') and not has(text, 'Bob'), 'no user name is left')
+	check(not has(text, 'Program Files') and not has(text, 'SteamLibrary') and not has(text, 'C:\\'), 'no Steam library path is left')
+	local log_part = text:match('newest 60 at most%):\n(.*)$')
+	check(select(2, log_part:gsub('\n', '\n')) == 60, 'exactly 60 log lines')
+	local longest = 0
+	for line in text:gmatch('[^\n]+') do
+		longest = math.max(longest, #line)
+	end
+	check(longest <= 303, 'long log lines are cut: ' .. longest)
+
+	_G.memreader_plus = { plus_version = '9.9.9' }
+	_G.memreader = {}
+	done, name = _G.memreader_plus_runtime_report()
+	text = read_all(name)
+	check(has(text, '(Lua only: this memreader Plus build cannot write the full report)'), 'a build without the native report says so in the title')
+	check(has(text, '  memreader_plus: loaded, version 9.9.9\n') and has(text, '  old memreader: loaded\n'), 'loaded modules are listed')
+
+	_G.memreader_plus = nil
+	local real_open = io.open
+	io.open = function(path, mode)
+		if mode == 'wb' and has(path, 'memreader_runtime_report_') then return nil, path .. ': Permission denied' end
+		return real_open(path, mode)
+	end
+	done, name = _G.memreader_plus_runtime_report()
+	io.open = real_open
+	check(done == false and has(name, 'Permission denied'), 'a file that cannot be opened gives false and the message: ' .. tostring(name))
+	check(tmp_files() == 0, 'and leaves no temporary file')
+	check(has(logged[#logged], 'runtime report failed: '), 'the failure is logged')
+
+	local real_rename = os.rename
+	os.rename = function()
+		return nil, 'denied'
+	end
+	done, name = _G.memreader_plus_runtime_report()
+	os.rename = real_rename
+	check(done == true and exists(name), 'when the rename fails the final file is written directly')
+	check(tmp_files() == 0, 'and the temporary file is removed')
+
+	os.execute('del /q memreader_runtime_report_*.txt >nul 2>nul')
+	block_runtime_report_names()
+	done, name = _G.memreader_plus_runtime_report()
+	check(done == false and type(name) == 'string' and name ~= '', 'a folder that refuses the final name gives false and a message: ' .. tostring(name))
+	check(tmp_files() == 0, 'and leaves no temporary file')
+elseif SCENARIO == 'report_loader' then
+	local logged = {}
+	ModLog = function(msg)
+		logged[#logged + 1] = msg
+		print('  log: ' .. msg)
+	end
+	local bin = nil
+	local bin_missing = false
+	local plain_loadfile = loadfile
+	loadfile = function(path)
+		if path ~= '/script/memreader_plus/bin' then return plain_loadfile(path) end
+		if bin_missing then return nil, 'no such file' end
+		return function()
+			return bin
+		end
+	end
+	local function run_loader()
+		_G.memreader_plus_load_error = nil
+		return assert(real_loadfile(LOADER))(ModLog)
+	end
+
+	bin = { module = 'missing_folder/twwh3-memreader_plus', data = 'x' }
+	check(run_loader() == nil and _G.memreader_plus == nil, 'a DLL that cannot be written leaves Plus unloaded')
+	check(
+		_G.memreader_plus_load_error:sub(1, 52) == 'cannot write missing_folder/twwh3-memreader_plus.dll',
+		'and records why: ' .. tostring(_G.memreader_plus_load_error)
+	)
+	check(has(logged[#logged], 'not loaded: ' .. _G.memreader_plus_load_error), 'the recorded reason is the logged one')
+	bin = { module = 'junk_module', data = 'not a dll' }
+	check(run_loader() == nil, 'a file that is no DLL leaves Plus unloaded')
+	check(_G.memreader_plus_load_error:sub(1, 28) == 'require junk_module failed: ', 'and records why: ' .. tostring(_G.memreader_plus_load_error))
+	bin_missing = true
+	check(
+		run_loader() == nil and _G.memreader_plus_load_error == 'bin.lua missing: no such file',
+		'a missing bin.lua records why: ' .. tostring(_G.memreader_plus_load_error)
+	)
+
+	installed_core({})
+	install_mct(settings_mods())
+	run_mod(REPORT)
+	local function report_text()
+		local done, name = _G.memreader_plus_runtime_report()
+		check(done == true, 'the Lua-only report is written: ' .. tostring(name))
+		return read_all(name)
+	end
+	local text = report_text()
+	check(has(text, '  load error: bin.lua missing: no such file\n'), 'the report shows the loader error')
+	check(
+		has(text, 'DLL file the loader writes:\n  could not be read: bin.lua missing: no such file\n'),
+		'a missing bin.lua is a failed section, not a failed report'
+	)
+	check(has(text, '[alpha_mod] Alpha Mod\n'), 'the other sections still print')
+
+	bin_missing = false
+	run_loader()
+	text = report_text()
+	check(has(text, '  load error: require junk_module failed: '), 'the report shows the require error')
+	check(has(text, '  junk_module.dll: 9 bytes, expected 9 bytes, the same bytes as the copy inside the pack\n'), 'the DLL on disk equals the packed copy')
+	local junk = assert(io.open('junk_module.dll', 'wb'))
+	junk:write('changed')
+	junk:close()
+	check(
+		has(report_text(), '  junk_module.dll: 7 bytes, expected 9 bytes, different bytes than the copy inside the pack\n'),
+		'a changed DLL is reported with both sizes'
+	)
+	bin = { module = 'absent_module', data = 'x' }
+	check(has(report_text(), '  absent_module.dll: not found in the game folder\n'), 'a missing DLL is reported')
 elseif SCENARIO == 'cpecific_bigread' then
 	io.stdout:setvbuf('no')
 	run_mod(THEIRS)

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(memreader_plus VERSION 0.8.2 LANGUAGES C ASM_MASM)
+project(memreader_plus VERSION 0.9.0 LANGUAGES C ASM_MASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

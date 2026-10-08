@@ -23,12 +23,15 @@ typedef void (*GameExit)(int code, int cleanup, int return_mode);
 typedef void (NTAPI *ExitFunction)(LONG code);
 typedef BOOL (WINAPI *TerminateFunction)(HANDLE process, UINT code);
 
+typedef enum { REPORT_FAULT, REPORT_EXIT, REPORT_RUNTIME } ReportKind;
+
 typedef struct {
 	EXCEPTION_POINTERS *info;
 	DWORD thread;
 	BOOL confirmed;
 	DWORD exit_code;
 	const char *exit_call;
+	ReportKind kind;
 } PendingReport;
 
 extern IMAGE_DOS_HEADER __ImageBase;
@@ -37,6 +40,7 @@ static const char watch_key = 0;
 static const char script_log_prefix[] = "script_log_";
 static const char script_logs[] = "script_log_*.txt";
 static const char report_format[] = "memreader_crash_report_%s.txt";
+static const char runtime_format[] = "memreader_runtime_report_%02d%02d%02d_%02d%02d%02d.txt";
 static const char temporary_reports[] = "memreader_crash_report_*.tmp";
 static const char game_handler_pattern[] =
 	"48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? B8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 2B E0 45 33 E4 "
@@ -60,6 +64,8 @@ static FILETIME fault_time;
 static char script_log[MAX_PATH];
 static char report_path[MAX_PATH + sizeof report_format + STAMP_LENGTH];
 static char written_path[sizeof report_path + 16];
+static char runtime_path[sizeof written_path];
+static char runtime_written[sizeof written_path];
 static lua_State *watched;
 static DWORD script_thread;
 static HANDLE script_thread_handle;
@@ -117,30 +123,30 @@ static BOOL write_file(const char *path, size_t header)
 	return TRUE;
 }
 
-static BOOL move_into_place(const char *temporary)
+static BOOL move_into_place(const char *temporary, const char *path)
 {
 	int i;
 
 	for (i = 0; i < MOVE_TRIES; i++) {
-		if (MoveFileExA(temporary, report_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		if (MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
 			return TRUE;
 		Sleep(MOVE_RETRY_MS);
 	}
 	return FALSE;
 }
 
-static void write_report(size_t header)
+static void write_report(const char *path, char *written, size_t header)
 {
 	char temporary[sizeof written_path];
 
-	_snprintf_s(temporary, sizeof temporary, _TRUNCATE, "%s.%lu.tmp", report_path, GetCurrentThreadId());
+	_snprintf_s(temporary, sizeof temporary, _TRUNCATE, "%s.%lu.tmp", path, GetCurrentThreadId());
 	if (!write_file(temporary, header))
 		return;
-	if (move_into_place(temporary) || write_file(report_path, header)) {
+	if (move_into_place(temporary, path) || write_file(path, header)) {
 		DeleteFileA(temporary);
-		strcpy_s(written_path, sizeof written_path, report_path);
+		strcpy_s(written, sizeof written_path, path);
 	} else {
-		strcpy_s(written_path, sizeof written_path, temporary);
+		strcpy_s(written, sizeof written_path, temporary);
 	}
 }
 
@@ -164,12 +170,12 @@ static void make_crash_report(CrashInput *input)
 	}
 	header = build_crash_report(&report, input);
 	resume_script_thread();
-	write_report(header);
+	write_report(report_path, written_path, header);
 }
 
 static void make_report(void)
 {
-	CrashInput input = { pending.info, pending.thread, script_thread, NULL, pending.exit_call ? NULL : watched, pending.confirmed, script_log };
+	CrashInput input = { pending.info, pending.thread, script_thread, NULL, pending.kind == REPORT_EXIT ? NULL : watched, pending.confirmed, script_log };
 	SYSTEMTIME now;
 
 	GetLocalTime(&now);
@@ -180,10 +186,16 @@ static void make_report(void)
 	input.allocator_count = allocator_count;
 	input.exit_code = pending.exit_code;
 	input.exit_call = pending.exit_call;
-	if (pending.exit_call)
-		write_report(build_exit_report(&report, &input));
-	else
+	switch (pending.kind) {
+	case REPORT_EXIT:
+		write_report(report_path, written_path, build_exit_report(&report, &input));
+		break;
+	case REPORT_RUNTIME:
+		write_report(runtime_path, runtime_written, build_runtime_report(&report, &input));
+		break;
+	default:
 		make_crash_report(&input);
+	}
 }
 
 static void warm_up(void)
@@ -228,10 +240,10 @@ static BOOL worker_done(void)
 	return WaitForSingleObject(done_event, REPORT_WAIT_MS) == WAIT_OBJECT_0;
 }
 
-static void make_report_on_worker(void)
+static void make_report_on_worker(const PendingReport *job)
 {
 	SetEvent(wake_event);
-	if (worker_done())
+	if (worker_done() || job->kind == REPORT_RUNTIME)
 		return;
 	worker_late = TRUE;
 	if (resume_script_thread() && worker_done())
@@ -253,15 +265,17 @@ static void copy_job(const PendingReport *job)
 
 static BOOL make_report_now(const PendingReport *job)
 {
+	char *written = job->kind == REPORT_RUNTIME ? runtime_written : written_path;
+
 	if (worker && !worker_ready())
 		return FALSE;
-	written_path[0] = '\0';
+	written[0] = '\0';
 	copy_job(job);
 	if (worker)
-		make_report_on_worker();
+		make_report_on_worker(job);
 	else
 		make_report();
-	return written_path[0] != '\0';
+	return written[0] != '\0';
 }
 
 static void wait_for_other_report(LONG me)
@@ -273,12 +287,19 @@ static void wait_for_other_report(LONG me)
 		Sleep(POLL_MS);
 }
 
+static BOOL may_report(const PendingReport *job)
+{
+	if (!report_path[0])
+		return FALSE;
+	return job->kind == REPORT_RUNTIME || (enabled && !(job->confirmed && written_path[0]));
+}
+
 static BOOL run_report(const PendingReport *job)
 {
 	LONG me = (LONG)job->thread;
 	BOOL wrote;
 
-	if (!enabled || !report_path[0] || (job->confirmed && written_path[0]))
+	if (!may_report(job))
 		return FALSE;
 	if (InterlockedCompareExchange(&reporting_thread, me, 0)) {
 		wait_for_other_report(me);
@@ -291,7 +312,7 @@ static BOOL run_report(const PendingReport *job)
 
 static BOOL report_fault(EXCEPTION_POINTERS *info, BOOL confirmed)
 {
-	PendingReport job = { info, GetCurrentThreadId(), confirmed, 0, NULL };
+	PendingReport job = { info, GetCurrentThreadId(), confirmed, 0, NULL, REPORT_FAULT };
 
 	return run_report(&job);
 }
@@ -310,13 +331,23 @@ static void report_exit(DWORD code, const char *call)
 {
 	CONTEXT context;
 	EXCEPTION_POINTERS info = { NULL, &context };
-	PendingReport job = { &info, GetCurrentThreadId(), TRUE, code, call };
+	PendingReport job = { &info, GetCurrentThreadId(), TRUE, code, call, REPORT_EXIT };
 
 	if (!code)
 		return;
 	RtlCaptureContext(&context);
 	leave_own_frames(&context);
 	run_report(&job);
+}
+
+static BOOL report_runtime(void)
+{
+	CONTEXT context;
+	EXCEPTION_POINTERS info = { NULL, &context };
+	PendingReport job = { &info, GetCurrentThreadId(), FALSE, 0, NULL, REPORT_RUNTIME };
+
+	RtlCaptureContext(&context);
+	return run_report(&job);
 }
 
 static void on_game_exit(int code, int cleanup, int return_mode)
@@ -460,13 +491,14 @@ static BOOL find_report_path(void)
 	DWORD length = GetModuleFileNameA((HMODULE)&__ImageBase, report_path, MAX_PATH);
 	FILETIME started = process_start();
 	char stamp[STAMP_LENGTH + 1];
-	char *name;
+	char *name = NULL;
 
-	if (length == 0 || length >= MAX_PATH)
+	if (length > 0 && length < MAX_PATH)
+		name = strrchr(report_path, '\\');
+	if (!name) {
+		report_path[0] = '\0';
 		return FALSE;
-	name = strrchr(report_path, '\\');
-	if (!name)
-		return FALSE;
+	}
 	name++;
 	script_log[0] = '\0';
 	if (script_log_stamp(name, started, stamp))
@@ -630,9 +662,66 @@ static int l_set_crash_reports(lua_State *L)
 	return 1;
 }
 
+static int l_set_crash_settings(lua_State *L)
+{
+	size_t length = 0;
+	const char *text = lua_type(L, 1) == LUA_TSTRING ? lua_tolstring(L, 1, &length) : NULL;
+
+	set_crash_settings(text, length);
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+static const char *runtime_name(void)
+{
+	char *name;
+	SYSTEMTIME now;
+
+	strcpy_s(runtime_path, sizeof runtime_path, report_path);
+	name = strrchr(runtime_path, '\\') + 1;
+	GetLocalTime(&now);
+	_snprintf_s(name, sizeof runtime_path - (size_t)(name - runtime_path), _TRUNCATE, runtime_format, now.wDay, now.wMonth,
+		now.wYear % 100, now.wHour, now.wMinute, now.wSecond);
+	return name;
+}
+
+static const char *save_runtime_report(void)
+{
+	const char *name = runtime_name();
+
+	if (!report_runtime())
+		return NULL;
+	if (strcmp(runtime_written, runtime_path) == 0)
+		return name;
+	DeleteFileA(runtime_written);
+	return NULL;
+}
+
+static int fail_runtime_report(lua_State *L, const char *message)
+{
+	lua_pushnil(L);
+	lua_pushstring(L, message);
+	return 2;
+}
+
+static int l_write_runtime_report(lua_State *L)
+{
+	const char *name;
+
+	if (!report_path[0])
+		return fail_runtime_report(L, "memreader Plus found no folder to write the report in");
+	name = save_runtime_report();
+	if (!name)
+		return fail_runtime_report(L, "the report could not be written: the report thread is busy or stopped, or the file could not be saved");
+	lua_pushstring(L, name);
+	return 1;
+}
+
 const luaL_Reg crash_functions[] = {
 	{ "set_crash_reports", l_set_crash_reports },
 	{ "set_crash_context", l_set_crash_context },
+	{ "set_crash_settings", l_set_crash_settings },
+	{ "write_runtime_report", l_write_runtime_report },
 	{ "note_crash_event", l_note_crash_event },
 	{ NULL, NULL }
 };
