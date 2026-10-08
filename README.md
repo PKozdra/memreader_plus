@@ -712,6 +712,10 @@ The same game object always gives the same userdata while it exists, so `==` wor
 
 When the game crashes, memreader Plus writes `memreader_crash_report_DDMMYY_HHMM.txt` next to `Warhammer3.exe`. It writes the report from inside the game's own crash handler, so a crash on any thread gets one, and a fault the game recovers from writes nothing. The report is plain text, usually 8 to 50 KB, small enough for pastebin. If a game patch moves the crash handler so that memreader Plus can't find it, memreader Plus writes the report as soon as a fatal fault (access violation, illegal instruction, integer division by zero, stack overflow) happens on the script thread, and the report says so and why.
 
+memreader Plus writes the report under a temporary name ending in `.tmp` and renames it when it is complete, so a report file is never cut off halfway. If the game closes while the report is being written, you find no report, only the `.tmp` file, which you can delete. Of two threads that crash at the same moment, the second one waits until the report of the first is written. After 5 seconds without a report, the crashing thread writes it itself.
+
+memreader Plus also writes a report when the game ends itself with an error code instead of crashing, for example when a script calls `os.exit(3)`. That report starts with `the game ended itself with exit code 3 (0x00000003) through exit` and shows the native stack of the thread that ended the game, the game context, the recent script events, what mods did through memreader Plus and the mod list. It has no Lua stack and no registers. A normal quit ends with exit code 0 and writes nothing. A crash that already has a report doesn't get a second one when the game closes after it. Some errors end the game before memreader Plus can write anything, such as a fast fail, which is how `abort()` and a damaged Windows heap end a program, and they get no report.
+
 The first lines give the time, the exception and where it happened, as `Warhammer3.exe+offset` with the start of the function around it. A C++ exception also gives its type, and an access violation gives the address that was read or written. Then the report says which thread crashed, how long the game had been running, and how much memory the game used and the PC had left.
 
 The Lua stack comes next, innermost first, with the source file, line and function of each frame and the string, number and boolean locals of the first 12 frames. A C function's frame shows its address in the exe, which tells you which game binding the script was calling. An event handler's `eventname` is one of the locals. If the stack says `no Lua function was running`, the fault is in the game's own code. For a crash on another thread, memreader Plus pauses the script thread for a moment and shows where it was.
@@ -779,7 +783,7 @@ The address of `Warhammer3.exe` in memory: `0x0000000140000000`. The game always
 #### `version: float`
 `1.2`, the memreader API version. memreader Plus keeps it at 1.2 on purpose (see [Both mods installed](#both-mods-installed)).
 #### `plus_version: string`
-The version of memreader Plus, for example `'0.8.0'`.
+The version of memreader Plus, for example `'0.8.2'`.
 
 ### Addition +
 #### `add(float, float): float`

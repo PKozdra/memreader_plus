@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <intrin.h>
+#include <tlhelp32.h>
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
@@ -501,6 +502,335 @@ static int l_test_stack_overflow(lua_State *L)
 	return 1;
 }
 
+static bool second_fault;
+
+static void fault_av(void)
+{
+	read_null();
+}
+
+static void fault_overflow(void)
+{
+	overflow(0);
+}
+
+static void fault_fastfail(void)
+{
+	__fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+
+static void fault_abort(void)
+{
+	abort();
+}
+
+static void fault_cpp(void)
+{
+	RaiseException(0xE06D7363, EXCEPTION_NONCONTINUABLE, 0, NULL);
+}
+
+static void fault_heap_double_free(void)
+{
+	HANDLE heap = GetProcessHeap();
+	void *block = HeapAlloc(heap, 0, 512);
+
+	HeapFree(heap, 0, block);
+	HeapFree(heap, 0, block);
+}
+
+static void fault_heap_overrun(void)
+{
+	HANDLE heap = GetProcessHeap();
+	char *first = HeapAlloc(heap, 0, 512);
+	char *second = HeapAlloc(heap, 0, 512);
+
+	memset(first, 0xAA, 512 + 64);
+	HeapFree(heap, 0, second);
+	HeapFree(heap, 0, first);
+}
+
+static void fault_exit_process(void)
+{
+	ExitProcess(7);
+}
+
+static void fault_terminate_process(void)
+{
+	TerminateProcess(GetCurrentProcess(), 8);
+}
+
+static void fault_crt_exit(void)
+{
+	exit(9);
+}
+
+static INT32 (*volatile divider)(INT32, INT32) = divide;
+
+static void fault_divide(void)
+{
+	divider(1, 0);
+}
+
+static void fault_ud2(void)
+{
+	__ud2();
+}
+
+static void fault_second(void)
+{
+	second_fault = true;
+	fault_divide();
+}
+
+static void fault_worker_stuck(void)
+{
+	THREADENTRY32 entry = { sizeof entry };
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	DWORD self = GetCurrentThreadId();
+	HANDLE thread;
+
+	for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == self)
+			continue;
+		thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
+		if (thread)
+			SuspendThread(thread);
+	}
+	CloseHandle(snapshot);
+	read_null();
+}
+
+static HANDLE start_both;
+
+static DWORD WINAPI wait_then_fault(LPVOID unused)
+{
+	(void)unused;
+	WaitForSingleObject(start_both, INFINITE);
+	return (DWORD)read_null();
+}
+
+static void fault_two_threads(void)
+{
+	HANDLE threads[2];
+
+	start_both = CreateEventW(NULL, TRUE, FALSE, NULL);
+	threads[0] = CreateThread(NULL, 0, wait_then_fault, NULL, 0, NULL);
+	threads[1] = CreateThread(NULL, 0, wait_then_fault, NULL, 0, NULL);
+	Sleep(200);
+	SetEvent(start_both);
+	WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+}
+
+static volatile LONG spin_count;
+
+static PRUNTIME_FUNCTION CALLBACK stall_lookup(DWORD64 pc, PVOID forever)
+{
+	LONG seen = spin_count;
+
+	(void)pc;
+	if (forever)
+		Sleep(INFINITE);
+	while (spin_count == seen)
+		Sleep(10);
+	return NULL;
+}
+
+static DWORD WINAPI fault_soon(LPVOID unused)
+{
+	(void)unused;
+	Sleep(200);
+	return (DWORD)read_null();
+}
+
+static void spin_while_another_thread_faults(bool forever)
+{
+	static const BYTE spin[] = { 0xF0, 0xFF, 0x01, 0xF3, 0x90, 0xEB, 0xF9 };
+	BYTE *code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+	memcpy(code, spin, sizeof spin);
+	RtlInstallFunctionTableCallback((DWORD64)code | 3, (DWORD64)code, 4096, stall_lookup, forever ? (PVOID)1 : NULL, NULL);
+	CloseHandle(CreateThread(NULL, 0, fault_soon, NULL, 0, NULL));
+	((void (*)(volatile LONG *))code)(&spin_count);
+}
+
+static void fault_worker_waits(void)
+{
+	spin_while_another_thread_faults(false);
+}
+
+static void fault_worker_blocked(void)
+{
+	spin_while_another_thread_faults(true);
+}
+
+static ULONG_PTR plus_start;
+static ULONG_PTR plus_end;
+
+static void find_plus(lua_State *L, int index)
+{
+	lua_CFunction function = lua_tocfunction(L, index);
+	HMODULE module;
+	IMAGE_NT_HEADERS *headers;
+
+	if (!function || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCWSTR)(void *)function, &module))
+		luaL_error(L, "test_fault needs a function of memreader Plus");
+	headers = (IMAGE_NT_HEADERS *)((BYTE *)module + ((IMAGE_DOS_HEADER *)module)->e_lfanew);
+	plus_start = (ULONG_PTR)module;
+	plus_end = plus_start + headers->OptionalHeader.SizeOfImage;
+}
+
+typedef LONG (NTAPI *QueryThread)(HANDLE thread, int what, PVOID out, ULONG size, PULONG used);
+
+static HANDLE open_plus_worker(void)
+{
+	QueryThread query = (QueryThread)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+	THREADENTRY32 entry = { sizeof entry };
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	HANDLE found = NULL;
+	ULONG_PTR start;
+	HANDLE thread;
+
+	for (BOOL more = Thread32First(snapshot, &entry); more && !found; more = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != GetCurrentProcessId())
+			continue;
+		thread = OpenThread(THREAD_QUERY_INFORMATION | THREAD_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ThreadID);
+		start = 0;
+		if (thread && query(thread, 9, &start, sizeof start, NULL) == 0 && start >= plus_start && start < plus_end)
+			found = thread;
+		else if (thread)
+			CloseHandle(thread);
+	}
+	CloseHandle(snapshot);
+	return found;
+}
+
+static void fault_worker_dead(void)
+{
+	HANDLE worker = open_plus_worker();
+
+	TerminateThread(worker, 0);
+	WaitForSingleObject(worker, INFINITE);
+	read_null();
+}
+
+static BOOL (WINAPI *real_move)(LPCSTR from, LPCSTR to, DWORD flags);
+static volatile LONG move_refusals;
+static volatile LONG move_calls;
+
+static BOOL WINAPI refusing_move(LPCSTR from, LPCSTR to, DWORD flags)
+{
+	InterlockedIncrement(&move_calls);
+	if (InterlockedDecrement(&move_refusals) >= 0) {
+		SetLastError(ERROR_SHARING_VIOLATION);
+		return FALSE;
+	}
+	return real_move(from, to, flags);
+}
+
+static void replace_plus_import(const char *name, void *replacement, void **original)
+{
+	BYTE *base = (BYTE *)plus_start;
+	IMAGE_NT_HEADERS *headers = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+	DWORD imports = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+	IMAGE_THUNK_DATA *names, *slots;
+	DWORD old;
+
+	for (IMAGE_IMPORT_DESCRIPTOR *library = (IMAGE_IMPORT_DESCRIPTOR *)(base + imports); library->Name; library++) {
+		names = (IMAGE_THUNK_DATA *)(base + library->OriginalFirstThunk);
+		slots = (IMAGE_THUNK_DATA *)(base + library->FirstThunk);
+		for (; names->u1.AddressOfData; names++, slots++) {
+			if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal) || strcmp(((IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData))->Name, name) != 0)
+				continue;
+			VirtualProtect(&slots->u1.Function, sizeof slots->u1.Function, PAGE_READWRITE, &old);
+			*original = (void *)slots->u1.Function;
+			slots->u1.Function = (ULONG_PTR)replacement;
+			VirtualProtect(&slots->u1.Function, sizeof slots->u1.Function, old, &old);
+		}
+	}
+}
+
+static void fault_after_move_refusals(LONG refusals)
+{
+	move_refusals = refusals;
+	replace_plus_import("MoveFileExA", (void *)refusing_move, (void **)&real_move);
+	read_null();
+}
+
+static void fault_move_retry(void)
+{
+	fault_after_move_refusals(3);
+}
+
+static void fault_move_fails(void)
+{
+	fault_after_move_refusals(1000);
+}
+
+static void write_move_calls(void)
+{
+	FILE *file;
+
+	if (!move_calls || fopen_s(&file, "move_calls.txt", "w"))
+		return;
+	fprintf(file, "%ld", move_calls);
+	fclose(file);
+}
+
+static const struct {
+	const char *name;
+	void (*function)(void);
+} faults[] = {
+	{ "av", fault_av },
+	{ "overflow", fault_overflow },
+	{ "fastfail", fault_fastfail },
+	{ "abort", fault_abort },
+	{ "cpp", fault_cpp },
+	{ "heap_double_free", fault_heap_double_free },
+	{ "heap_overrun", fault_heap_overrun },
+	{ "exit_process", fault_exit_process },
+	{ "terminate_process", fault_terminate_process },
+	{ "crt_exit", fault_crt_exit },
+	{ "divide", fault_divide },
+	{ "ud2", fault_ud2 },
+	{ "second", fault_second },
+	{ "worker_stuck", fault_worker_stuck },
+	{ "two_threads", fault_two_threads },
+	{ "worker_waits", fault_worker_waits },
+	{ "worker_blocked", fault_worker_blocked },
+	{ "worker_dead", fault_worker_dead },
+	{ "move_retry", fault_move_retry },
+	{ "move_fails", fault_move_fails },
+};
+
+static DWORD WINAPI fault_thread(LPVOID function)
+{
+	((void (*)(void))function)();
+	return 0;
+}
+
+static int l_test_fault(lua_State *L)
+{
+	const char *name = luaL_checkstring(L, 1);
+	size_t i;
+
+	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+	if (!lua_isnoneornil(L, 3))
+		find_plus(L, 3);
+	for (i = 0; i < sizeof faults / sizeof faults[0]; i++) {
+		if (strcmp(faults[i].name, name) != 0)
+			continue;
+		if (lua_toboolean(L, 2)) {
+			HANDLE thread = CreateThread(NULL, 0, fault_thread, (LPVOID)faults[i].function, 0, NULL);
+			WaitForSingleObject(thread, INFINITE);
+		} else {
+			faults[i].function();
+		}
+		return 0;
+	}
+	return luaL_error(L, "no fault %s", name);
+}
+
 static int l_test_sleep(lua_State *L)
 {
 	Sleep((DWORD)luaL_checkinteger(L, 1));
@@ -562,6 +892,7 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_allocator_crash", l_test_allocator_crash);
 	lua_register(L, "test_hook_timing", l_test_hook_timing);
 	lua_register(L, "test_stack_overflow", l_test_stack_overflow);
+	lua_register(L, "test_fault", l_test_fault);
 	lua_register(L, "test_sleep", l_test_sleep);
 	lua_register(L, "test_protect", l_test_protect);
 	lua_register(L, "test_access_faults", l_test_access_faults);
@@ -589,10 +920,21 @@ static bool handler_hidden;
 
 static int main_filter(DWORD code, EXCEPTION_POINTERS *info)
 {
+	int result = EXCEPTION_CONTINUE_SEARCH;
+
 	if (!handler_hidden)
-		return game_crash_handler(code, info);
-	write_game_crash_file();
-	return EXCEPTION_CONTINUE_SEARCH;
+		result = game_crash_handler(code, info);
+	else
+		write_game_crash_file();
+	write_move_calls();
+	if (second_fault) {
+		second_fault = false;
+		__try {
+			read_null();
+		} __except (main_filter(GetExceptionCode(), GetExceptionInformation())) {
+		}
+	}
+	return result;
 }
 
 static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *info)

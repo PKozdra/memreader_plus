@@ -415,6 +415,20 @@ local function api(mr, label, small_only)
 	return r
 end
 
+local HOST_FAULTS = {
+	exit_report = { 'exit_process', false },
+	exit_report_off = { 'exit_process', false },
+	exit_report_terminate = { 'terminate_process', true },
+	exit_report_crt = { 'crt_exit', false },
+	fault_report_two_threads = { 'two_threads', false },
+	fault_report_worker_stuck = { 'worker_stuck', false },
+	fault_report_worker_waits = { 'worker_waits', false },
+	fault_report_worker_blocked = { 'worker_blocked', false },
+	fault_report_worker_dead = { 'worker_dead', false },
+	fault_report_move_retry = { 'move_retry', false },
+	fault_report_move_fails = { 'move_fails', false },
+}
+
 if SCENARIO == 'api' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus
@@ -1169,6 +1183,8 @@ elseif
 	or SCENARIO == 'fault_report_cpp'
 	or SCENARIO == 'fault_report_fallback'
 	or SCENARIO == 'fault_report_clues'
+	or SCENARIO == 'exit_report_quiet'
+	or HOST_FAULTS[SCENARIO]
 then
 	io.stdout:setvbuf('no')
 	load_other_program_dll()
@@ -1193,7 +1209,7 @@ then
 	)
 	check(not pcall(mr.call, mr.pointer(test_function('raise_lua_error')), 'void(pointer)', mr.pointer(test_state())), 'a Lua error leaves a guarded call')
 	check(not pcall(mr.set_crash_reports, 'yes'), 'set_crash_reports takes a boolean')
-	if SCENARIO == 'fault_report_off' and PASS > 1 then mr.set_crash_reports(false) end
+	if (SCENARIO == 'fault_report_off' or SCENARIO == 'exit_report_off') and PASS > 1 then mr.set_crash_reports(false) end
 	check(not pcall(mr.set_crash_context), 'set_crash_context needs a name')
 	if PASS > 1 then fill_crash_context(mr) end
 	if PASS > 1 and SCENARIO == 'fault_report' then fill_code_patches(mr) end
@@ -1222,6 +1238,10 @@ then
 				mr.call(mr.pointer(test_function('throw_out')), 'void()')
 			elseif SCENARIO == 'fault_report_clues' then
 				test_allocator_crash()
+			elseif SCENARIO == 'exit_report_quiet' then
+				os.exit(0)
+			elseif HOST_FAULTS[SCENARIO] then
+				test_fault(HOST_FAULTS[SCENARIO][1], HOST_FAULTS[SCENARIO][2], mr.set_crash_context)
 			else
 				test_crash()
 			end

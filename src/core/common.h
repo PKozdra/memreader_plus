@@ -103,6 +103,8 @@ typedef struct {
 	const char *handler_note;
 	const ULONG_PTR *allocator;
 	int allocator_count;
+	DWORD exit_code;
+	const char *exit_call;
 } CrashInput;
 
 typedef struct {
@@ -219,6 +221,7 @@ void add_damaged_memory(Text *text, const CONTEXT *context, const EXCEPTION_RECO
 void set_crash_context(const char *name, const char *value);
 void note_crash_event(const char *name);
 size_t build_crash_report(Text *report, const CrashInput *input);
+size_t build_exit_report(Text *report, const CrashInput *input);
 BOOL in_guarded_call(void);
 LONG pause_guarded_calls(void);
 void resume_guarded_calls(LONG paused);

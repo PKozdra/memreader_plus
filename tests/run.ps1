@@ -17,11 +17,17 @@ $expect = [ordered]@{
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
     fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash
+    fault_report_two_threads = $crash; fault_report_worker_stuck = $crash; fault_report_worker_waits = $crash
+    fault_report_worker_blocked = $crash; fault_report_worker_dead = $crash; fault_report_move_retry = $crash; fault_report_move_fails = $crash
+    exit_report = 7; exit_report_terminate = 8; exit_report_crt = 9; exit_report_quiet = 0; exit_report_off = 7
 }
 $reports = @{
     fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'
     fault_report_stale = 'started'; fault_report_thread = 'started'; fault_report_native_thread = 'started'; fault_report_overflow = 'started'
     fault_report_cpp = 'started'; fault_report_fallback = 'started'; fault_report_clues = 'started'
+    fault_report_two_threads = 'started'; fault_report_worker_stuck = 'none'; fault_report_worker_waits = 'started'
+    fault_report_worker_blocked = 'none'; fault_report_worker_dead = 'none'; fault_report_move_retry = 'started'; fault_report_move_fails = 'started'
+    exit_report = 'started'; exit_report_terminate = 'started'; exit_report_crt = 'started'; exit_report_quiet = 'none'; exit_report_off = 'none'
 }
 $readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
@@ -29,11 +35,25 @@ $faultNeedles = @{
     fault_report_stale = $readOfNull; fault_report_thread = $readOfNull; fault_report_native_thread = $readOfNull
     fault_report_overflow = @('exception 0xc00000fd (stack overflow)'); fault_report_cpp = @('exception 0xe06d7363 (C++ exception, type .H)')
     fault_report_fallback = $readOfNull; fault_report_clues = @('exception 0xc0000005 (access violation)')
+    fault_report_two_threads = $readOfNull; fault_report_worker_waits = $readOfNull; fault_report_move_retry = $readOfNull
+    fault_report_move_fails = $readOfNull
 }
 $nativeNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the crashing thread, innermost first:', '  #0 ', ', offset +0x',
     'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
 )
+$exitScenarios = @('exit_report', 'exit_report_terminate', 'exit_report_crt')
+$exitNeedles = @(
+    'Game running for ', 'Memory: game ', 'Native stack of the thread that ended the game, innermost first:', '  #0 ', ', offset +0x',
+    'Warhammer3.exe+0x', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
+)
+$exitAbsent = @('report_me', "The game's crash handler caught it", 'Lua stack', '  #0 memreader_plus', 'Registers of the crashing thread:')
+$offScriptThread = @('fault_report_native_thread', 'fault_report_two_threads', 'fault_report_worker_waits')
+$timeLimits = @{
+    fault_report_worker_stuck = 4, 9; fault_report_worker_waits = 4, 9; fault_report_worker_blocked = 9, 15; fault_report_worker_dead = 0, 3
+}
+$moveCalls = @{ fault_report_move_retry = '4'; fault_report_move_fails = '5' }
+$staleTemporary = 'memreader_crash_report_010101_0000.txt.1.tmp'
 $otherDll = 'fake_overlay64.dll'
 $otherDllCount = "Other programs' DLLs loaded: [1-9]"
 $hookerDll = 'fake_speedhack64.dll'
@@ -51,6 +71,11 @@ $scenarioNeedles = @{
     )
     fault_report_in_callback = @('RUNNING (on the stack)', ', callback ')
     fault_report_native_thread = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
+    fault_report_two_threads = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
+    fault_report_worker_waits = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
+    exit_report = @('the game ended itself with exit code 7 (0x00000007) through ExitProcess', 'Thread: the script thread')
+    exit_report_terminate = @('the game ended itself with exit code 8 (0x00000008) through TerminateProcess', 'not the script thread')
+    exit_report_crt = @('the game ended itself with exit code 9 (0x00000009) through ExitProcess', 'Thread: the script thread')
     fault_report_fallback = @("Written when the fault happened: the game's crash handler was not found (its pattern matched nothing)")
     fault_report_clues = @(
         "This fault is in the game's memory allocator: memory was damaged earlier, and the code on this stack only found it",
@@ -116,6 +141,7 @@ foreach ($scenario in $expect.Keys) {
             New-ModFile $work
             New-Item -ItemType Directory (Join-Path $work 'crash_report') | Out-Null
             Copy-Item (Join-Path $env:SystemRoot 'System32\version.dll') (Join-Path $work $otherDll)
+            Set-Content (Join-Path $work $staleTemporary) 'left by a crash' -NoNewline
             if ($scenario -eq 'fault_report_clues') { Copy-Item (Join-Path $env:SystemRoot 'System32\version.dll') (Join-Path $work $hookerDll) }
             $extra = @('mods.txt;', 'appdata_folder', "$work;")
             if ($scenario -eq 'fault_report_no_log') { $extra += 'x' * ($commandLineBuffer + 100) }
@@ -126,12 +152,31 @@ foreach ($scenario in $expect.Keys) {
             }
         }
         $before = Get-Date -Format 'ddMMyy_HHmm'
-        & $runExe (Join-Path $PSScriptRoot 'offline.lua') ($root -replace '\\', '/') $scenario @extra
+        $hostArguments = @((Join-Path $PSScriptRoot 'offline.lua'), ($root -replace '\\', '/'), $scenario) + $extra
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        if ($timeLimits.Contains($scenario)) {
+            $process = Start-Process $runExe -ArgumentList $hostArguments -NoNewWindow -PassThru
+            $null = $process.Handle
+            if (-not $process.WaitForExit($timeLimits[$scenario][1] * 1000)) { $process.Kill(); $process.WaitForExit() }
+            $exitCode = $process.ExitCode
+            $seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
+            "took $seconds s"
+            if ($seconds -lt $timeLimits[$scenario][0] -or $seconds -ge $timeLimits[$scenario][1]) { $failed += "$scenario (took $seconds s, expected $($timeLimits[$scenario] -join ' to ') s)" }
+        } else {
+            & $runExe @hostArguments
+            $exitCode = $LASTEXITCODE
+        }
         $after = Get-Date -Format 'ddMMyy_HHmm'
-        if ($LASTEXITCODE -ne $expect[$scenario]) { $failed += $scenario; "exit $LASTEXITCODE, expected $($expect[$scenario])" }
-        elseif ($LASTEXITCODE) { "crashed as expected (exit $('{0:X8}' -f $LASTEXITCODE))" }
+        if ($exitCode -ne $expect[$scenario]) { $failed += $scenario; "exit $exitCode, expected $($expect[$scenario])" }
+        elseif ($exitCode) { "crashed as expected (exit $('{0:X8}' -f $exitCode))" }
+        if ($moveCalls.Contains($scenario)) {
+            $calls = Get-Content -Raw -ErrorAction SilentlyContinue (Join-Path $work 'move_calls.txt')
+            if ($calls -ne $moveCalls[$scenario]) { $failed += "$scenario (MoveFileExA called $calls times, expected $($moveCalls[$scenario]))" }
+        }
         if ($reports.Contains($scenario)) {
             $written = @(Get-ChildItem $work -Filter "$reportPrefix*.txt" | ForEach-Object Name)
+            $leftovers = @(Get-ChildItem $work -Filter "$reportPrefix*.tmp" | ForEach-Object Name)
+            if ($leftovers) { $failed += "$scenario (temporary report files left: $leftovers)" }
             if ($reports[$scenario] -eq 'none') {
                 if ($written.Count) { $failed += "$scenario (reporting was off but wrote $written)" }
                 continue
@@ -141,10 +186,16 @@ foreach ($scenario in $expect.Keys) {
             if ($written.Count -ne 1 -or -not $report) { Get-ChildItem $work | ForEach-Object { "$($_.Name) created $($_.CreationTimeUtc.ToString('o'))" }; $failed += "$scenario (reports: $written, expected stamp $stamps)"; continue }
             $text = Get-Content -Raw -ErrorAction SilentlyContinue (Join-Path $work $report)
             $logLine = if ($scenario -eq 'fault_report') { 'Script log of this Lua state: script_log_010203_0405.txt' } else { 'Script logging is off' }
-            $needles = @('report_me', 'marker = "event-under-test"', $logLine) + $faultNeedles[$scenario] + $modNeedles + $nativeNeedles
+            $isExit = $exitScenarios -contains $scenario
+            if ($isExit) {
+                $needles = @($logLine) + $exitNeedles + $modNeedles
+                foreach ($absent in $exitAbsent) { if ($text -and $text.Contains($absent)) { $failed += "$scenario (exit report shows $absent)" } }
+            } else {
+                $needles = @('report_me', 'marker = "event-under-test"', $logLine) + $faultNeedles[$scenario] + $modNeedles + $nativeNeedles
+            }
             if ($scenario -ne 'fault_report_stale') { $needles += $contextNeedles + $eventNeedles }
-            if ($scenario -ne 'fault_report_fallback') { $needles += $gameFilesNote; $needles += "The game's crash handler caught it" }
-            if ($scenario -ne 'fault_report_native_thread') { $needles += 'Thread: the script thread'; $needles += 'Code at rip:' }
+            if ($scenario -ne 'fault_report_fallback' -and -not $isExit) { $needles += $gameFilesNote; $needles += "The game's crash handler caught it" }
+            if ($offScriptThread -notcontains $scenario -and -not $isExit) { $needles += 'Thread: the script thread'; $needles += 'Code at rip:' }
             if ($scenario -eq 'fault_report_thread') { $needles += 'Lua thread ' }
             if ($scenarioNeedles.Contains($scenario)) { $needles += $scenarioNeedles[$scenario] }
             if ($scenario -ne 'fault_report_clues') { $needles += $noTimingHooks }

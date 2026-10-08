@@ -109,31 +109,59 @@ void note_crash_event(const char *name)
 	oldest->last_tick = GetTickCount64();
 }
 
-static void add_header(Text *report, const CrashInput *input)
+static void add_title(Text *report, const CrashInput *input)
 {
 	SYSTEMTIME time;
 
 	FileTimeToSystemTime(&input->time, &time);
 	add_text(report, "memreader Plus %s crash report\n", MEMREADER_PLUS_VERSION);
 	add_text(report, "%04d-%02d-%02d %02d:%02d:%02d, ", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
+}
+
+static void add_header(Text *report, const CrashInput *input)
+{
+	add_title(report, input);
 	add_fault(report, input->info->ExceptionRecord);
 }
 
-static void add_thread(Text *report, const CrashInput *input)
+static void add_exit_header(Text *report, const CrashInput *input)
+{
+	add_title(report, input);
+	add_text(report, "the game ended itself with exit code %lu (0x%08lx) through %s\n", input->exit_code, input->exit_code,
+		input->exit_call);
+}
+
+static void add_thread_name(Text *report, const CrashInput *input)
 {
 	if (input->thread == input->script_thread)
 		add_text(report, "Thread: the script thread\n");
 	else
 		add_text(report, "Thread: %lu, not the script thread (%lu)\n", input->thread, input->script_thread);
+}
+
+static void add_script_log(Text *report, const CrashInput *input)
+{
+	if (input->script_log[0])
+		add_text(report, "Script log of this Lua state: %s\n", input->script_log);
+	else
+		add_text(report, "Script logging is off\n");
+}
+
+static void add_thread(Text *report, const CrashInput *input)
+{
+	add_thread_name(report, input);
 	if (input->confirmed)
 		add_text(report, "The game's crash handler caught it, so nothing recovered from this fault\n");
 	else
 		add_text(report, "Written when the fault happened: %s, so the game may have recovered\n",
 			input->handler_note ? input->handler_note : "the game's crash handler was not found");
-	if (input->script_log[0])
-		add_text(report, "Script log of this Lua state: %s\n", input->script_log);
-	else
-		add_text(report, "Script logging is off\n");
+	add_script_log(report, input);
+}
+
+static void add_exit_thread(Text *report, const CrashInput *input)
+{
+	add_thread_name(report, input);
+	add_script_log(report, input);
 }
 
 static UINT64 ticks_of(FILETIME time)
@@ -307,6 +335,12 @@ static void add_crashed_stack(Text *report, const CrashInput *input)
 		add_text(report, "This fault is in the game's memory allocator: memory was damaged earlier, and the code on this stack only found it\n");
 }
 
+static void add_exit_stack(Text *report, const CrashInput *input)
+{
+	add_text(report, "Native stack of the thread that ended the game, innermost first:\n");
+	add_native_stack(report, input->info->ContextRecord);
+}
+
 static void add_crashed_registers(Text *report, const CrashInput *input)
 {
 	add_text(report, "Registers of the crashing thread:\n");
@@ -345,9 +379,14 @@ static void add_modules(Text *report, const CrashInput *input)
 	(void)input;
 }
 
-static const Section sections[] = {
+static const Section crash_sections[] = {
 	add_header, add_thread, add_uptime, add_context, add_events, add_lua_part, add_crashed_stack,
 	add_crashed_registers, add_crashed_memory, add_script_stack, add_plus_hooks, add_plus_changes, add_modules
+};
+
+static const Section exit_sections[] = {
+	add_exit_header, add_exit_thread, add_uptime, add_context, add_events, add_exit_stack, add_plus_hooks, add_plus_changes,
+	add_modules
 };
 
 static void run_section(Text *report, const CrashInput *input, Section section)
@@ -359,7 +398,7 @@ static void run_section(Text *report, const CrashInput *input, Section section)
 	}
 }
 
-size_t build_crash_report(Text *report, const CrashInput *input)
+static size_t build_report(Text *report, const CrashInput *input, const Section *list, int count)
 {
 	Text body = { report->data, report->size - CUT_ROOM, 0 };
 	size_t header = 0;
@@ -367,8 +406,8 @@ size_t build_crash_report(Text *report, const CrashInput *input)
 
 	load_modules();
 	set_crash_stack((ULONG_PTR)input->info->ContextRecord->Rsp);
-	for (i = 0; i < (int)(sizeof sections / sizeof sections[0]); i++) {
-		run_section(&body, input, sections[i]);
+	for (i = 0; i < count; i++) {
+		run_section(&body, input, list[i]);
 		if (i == 0)
 			header = body.used;
 	}
@@ -376,4 +415,14 @@ size_t build_crash_report(Text *report, const CrashInput *input)
 	if (body.used >= body.size - 1)
 		add_text(report, "\n(the report was cut here: it reached its size limit)\n");
 	return header;
+}
+
+size_t build_crash_report(Text *report, const CrashInput *input)
+{
+	return build_report(report, input, crash_sections, (int)(sizeof crash_sections / sizeof crash_sections[0]));
+}
+
+size_t build_exit_report(Text *report, const CrashInput *input)
+{
+	return build_report(report, input, exit_sections, (int)(sizeof exit_sections / sizeof exit_sections[0]));
 }
