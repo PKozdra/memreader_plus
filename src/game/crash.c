@@ -20,8 +20,10 @@ enum {
 
 typedef int (*GameHandler)(DWORD code, EXCEPTION_POINTERS *info);
 typedef void (*GameExit)(int code, int cleanup, int return_mode);
+#ifdef MEMREADER_SYSTEM_EXIT_HOOKS
 typedef void (NTAPI *ExitFunction)(LONG code);
 typedef BOOL (WINAPI *TerminateFunction)(HANDLE process, UINT code);
+#endif
 
 typedef enum { REPORT_FAULT, REPORT_EXIT, REPORT_RUNTIME } ReportKind;
 
@@ -82,8 +84,10 @@ static EXCEPTION_RECORD pending_record;
 static CONTEXT pending_context;
 static EXCEPTION_POINTERS pending_info;
 static GameExit game_exit;
+#ifdef MEMREADER_SYSTEM_EXIT_HOOKS
 static ExitFunction exit_process;
 static TerminateFunction terminate_process;
+#endif
 static char report_buffer[REPORT_SIZE];
 static Text report = { report_buffer, sizeof report_buffer, 0 };
 
@@ -356,6 +360,7 @@ static void on_game_exit(int code, int cleanup, int return_mode)
 	game_exit(code, cleanup, return_mode);
 }
 
+#ifdef MEMREADER_SYSTEM_EXIT_HOOKS
 static void NTAPI on_exit_process(LONG code)
 {
 	report_exit((DWORD)code, "ExitProcess");
@@ -378,6 +383,7 @@ static void hook_system_function(const WCHAR *module, const char *name, LPVOID d
 	if (MH_EnableHook(target) != MH_OK)
 		MH_RemoveHook(target);
 }
+#endif
 
 static void hook_game_exit(void)
 {
@@ -396,8 +402,10 @@ static void hook_game_exit(void)
 static void hook_exits(void)
 {
 	hook_game_exit();
+#ifdef MEMREADER_SYSTEM_EXIT_HOOKS
 	hook_system_function(L"ntdll.dll", "RtlExitUserProcess", (LPVOID)on_exit_process, (LPVOID *)&exit_process);
 	hook_system_function(L"kernelbase.dll", "TerminateProcess", (LPVOID)on_terminate_process, (LPVOID *)&terminate_process);
+#endif
 }
 
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)

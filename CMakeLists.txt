@@ -62,6 +62,11 @@ target_include_directories(memreader_plus PRIVATE
 	"${PROJECT_SOURCE_DIR}/vendor/minhook/src")
 target_compile_definitions(memreader_plus PRIVATE LUA_BUILD_AS_DLL)
 
+option(MEMREADER_SYSTEM_EXIT_HOOKS "Hook ntdll!RtlExitUserProcess and kernelbase!TerminateProcess for exit reports" ON)
+if(MEMREADER_SYSTEM_EXIT_HOOKS)
+	target_compile_definitions(memreader_plus PRIVATE MEMREADER_SYSTEM_EXIT_HOOKS=1)
+endif()
+
 if(MSVC)
 	set(CMAKE_C_FLAGS_RELEASE "/O1 /DNDEBUG")
 	set(C_OPTIONS /W4 /GS /GL /Gy /Zi /sdl /fp:precise /Oi /FC /Brepro)

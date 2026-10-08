@@ -51,6 +51,9 @@ $nativeNeedles = @(
     'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
 )
 $exitScenarios = @('exit_report', 'exit_report_terminate', 'exit_report_crt')
+$systemHooks = Select-String -Path (Join-Path $root 'build\CMakeCache.txt') -Pattern '^MEMREADER_SYSTEM_EXIT_HOOKS:BOOL=ON$' -Quiet
+if (-not $systemHooks) { foreach ($name in $exitScenarios) { $reports[$name] = 'none' } }
+$dllText = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes((Join-Path $root 'build\Release\memreader_plus.dll')))
 $exitNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the thread that ended the game, innermost first:', '  #0 ', ', offset +0x',
     'Warhammer3.exe+0x', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
@@ -269,5 +272,7 @@ foreach ($scenario in $expect.Keys) {
     } finally { Pop-Location }
 }
 if (Test-Path $profilePacks) { Remove-Item -Recurse -Force $profilePacks }
+"== system exit hooks: $(if ($systemHooks) { 'on' } else { 'off' })"
+if ($dllText.Contains('RtlExitUserProcess') -ne $systemHooks) { $failed += "dll string RtlExitUserProcess (system exit hooks $(if ($systemHooks) { 'on, string missing' } else { 'off, string present' }))" }
 if ($failed) { throw "failed: $($failed -join ', ')" }
 if ($skipped) { "all other scenarios passed; skipped: $($skipped -join ', ')" } else { 'all scenarios passed' }
