@@ -13,6 +13,7 @@ enum {
 	POLL_MS = 10,
 	MOVE_TRIES = 5,
 	MOVE_RETRY_MS = 20,
+	STACK_GUARANTEE_BYTES = 32 * 1024,
 	GAME_FILE_GRACE_SECONDS = 2,
 	TICKS_PER_SECOND = 10000000
 };
@@ -386,6 +387,13 @@ static int forget_state(lua_State *L)
 	return 0;
 }
 
+static void reserve_stack(void)
+{
+	ULONG bytes = STACK_GUARANTEE_BYTES;
+
+	SetThreadStackGuarantee(&bytes);
+}
+
 static void remember_state(lua_State *L)
 {
 	lua_pushlightuserdata(L, (void *)&watch_key);
@@ -401,6 +409,7 @@ static void remember_state(lua_State *L)
 	if (script_thread_handle)
 		CloseHandle(script_thread_handle);
 	script_thread = GetCurrentThreadId();
+	reserve_stack();
 	script_thread_handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, script_thread);
 }
 

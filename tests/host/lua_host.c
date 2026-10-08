@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <intrin.h>
+#include <malloc.h>
 #include <tlhelp32.h>
 #include "lua.h"
 #include "lualib.h"
@@ -916,12 +917,19 @@ static int run_pass(char **argv, int argc, int pass)
 	return next_pass;
 }
 
+enum { CONTEXT_ROOM = 12 * 1024 };
+
 static bool handler_hidden;
 
 static int main_filter(DWORD code, EXCEPTION_POINTERS *info)
 {
 	int result = EXCEPTION_CONTINUE_SEARCH;
+	volatile char *context_room;
 
+	if (code == EXCEPTION_STACK_OVERFLOW) {
+		context_room = _alloca(CONTEXT_ROOM);
+		context_room[0] = 1;
+	}
 	if (!handler_hidden)
 		result = game_crash_handler(code, info);
 	else
