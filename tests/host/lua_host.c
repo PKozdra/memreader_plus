@@ -414,6 +414,65 @@ static int l_test_execute_crash(lua_State *L)
 	return 0;
 }
 
+void fake_dlfree(void *chunk);
+
+static int l_test_allocator_crash(lua_State *L)
+{
+	static const WCHAR words[] = L"a tooltip text overwrote this chunk";
+	BYTE *chunk = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 256);
+
+	memcpy(chunk + 0x20, words, sizeof words);
+	fake_dlfree(chunk + 0x10);
+	return 0;
+}
+
+static ULONG_PTR *exe_import_slot(const char *dll, const char *name)
+{
+	BYTE *image = (BYTE *)GetModuleHandleW(NULL);
+	IMAGE_NT_HEADERS *headers = (IMAGE_NT_HEADERS *)(image + ((IMAGE_DOS_HEADER *)image)->e_lfanew);
+	IMAGE_DATA_DIRECTORY *directory = &headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	IMAGE_IMPORT_DESCRIPTOR *entry = (IMAGE_IMPORT_DESCRIPTOR *)(image + directory->VirtualAddress);
+	IMAGE_THUNK_DATA *names;
+	int i;
+
+	for (; entry->Name; entry++) {
+		if (_stricmp((char *)(image + entry->Name), dll) != 0)
+			continue;
+		names = (IMAGE_THUNK_DATA *)(image + entry->OriginalFirstThunk);
+		for (i = 0; names[i].u1.AddressOfData; i++) {
+			if (!IMAGE_SNAP_BY_ORDINAL(names[i].u1.Ordinal) &&
+				strcmp(((IMAGE_IMPORT_BY_NAME *)(image + names[i].u1.AddressOfData))->Name, name) == 0)
+				return (ULONG_PTR *)(image + entry->FirstThunk) + i;
+		}
+	}
+	return NULL;
+}
+
+static void write_code(void *at, const void *bytes, size_t size)
+{
+	DWORD old;
+
+	VirtualProtect(at, size, PAGE_EXECUTE_READWRITE, &old);
+	memcpy(at, bytes, size);
+	VirtualProtect(at, size, old, &old);
+}
+
+static int l_test_hook_timing(lua_State *L)
+{
+	ULONG_PTR into = (ULONG_PTR)GetModuleHandleA(luaL_checkstring(L, 1)) + 0x1000;
+	ULONG_PTR *slot = exe_import_slot("KERNEL32.dll", "QueryPerformanceCounter");
+	BYTE jump[14] = { 0xFF, 0x25, 0, 0, 0, 0 };
+	FARPROC time_function = GetProcAddress(LoadLibraryA("winmm.dll"), "timeGetTime");
+
+	memcpy(jump + 6, &into, sizeof into);
+	if (slot)
+		write_code(slot, &into, sizeof into);
+	if (time_function)
+		write_code((void *)time_function, jump, sizeof jump);
+	lua_pushboolean(L, slot != NULL && time_function != NULL);
+	return 1;
+}
+
 static DWORD WINAPI crash_thread(LPVOID unused)
 {
 	(void)unused;
@@ -500,6 +559,8 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_recovered_crash", l_test_recovered_crash);
 	lua_register(L, "test_execute_crash", l_test_execute_crash);
 	lua_register(L, "test_thread_crash", l_test_thread_crash);
+	lua_register(L, "test_allocator_crash", l_test_allocator_crash);
+	lua_register(L, "test_hook_timing", l_test_hook_timing);
 	lua_register(L, "test_stack_overflow", l_test_stack_overflow);
 	lua_register(L, "test_sleep", l_test_sleep);
 	lua_register(L, "test_protect", l_test_protect);

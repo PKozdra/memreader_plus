@@ -16,19 +16,19 @@ $expect = [ordered]@{
     file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
-    fault_report_cpp = -529697949; fault_report_fallback = $crash
+    fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash
 }
 $reports = @{
     fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'
     fault_report_stale = 'started'; fault_report_thread = 'started'; fault_report_native_thread = 'started'; fault_report_overflow = 'started'
-    fault_report_cpp = 'started'; fault_report_fallback = 'started'
+    fault_report_cpp = 'started'; fault_report_fallback = 'started'; fault_report_clues = 'started'
 }
 $readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
     fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull
     fault_report_stale = $readOfNull; fault_report_thread = $readOfNull; fault_report_native_thread = $readOfNull
     fault_report_overflow = @('exception 0xc00000fd (stack overflow)'); fault_report_cpp = @('exception 0xe06d7363 (C++ exception, type .H)')
-    fault_report_fallback = $readOfNull
+    fault_report_fallback = $readOfNull; fault_report_clues = @('exception 0xc0000005 (access violation)')
 }
 $nativeNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the crashing thread, innermost first:', '  #0 ', ', offset +0x',
@@ -36,6 +36,8 @@ $nativeNeedles = @(
 )
 $otherDll = 'fake_overlay64.dll'
 $otherDllCount = "Other programs' DLLs loaded: [1-9]"
+$hookerDll = 'fake_speedhack64.dll'
+$noTimingHooks = "No other program's DLL hooks the game's timing functions"
 $steamScenario = 'fault_report_cpp'
 $steamCommandLine = '<Steam library>\steamapps\common\game\Warhammer3.exe'
 $eventNeedles = @(
@@ -49,11 +51,17 @@ $scenarioNeedles = @{
     )
     fault_report_in_callback = @('RUNNING (on the stack)', ', callback ')
     fault_report_native_thread = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
-    fault_report_fallback = @('Written when the fault happened')
+    fault_report_fallback = @("Written when the fault happened: the game's crash handler was not found (its pattern matched nothing)")
+    fault_report_clues = @(
+        "This fault is in the game's memory allocator: memory was damaged earlier, and the code on this stack only found it",
+        'not readable, text "a to"', 'Memory around rcx+16, which holds the bad value of rax:', '  a toolti', '  p text o',
+        "Other programs' DLLs that hook timing functions the game uses:", "  $hookerDll hooks QueryPerformanceCounter",
+        "  $hookerDll hooks timeGetTime"
+    )
 }
 $contextNeedles = @(
     'Game context set by script at safe moments:', '  mode: campaign', '  campaign: main_warhammer', '  campaign type: sp', '  difficulty: hard',
-    '  turn: 42', '  player: wh_a', '  humans: wh_a, wh_b', '  note: first second'
+    '  turn: 42', '  player: wh_a', '  humans: wh_a, wh_b', '  note: first second', '  phase: quitting'
 )
 $contextAbsent = @('  temp: ', '  multiplayer: ')
 $gameFilesNote = "The game's own crash files for this crash, in the game crash folder: D"
@@ -108,6 +116,7 @@ foreach ($scenario in $expect.Keys) {
             New-ModFile $work
             New-Item -ItemType Directory (Join-Path $work 'crash_report') | Out-Null
             Copy-Item (Join-Path $env:SystemRoot 'System32\version.dll') (Join-Path $work $otherDll)
+            if ($scenario -eq 'fault_report_clues') { Copy-Item (Join-Path $env:SystemRoot 'System32\version.dll') (Join-Path $work $hookerDll) }
             $extra = @('mods.txt;', 'appdata_folder', "$work;")
             if ($scenario -eq 'fault_report_no_log') { $extra += 'x' * ($commandLineBuffer + 100) }
             if ($scenario -eq $steamScenario) {
@@ -138,6 +147,7 @@ foreach ($scenario in $expect.Keys) {
             if ($scenario -ne 'fault_report_native_thread') { $needles += 'Thread: the script thread'; $needles += 'Code at rip:' }
             if ($scenario -eq 'fault_report_thread') { $needles += 'Lua thread ' }
             if ($scenarioNeedles.Contains($scenario)) { $needles += $scenarioNeedles[$scenario] }
+            if ($scenario -ne 'fault_report_clues') { $needles += $noTimingHooks }
             $missing = @($needles | Where-Object { -not $text -or -not $text.Contains($_) })
             foreach ($needle in $missing) { $failed += "$scenario (report lacks: $needle)" }
             if ($missing) { $text }

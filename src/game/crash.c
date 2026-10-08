@@ -30,12 +30,19 @@ static const char report_format[] = "memreader_crash_report_%s.txt";
 static const char game_handler_pattern[] =
 	"48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? B8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 2B E0 45 33 E4 "
 	"4C 8B F2 44 38 25 ?? ?? ?? ?? 8B D9 74 0A 48 83 C9 FF E8 ?? ?? ?? ?? CC B8 8D 00 00 C0";
+static const char *allocator_patterns[] = {
+	"40 53 48 83 EC ?? 48 83 3D ?? ?? ?? ?? 00 48 8B D9 0F 84 ?? ?? ?? ?? F6 05 ?? ?? ?? ?? 02 74 13",
+	"48 83 EC ?? 48 85 C9 0F 84 ?? ?? ?? ?? F6 05 ?? ?? ?? ?? 02 48 89 5C 24 68 48 8D 59 F0 74 13 B8"
+};
 static const char game_file_format[] = "D%4d-%2d-%2d_T%2d-%2d-%2d";
 
 static BOOL watching;
 static BOOL enabled = TRUE;
 static GameHandler game_handler;
 static BOOL game_handler_hooked;
+static char handler_note[128];
+static ULONG_PTR allocator[sizeof allocator_patterns / sizeof allocator_patterns[0]];
+static int allocator_count;
 static FILETIME fault_time;
 static char script_log[MAX_PATH];
 static char report_path[MAX_PATH + sizeof report_format + STAMP_LENGTH];
@@ -98,6 +105,9 @@ static void make_report(void)
 	GetLocalTime(&now);
 	SystemTimeToFileTime(&now, &fault_time);
 	input.time = fault_time;
+	input.handler_note = handler_note[0] ? handler_note : NULL;
+	input.allocator = allocator;
+	input.allocator_count = allocator_count;
 	if (pending.thread != script_thread && script_thread_handle && SuspendThread(script_thread_handle) != (DWORD)-1) {
 		paused = TRUE;
 		script.ContextFlags = CONTEXT_FULL;
@@ -323,19 +333,51 @@ static int after_game_handler(DWORD code, EXCEPTION_POINTERS *info)
 	return result;
 }
 
+static INT_PTR find_game_handler(void)
+{
+	const BYTE *found[2];
+	int count = find_code_all(game_handler_pattern, found, 2);
+
+	if (count == 1)
+		return (INT_PTR)found[0];
+	if (count == 0)
+		strcpy_s(handler_note, sizeof handler_note, "the game's crash handler was not found (its pattern matched nothing)");
+	else
+		strcpy_s(handler_note, sizeof handler_note, "the game's crash handler was not found (its pattern matched more than one place)");
+	return 0;
+}
+
 static void hook_game_handler(void)
 {
-	INT_PTR target = find_unique(game_handler_pattern);
+	INT_PTR target = find_game_handler();
 	BYTE window[SAVED_BYTES];
+	MH_STATUS status;
 
-	if (!target || MH_CreateHook((LPVOID)target, (LPVOID)after_game_handler, (LPVOID *)&game_handler) != MH_OK)
+	if (!target)
 		return;
-	capture_code(target, window);
-	if (MH_EnableHook((LPVOID)target) == MH_OK) {
-		remember_code(target, window);
-		game_handler_hooked = TRUE;
-	} else {
+	status = MH_CreateHook((LPVOID)target, (LPVOID)after_game_handler, (LPVOID *)&game_handler);
+	if (status == MH_OK) {
+		capture_code(target, window);
+		status = MH_EnableHook((LPVOID)target);
+		if (status == MH_OK) {
+			remember_code(target, window);
+			game_handler_hooked = TRUE;
+			return;
+		}
 		MH_RemoveHook((LPVOID)target);
+	}
+	_snprintf_s(handler_note, sizeof handler_note, _TRUNCATE, "the game's crash handler was found but could not be hooked (MinHook %d)", status);
+}
+
+static void find_allocator(void)
+{
+	INT_PTR found;
+	int i;
+
+	for (i = 0; i < (int)(sizeof allocator_patterns / sizeof allocator_patterns[0]); i++) {
+		found = find_unique(allocator_patterns[i]);
+		if (found)
+			allocator[allocator_count++] = (ULONG_PTR)found;
 	}
 }
 
@@ -383,6 +425,7 @@ static void start_watching(void)
 	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(void *)on_exception, &module))
 		return;
 	start_worker();
+	find_allocator();
 	hook_game_handler();
 	if (!game_handler_hooked)
 		AddVectoredExceptionHandler(1, on_exception);

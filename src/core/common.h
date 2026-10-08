@@ -100,6 +100,9 @@ typedef struct {
 	BOOL confirmed;
 	const char *script_log;
 	FILETIME time;
+	const char *handler_note;
+	const ULONG_PTR *allocator;
+	int allocator_count;
 } CrashInput;
 
 typedef struct {
@@ -202,6 +205,17 @@ void add_registers(Text *text, const CONTEXT *context);
 void add_code_bytes(Text *text, ULONG_PTR rip);
 void add_memory_use(Text *text);
 void add_other_module_count(Text *text);
+const char *other_program_at(ULONG_PTR address);
+const char *register_name(int index);
+BOOL is_printable(BYTE value);
+int wide_text_length(const BYTE *bytes, int units);
+BOOL is_bad_pointer(ULONG_PTR value);
+BOOL is_heap_pointer(ULONG_PTR value);
+BOOL stack_enters(const CONTEXT *start, const ULONG_PTR *functions, int count, int depth);
+BOOL is_known_program(const char *name);
+void prepare_clues(void);
+void add_timing_hooks(Text *text);
+void add_damaged_memory(Text *text, const CONTEXT *context, const EXCEPTION_RECORD *record);
 void set_crash_context(const char *name, const char *value);
 void note_crash_event(const char *name);
 size_t build_crash_report(Text *report, const CrashInput *input);

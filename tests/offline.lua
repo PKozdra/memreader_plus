@@ -124,7 +124,13 @@ local function fill_crash_context(mr)
 	}
 	setfenv(chunk, env)
 	chunk()
+	core.event_callback = function(_, eventname, context)
+		if listeners[eventname] then listeners[eventname](context) end
+	end
 	listeners.FirstTickAfterWorldCreated()
+	listeners.ComponentLClickUp({ string = 'button_windows' })
+	listeners.ComponentLClickUp({ string = 'button_cancel' })
+	listeners.ComponentLClickUp({ string = 'button_quit' })
 	core:event_callback('FactionTurnStart', faction)
 	for _ = 1, 3 do
 		core:event_callback('CharacterTurnStart', faction)
@@ -1162,9 +1168,14 @@ elseif
 	or SCENARIO == 'fault_report_overflow'
 	or SCENARIO == 'fault_report_cpp'
 	or SCENARIO == 'fault_report_fallback'
+	or SCENARIO == 'fault_report_clues'
 then
 	io.stdout:setvbuf('no')
 	load_other_program_dll()
+	if SCENARIO == 'fault_report_clues' then
+		package.loadlib('.\\fake_speedhack64.dll', 'luaopen_fake_speedhack64')
+		check(test_hook_timing('fake_speedhack64.dll'), 'the test hooks QueryPerformanceCounter and timeGetTime')
+	end
 	local log = PASS == 1 and 'script_log_010203_0404.txt' or 'script_log_010203_0405.txt'
 	if SCENARIO == 'fault_report' then io.open(log, 'wb'):close() end
 	if SCENARIO == 'fault_report_thread' then
@@ -1209,6 +1220,8 @@ then
 				test_stack_overflow()
 			elseif SCENARIO == 'fault_report_cpp' then
 				mr.call(mr.pointer(test_function('throw_out')), 'void()')
+			elseif SCENARIO == 'fault_report_clues' then
+				test_allocator_crash()
 			else
 				test_crash()
 			end

@@ -16,6 +16,7 @@ enum {
 	MAX_EVENTS = 32,
 	EVENT_NAME_SIZE = 48,
 	CUT_ROOM = 64,
+	ALLOCATOR_DEPTH = 4,
 	TICKS_PER_SECOND = 10000000
 };
 
@@ -127,7 +128,8 @@ static void add_thread(Text *report, const CrashInput *input)
 	if (input->confirmed)
 		add_text(report, "The game's crash handler caught it, so nothing recovered from this fault\n");
 	else
-		add_text(report, "Written when the fault happened: the game's crash handler was not found, so the game may have recovered\n");
+		add_text(report, "Written when the fault happened: %s, so the game may have recovered\n",
+			input->handler_note ? input->handler_note : "the game's crash handler was not found");
 	if (input->script_log[0])
 		add_text(report, "Script log of this Lua state: %s\n", input->script_log);
 	else
@@ -301,6 +303,8 @@ static void add_crashed_stack(Text *report, const CrashInput *input)
 {
 	add_text(report, "Native stack of the crashing thread, innermost first:\n");
 	add_native_stack(report, input->info->ContextRecord);
+	if (input->allocator_count && stack_enters(input->info->ContextRecord, input->allocator, input->allocator_count, ALLOCATOR_DEPTH))
+		add_text(report, "This fault is in the game's memory allocator: memory was damaged earlier, and the code on this stack only found it\n");
 }
 
 static void add_crashed_registers(Text *report, const CrashInput *input)
@@ -308,6 +312,11 @@ static void add_crashed_registers(Text *report, const CrashInput *input)
 	add_text(report, "Registers of the crashing thread:\n");
 	add_registers(report, input->info->ContextRecord);
 	add_code_bytes(report, (ULONG_PTR)input->info->ContextRecord->Rip);
+}
+
+static void add_crashed_memory(Text *report, const CrashInput *input)
+{
+	add_damaged_memory(report, input->info->ContextRecord, input->info->ExceptionRecord);
 }
 
 static void add_script_stack(Text *report, const CrashInput *input)
@@ -332,12 +341,13 @@ static void add_plus_changes(Text *report, const CrashInput *input)
 static void add_modules(Text *report, const CrashInput *input)
 {
 	add_other_module_count(report);
+	add_timing_hooks(report);
 	(void)input;
 }
 
 static const Section sections[] = {
 	add_header, add_thread, add_uptime, add_context, add_events, add_lua_part, add_crashed_stack,
-	add_crashed_registers, add_script_stack, add_plus_hooks, add_plus_changes, add_modules
+	add_crashed_registers, add_crashed_memory, add_script_stack, add_plus_hooks, add_plus_changes, add_modules
 };
 
 static void run_section(Text *report, const CrashInput *input, Section section)

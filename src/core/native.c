@@ -69,6 +69,7 @@ void prepare_native_report(void)
 	game_length = exe_length < MAX_PATH ? exe_length : 0;
 	while (game_length > 0 && game_folder[game_length - 1] != L'\\')
 		game_length--;
+	prepare_clues();
 }
 
 static const char *exception_name(DWORD code)
@@ -189,6 +190,18 @@ static BOOL is_readable(ULONG_PTR address, size_t size)
 		!(region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && address + size <= (ULONG_PTR)region.BaseAddress + region.RegionSize;
 }
 
+const char *other_program_at(ULONG_PTR address)
+{
+	const Module *module = module_of(address);
+
+	return module && module->other_program ? module->name : NULL;
+}
+
+const char *register_name(int index)
+{
+	return register_names[index];
+}
+
 static BOOL is_code(ULONG_PTR address)
 {
 	MEMORY_BASIC_INFORMATION region;
@@ -264,18 +277,79 @@ void add_native_stack(Text *text, const CONTEXT *start)
 	}
 }
 
+static BOOL starts_one_of(ULONG_PTR address, const ULONG_PTR *functions, int count)
+{
+	ULONG64 image = 0;
+	PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(address, &image, NULL);
+	ULONG_PTR start;
+	int i;
+
+	if (!entry)
+		return FALSE;
+	start = (ULONG_PTR)image + primary_function_entry(entry, image)->BeginAddress;
+	for (i = 0; i < count; i++) {
+		if (functions[i] == start)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+BOOL stack_enters(const CONTEXT *start, const ULONG_PTR *functions, int count, int depth)
+{
+	CONTEXT context = *start;
+	ULONG64 image, establisher;
+	PRUNTIME_FUNCTION entry;
+	PVOID handler_data;
+	int number;
+
+	for (number = 0; number < depth && context.Rip; number++) {
+		if (starts_one_of(number ? context.Rip - 1 : context.Rip, functions, count))
+			return TRUE;
+		entry = RtlLookupFunctionEntry(context.Rip, &image, NULL);
+		if (!entry)
+			return FALSE;
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, entry, &context, &handler_data, &establisher, NULL);
+	}
+	return FALSE;
+}
+
+BOOL is_printable(BYTE value)
+{
+	return value >= ' ' && value < 127;
+}
+
 static int printable_length(const char *text, int size)
 {
 	int length = 0;
 
-	while (length < size && text[length] >= ' ' && text[length] < 127)
+	while (length < size && is_printable((BYTE)text[length]))
 		length++;
 	return length;
+}
+
+int wide_text_length(const BYTE *bytes, int units)
+{
+	int length = 0;
+
+	while (length < units && bytes[2 * length + 1] == 0 && is_printable(bytes[2 * length]))
+		length++;
+	return length;
+}
+
+static void add_wide_text(Text *text, const char *label, const BYTE *bytes, int length)
+{
+	int i;
+
+	add_text(text, "%stext \"", label);
+	for (i = 0; i < length; i++)
+		add_text(text, "%c", bytes[2 * i]);
+	add_text(text, "\"");
 }
 
 static BOOL add_text_preview(Text *text, ULONG_PTR address)
 {
 	char preview[TEXT_PREVIEW + 1];
+	BYTE wide[2 * TEXT_PREVIEW];
 	int length;
 
 	if (read_ca_text((INT_PTR)address, FALSE, preview, sizeof preview) && preview[0] &&
@@ -286,10 +360,37 @@ static BOOL add_text_preview(Text *text, ULONG_PTR address)
 	if (!copy_memory(preview, (INT_PTR)address, TEXT_PREVIEW))
 		return FALSE;
 	length = printable_length(preview, TEXT_PREVIEW);
-	if (length < 4)
+	if (length >= 4) {
+		add_text(text, "  text \"%.*s\"", length, preview);
+		return TRUE;
+	}
+	if (!copy_memory(wide, (INT_PTR)address, sizeof wide) || (length = wide_text_length(wide, TEXT_PREVIEW)) < 4)
 		return FALSE;
-	add_text(text, "  text \"%.*s\"", length, preview);
+	add_wide_text(text, "  ", wide, length);
 	return TRUE;
+}
+
+static void add_value_as_text(Text *text, ULONG_PTR value)
+{
+	const BYTE *bytes = (const BYTE *)&value;
+	int length = printable_length((const char *)bytes, sizeof value), i;
+
+	if (wide_text_length(bytes, sizeof value / 2) == sizeof value / 2) {
+		add_wide_text(text, ", ", bytes, sizeof value / 2);
+		return;
+	}
+	if (length < 4)
+		return;
+	for (i = length; i < (int)sizeof value; i++) {
+		if (bytes[i])
+			return;
+	}
+	add_text(text, ", text \"%.*s\"", length, (const char *)bytes);
+}
+
+BOOL is_bad_pointer(ULONG_PTR value)
+{
+	return value >= SMALL_VALUE && !is_readable(value, 1);
 }
 
 void set_crash_stack(ULONG_PTR rsp)
@@ -304,6 +405,11 @@ static BOOL on_crash_stack(ULONG_PTR address)
 	MEMORY_BASIC_INFORMATION region;
 
 	return crash_stack && VirtualQuery((LPCVOID)address, &region, sizeof region) && (ULONG_PTR)region.AllocationBase == crash_stack;
+}
+
+BOOL is_heap_pointer(ULONG_PTR value)
+{
+	return value >= SMALL_VALUE && !module_of(value) && !on_crash_stack(value) && is_readable(value, sizeof value);
 }
 
 static BOOL is_vtable(ULONG_PTR address)
@@ -331,6 +437,7 @@ static void add_value(Text *text, ULONG_PTR value)
 	}
 	if (!is_readable(value, sizeof first)) {
 		add_text(text, "  not readable");
+		add_value_as_text(text, value);
 		return;
 	}
 	if (copy_memory(&first, (INT_PTR)value, sizeof first) && is_vtable(first)) {
@@ -441,12 +548,18 @@ void add_memory_use(Text *text)
 
 void add_other_module_count(Text *text)
 {
-	int count = 0;
+	int count = 0, known = 0;
 	int i;
 
 	for (i = 1; i < module_count; i++) {
-		if (modules[i].other_program)
-			count++;
+		if (!modules[i].other_program)
+			continue;
+		count++;
+		if (is_known_program(modules[i].name))
+			known++;
 	}
-	add_text(text, "Other programs' DLLs loaded: %d\n", count);
+	add_text(text, "Other programs' DLLs loaded: %d", count);
+	if (known)
+		add_text(text, ", %d of them known overlays, drivers and antivirus", known);
+	add_text(text, "\n");
 }

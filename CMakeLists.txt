@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(memreader_plus VERSION 0.8.0 LANGUAGES C ASM_MASM)
+project(memreader_plus VERSION 0.8.1 LANGUAGES C ASM_MASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -34,6 +34,7 @@ add_library(memreader_plus SHARED
 	src/core/guard.c
 	src/core/native.c
 	src/core/crash_report.c
+	src/core/clues.c
 	src/core/thunk.asm
 	src/game/game.h
 	src/game/crash.c
