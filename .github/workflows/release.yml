@@ -43,8 +43,19 @@ jobs:
         uses: crazy-max/ghaction-virustotal@v4
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
-          github_token: ${{ github.token }}
-          update_release_body: true
           files: |
             release/memreader_plus.dll
             release/memreader_plus.pack
+      - name: Release notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $lines = @('Files built by GitHub Actions from this tag.', '', 'SHA-256:')
+          $sums = Get-Content release\SHA256SUMS.txt | ForEach-Object { $hash, $name = $_ -split '  '; [pscustomobject]@{ Hash = $hash; Name = $name } }
+          $sums | ForEach-Object { $lines += "- ``$($_.Name)`` $($_.Hash)" }
+          $lines += '', 'VirusTotal:'
+          $sums | ForEach-Object { $lines += "- [$($_.Name)](https://www.virustotal.com/gui/file/$($_.Hash))" }
+          $lines += '', 'Check that a file came from this build: `gh attestation verify memreader_plus.pack -R ${{ github.repository }}`'
+          $lines | Set-Content -Encoding utf8 notes.md
+          gh release edit ${{ github.ref_name }} --notes-file notes.md
