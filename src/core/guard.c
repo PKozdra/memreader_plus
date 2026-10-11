@@ -12,9 +12,6 @@ enum { EXECUTABLE = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | 
 extern IMAGE_DOS_HEADER __ImageBase;
 
 static const char log_name[] = "memreader_plus_refused.txt";
-static const WORD exe_tables[] = {
-	IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DIRECTORY_ENTRY_IAT, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT
-};
 typedef struct {
 	INT_PTR low;
 	INT_PTR high;
@@ -33,48 +30,20 @@ static Change patches[MAX_PATCHES];
 static int patch_count;
 static UINT32 patches_not_listed;
 
-static BOOL overlaps(INT_PTR address, size_t size, INT_PTR start, INT_PTR end)
-{
-	return address < end && address + (INT_PTR)size > start;
-}
-
-static BOOL in_exe_tables(INT_PTR address, size_t size)
-{
-	INT_PTR base = (INT_PTR)GetModuleHandleA(NULL);
-	const IMAGE_OPTIONAL_HEADER *header = &game_headers()->OptionalHeader;
-	const IMAGE_DATA_DIRECTORY *table;
-	int i;
-
-	if (overlaps(address, size, base, base + (INT_PTR)header->SizeOfHeaders))
-		return TRUE;
-	for (i = 0; i < (int)(sizeof exe_tables / sizeof exe_tables[0]); i++) {
-		table = &header->DataDirectory[exe_tables[i]];
-		if (table->Size && overlaps(address, size, base + table->VirtualAddress, base + table->VirtualAddress + table->Size))
-			return TRUE;
-	}
-	return FALSE;
-}
-
-static BOOL is_data_memory(INT_PTR address, size_t size)
+BOOL is_executable(INT_PTR address)
 {
 	MEMORY_BASIC_INFORMATION region;
-	INT_PTR at = address;
 
-	while (at < address + (INT_PTR)size) {
-		if (!VirtualQuery((LPCVOID)at, &region, sizeof region))
-			return TRUE;
-		if (region.State == MEM_COMMIT && (region.Type == MEM_IMAGE || (region.Protect & EXECUTABLE)))
-			return FALSE;
-		at = (INT_PTR)region.BaseAddress + (INT_PTR)region.RegionSize;
-	}
-	return TRUE;
+	return VirtualQuery((LPCVOID)address, &region, sizeof region) && region.State == MEM_COMMIT &&
+		(region.Protect & EXECUTABLE) && !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
 }
 
-BOOL may_write(INT_PTR address, size_t size)
+BOOL in_own_module(INT_PTR address)
 {
-	if (in_game_image(address, size))
-		return !in_exe_tables(address, size);
-	return is_data_memory(address, size);
+	INT_PTR start = (INT_PTR)&__ImageBase;
+	const IMAGE_NT_HEADERS *headers = (const IMAGE_NT_HEADERS *)(start + __ImageBase.e_lfanew);
+
+	return address >= start && address < start + (INT_PTR)headers->OptionalHeader.SizeOfImage;
 }
 
 BOOL in_exe_code(INT_PTR address)
@@ -295,10 +264,5 @@ void check_write(lua_State *L, int argument, const char *what, INT_PTR address, 
 		note_refusal(L, what, address);
 		luaL_argerror(L, argument, "refused: the first bytes of a hooked function run from the hook's copy, so a change there would never run");
 	}
-	if (may_write(address, size)) {
-		note_change(L, function_name(L, what), address, size);
-		return;
-	}
-	note_refusal(L, what, address);
-	luaL_argerror(L, argument, "refused: Plus writes only to the game's exe and to data memory, not to other modules, executable memory or the exe's headers and import or export tables");
+	note_change(L, function_name(L, what), address, size);
 }

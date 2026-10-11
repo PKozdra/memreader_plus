@@ -843,7 +843,7 @@ fix('call crash', function(mr)
 end)
 fix('call outside the exe', function(mr)
 	local ok, err = pcall(mr.call, mr.pointer(P), 'void()')
-	return ok, err == "bad argument #1 to '?' (refused: call takes only code in the game's exe or a hook's original)"
+	return ok, err == "bad argument #1 to '?' (refused: call takes only executable memory)"
 end)
 fix('call Lua error inside', function(mr)
 	local ok, err = pcall(mr.call, test_address(mr, 'raise_lua_error'), 'void(pointer)', mr.pointer(test_state()))

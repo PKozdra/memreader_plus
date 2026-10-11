@@ -59,11 +59,36 @@ static BYTE *take_hop_slot(void)
 	return run;
 }
 
-static void write_absolute_jump(BYTE *at, UINT64 destination)
+static BOOL padding_reaches(INT_PTR target)
+{
+	INT64 from_start, from_end;
+
+	if (!padding_next && !code_section(0, &padding_next, &padding_end))
+		return FALSE;
+	from_start = (INT64)((INT_PTR)padding_next - (target + SITE_JUMP));
+	from_end = (INT64)((INT_PTR)padding_end - (target + SITE_JUMP));
+	return from_start == (INT32)from_start && from_end == (INT32)from_end;
+}
+
+static AbsoluteJump absolute_jump(UINT64 destination)
 {
 	AbsoluteJump jump = { { JUMP_RIP[0], JUMP_RIP[1] }, 0, destination };
 
+	return jump;
+}
+
+static void write_absolute_jump(BYTE *at, UINT64 destination)
+{
+	AbsoluteJump jump = absolute_jump(destination);
+
 	patch_memory((INT_PTR)at, (const char *)&jump, sizeof jump);
+}
+
+void write_jump_back(BYTE *at, void *destination)
+{
+	AbsoluteJump jump = absolute_jump((UINT64)(ULONG_PTR)destination);
+
+	memcpy(at, &jump, sizeof jump);
 }
 
 static BOOL prologue_relocatable(BYTE *target)
@@ -85,7 +110,33 @@ static BOOL prologue_relocatable(BYTE *target)
 	return TRUE;
 }
 
-static int suspend_others(void)
+static HANDLE open_thread(DWORD id)
+{
+	HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, id);
+
+	if (!thread)
+		thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, id);
+	return thread;
+}
+
+static void leave_prologue(HANDLE thread, INT_PTR target, const TRAMPOLINE *ct)
+{
+	CONTEXT context = { 0 };
+	UINT i;
+
+	context.ContextFlags = CONTEXT_CONTROL;
+	if (!GetThreadContext(thread, &context))
+		return;
+	for (i = 0; i < ct->nIP; i++) {
+		if (context.Rip == (DWORD64)target + ct->oldIPs[i]) {
+			context.Rip = (DWORD64)(ULONG_PTR)ct->pTrampoline + ct->newIPs[i];
+			SetThreadContext(thread, &context);
+			return;
+		}
+	}
+}
+
+static int suspend_others(INT_PTR target, const TRAMPOLINE *ct)
 {
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
 	THREADENTRY32 entry = { sizeof entry };
@@ -100,11 +151,13 @@ static int suspend_others(void)
 
 		if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self)
 			continue;
-		thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
-		if (thread && SuspendThread(thread) != (DWORD)-1)
+		thread = open_thread(entry.th32ThreadID);
+		if (thread && SuspendThread(thread) != (DWORD)-1) {
+			leave_prologue(thread, target, ct);
 			suspended[count++] = thread;
-		else if (thread)
+		} else if (thread) {
 			CloseHandle(thread);
+		}
 	}
 	CloseHandle(snapshot);
 	return count;
@@ -120,7 +173,7 @@ static void resume_others(int count)
 	}
 }
 
-int install_far_hook(INT_PTR target, void *detour, void **original)
+int install_far_hook(INT_PTR target, void *detour, void **original, FinishHook finish, void *context)
 {
 	TRAMPOLINE ct = { 0 };
 	BYTE site_jump[SITE_JUMP] = { 0xE9, 0, 0, 0, 0 };
@@ -131,6 +184,8 @@ int install_far_hook(INT_PTR target, void *detour, void **original)
 
 	if (!prologue_relocatable((BYTE *)target))
 		return MH_ERROR_UNSUPPORTED_FUNCTION;
+	if (!padding_reaches(target))
+		return MH_ERROR_MEMORY_ALLOC;
 	far_buffer = VirtualAlloc(NULL, FAR_BUFFER_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if (!far_buffer)
 		return MH_ERROR_MEMORY_ALLOC;
@@ -148,10 +203,12 @@ int install_far_hook(INT_PTR target, void *detour, void **original)
 	}
 	VirtualProtect(far_buffer, FAR_BUFFER_SIZE, PAGE_EXECUTE_READ, &(DWORD){ 0 });
 	FlushInstructionCache(GetCurrentProcess(), far_buffer, FAR_BUFFER_SIZE);
+	if (finish)
+		finish(context, far_buffer);
 	write_absolute_jump(hop, (UINT64)ct.pRelay);
 	distance = (INT32)((INT_PTR)hop - (target + SITE_JUMP));
 	memcpy(site_jump + 1, &distance, sizeof distance);
-	suspended_count = suspend_others();
+	suspended_count = suspend_others(target, &ct);
 	patch_memory(target, (const char *)site_jump, sizeof site_jump);
 	resume_others(suspended_count);
 	*original = ct.pTrampoline;

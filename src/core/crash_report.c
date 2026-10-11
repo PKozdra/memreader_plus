@@ -458,7 +458,6 @@ static void add_plus_changes(Text *report, const CrashInput *input)
 
 static void add_modules(Text *report, const CrashInput *input)
 {
-	add_other_module_count(report);
 	add_timing_hooks(report);
 	(void)input;
 }

@@ -148,6 +148,16 @@ prologue_target PROC
 	ret
 prologue_target ENDP
 
+parked_target PROC
+	push rbx
+spin:
+	cmp dword ptr [rcx], 0
+	je spin
+	pop rbx
+	mov eax, 77
+	ret
+parked_target ENDP
+
 filler_code PROC
 	BYTE 40960 DUP (0)
 filler_code ENDP

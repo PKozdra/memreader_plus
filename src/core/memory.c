@@ -85,23 +85,19 @@ static BOOL is_writable(INT_PTR address, size_t size)
 	return TRUE;
 }
 
-static BOOL store(INT_PTR address, const void *source, size_t size)
-{
-	if (!in_game_image(address, size))
-		return guarded_copy((void *)address, source, size, FALSE);
-	if (is_writable(address, size) && guarded_copy((void *)address, source, size, FALSE))
-		return TRUE;
-	return WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
-}
-
 BOOL write_memory(INT_PTR address, const void *source, size_t size)
 {
-	return may_write(address, size) && store(address, source, size);
+	BOOL direct = !in_game_image(address, size) || is_writable(address, size);
+
+	if (direct && guarded_copy((void *)address, source, size, FALSE))
+		return TRUE;
+	return patch_memory(address, (const char *)source, size) ||
+		WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
 }
 
 BOOL zero_memory(INT_PTR address, size_t size)
 {
-	return may_write(address, size) && guarded_copy((void *)address, NULL, size, TRUE);
+	return guarded_copy((void *)address, NULL, size, TRUE);
 }
 
 void push_read_error(lua_State *L, int result)
@@ -385,7 +381,7 @@ static int l_write(lua_State *L)
 		return luaL_error(L, "passed invalid argument type");
 	}
 	check_write(L, 1, "write", address, size);
-	if (!store(address, source, size))
+	if (!write_memory(address, source, size))
 		return luaL_error(L, "failed to write memory");
 	return 0;
 }
@@ -459,10 +455,6 @@ static int check_patch(lua_State *L, int index, int number, PatchSite *site)
 		site_error(L, number, index + 1, lua_pushfstring(L, "must be 1 to %d bytes", MAX_PATCH_SIZE));
 	if (!in_game_image(site->address, site->size))
 		site_error(L, number, index, "address is outside the game's exe");
-	if (!may_write(site->address, site->size)) {
-		note_refusal(L, number ? "relocate_field" : "patch", site->address);
-		site_error(L, number, index, "refused: the exe's headers and import or export tables are never patched");
-	}
 	read_or_fail(L, site->address, site->current, site->size);
 	if (memcmp(site->current, site->bytes, site->size) == 0)
 		return PATCH_DONE;

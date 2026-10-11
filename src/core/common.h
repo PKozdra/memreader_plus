@@ -27,7 +27,9 @@ enum { MAX_ARGUMENTS = 16, REGISTER_ARGUMENTS = 4 };
 
 enum ReadResult { READ_OK, READ_FAILED, READ_TOO_LARGE, READ_NOT_CA_STRING };
 
-enum { SAVED_BYTES = 16, DEBUG_RECORD_SIZE = 0x400 };
+enum { SAVED_BYTES = 16, DEBUG_RECORD_SIZE = 0x400, MAX_HOOKS = 1000, JUMP_BACK_SIZE = 14 };
+
+enum HookKind { KIND_FUNCTION, KIND_SITE, KIND_CAVE };
 
 typedef struct {
 	BYTE type;
@@ -86,6 +88,27 @@ typedef struct {
 	size_t used;
 } Text;
 
+typedef struct {
+	UINT64 low;
+	UINT64 high;
+} FloatRegister;
+
+enum { SITE_FLOATS = 6, SITE_VECTORS = 16, SITE_REGISTERS = 16 };
+
+typedef struct {
+	FloatRegister floats[SITE_FLOATS];
+	FloatRegister upper[SITE_VECTORS];
+	UINT64 upper_used;
+	UINT64 spare;
+	UINT64 registers[SITE_REGISTERS];
+	UINT64 flags;
+	UINT64 return_address;
+} SiteFrame;
+
+_Static_assert(offsetof(SiteFrame, upper) == 96 && offsetof(SiteFrame, upper_used) == 352 &&
+	offsetof(SiteFrame, registers) == 368 && offsetof(SiteFrame, flags) == 496 &&
+	offsetof(SiteFrame, return_address) == 504 && sizeof(SiteFrame) == 512, "SiteFrame layout is shared with thunk.asm");
+
 typedef union {
 	lua_Debug fields;
 	char raw[DEBUG_RECORD_SIZE];
@@ -136,6 +159,7 @@ extern const luaL_Reg layout_functions[];
 extern const luaL_Reg call_functions[];
 extern const luaL_Reg hook_functions[];
 extern const luaL_Reg farhook_functions[];
+extern const luaL_Reg cave_functions[];
 extern const luaL_Reg frame_functions[];
 
 TypedValue *push_value(lua_State *L, int type, INT64 number);
@@ -165,6 +189,7 @@ void capture_code(INT_PTR address, BYTE *window);
 void remember_code(INT_PTR address, const BYTE *window);
 void remember_original(INT_PTR address, size_t size);
 BOOL code_section(int index, BYTE **start, BYTE **end);
+BOOL copy_original(INT_PTR address, BYTE *out, size_t size);
 int find_code_all(const char *pattern, const BYTE **found, int max);
 INT_PTR find_unique(const char *pattern);
 INT_PTR call_destination(INT_PTR call);
@@ -176,9 +201,9 @@ BOOL zero_memory(INT_PTR address, size_t size);
 const IMAGE_NT_HEADERS *game_headers(void);
 BOOL in_game_image(INT_PTR address, size_t size);
 BOOL patch_memory(INT_PTR address, const char *bytes, size_t size);
-BOOL may_write(INT_PTR address, size_t size);
 BOOL in_exe_code(INT_PTR address);
-BOOL is_hook_original(INT_PTR address);
+BOOL is_executable(INT_PTR address);
+BOOL in_own_module(INT_PTR address);
 BOOL in_hooked_prologue(INT_PTR address, size_t size);
 void note_line(const char *line);
 void note_refusal(lua_State *L, const char *what, INT_PTR address);
@@ -191,8 +216,21 @@ UINT64 argument_bits(lua_State *L, int index, int type);
 BOOL is_float_type(int type);
 void push_bits(lua_State *L, int type, UINT64 bits);
 void prepare_hooks(void);
-int install_far_hook(INT_PTR target, void *detour, void **original);
+typedef void (*FinishHook)(void *context, void *original);
+int install_far_hook(INT_PTR target, void *detour, void **original, FinishHook finish, void *context);
+void write_jump_back(BYTE *at, void *destination);
 BOOL hook_native(INT_PTR target, void *detour, const char *name, void **next);
+void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t size, FinishHook finish, void *context);
+BOOL prepare_site_stubs(void);
+void *site_stub(int index);
+void finish_site(void *context, void *original);
+int site_index(const SiteFrame *frame);
+int site_stub_at(ULONG_PTR address);
+void check_site_target(lua_State *L, INT_PTR target);
+void push_registers(lua_State *L);
+SiteFrame *swap_active_site(SiteFrame *frame);
+void site_entry(void);
+extern BYTE site_avx;
 void note_change(lua_State *L, const char *what, INT_PTR address, size_t size);
 void add_changes(Text *report);
 BOOL describe_hook_code(ULONG_PTR address, char *out, size_t size);
@@ -206,7 +244,6 @@ void add_native_stack(Text *text, const CONTEXT *start);
 void add_registers(Text *text, const CONTEXT *context);
 void add_code_bytes(Text *text, ULONG_PTR rip);
 void add_memory_use(Text *text);
-void add_other_module_count(Text *text);
 const char *other_program_at(ULONG_PTR address);
 const char *register_name(int index);
 BOOL is_printable(BYTE value);
@@ -214,7 +251,6 @@ int wide_text_length(const BYTE *bytes, int units);
 BOOL is_bad_pointer(ULONG_PTR value);
 BOOL is_heap_pointer(ULONG_PTR value);
 BOOL stack_enters(const CONTEXT *start, const ULONG_PTR *functions, int count, int depth);
-BOOL is_known_program(const char *name);
 void prepare_clues(void);
 void add_timing_hooks(Text *text);
 void add_damaged_memory(Text *text, const CONTEXT *context, const EXCEPTION_RECORD *record);

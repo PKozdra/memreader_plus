@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <intrin.h>
+#include <immintrin.h>
 #include <malloc.h>
 #include <tlhelp32.h>
 #include "lua.h"
@@ -197,6 +198,29 @@ static int l_exe_data_address(lua_State *L)
 	return 1;
 }
 
+static volatile LONG cave_hits;
+
+#pragma optimize("", off)
+static INT32 cave_target(INT32 a, INT32 b)
+{
+	return a * 10 + b;
+}
+#pragma optimize("", on)
+
+static int l_cave_count(lua_State *L)
+{
+	lua_pushinteger(L, cave_hits);
+	return 1;
+}
+
+static int l_cave_count_address(lua_State *L)
+{
+	void *address = (void *)&cave_hits;
+
+	lua_pushlstring(L, (const char *)&address, sizeof address);
+	return 1;
+}
+
 static INT64 hook_single(INT64 x)
 {
 	return x * 3 + 1;
@@ -256,7 +280,61 @@ INT64 frame_pointer_target(UINT64 *probe);
 INT64 frame_call(void *function, UINT64 *probe);
 INT64 frame_hooked(UINT64 *probe);
 INT32 prologue_target(void);
+INT32 parked_target(volatile LONG *flag);
 void filler_code(void);
+void site_target(void);
+void site_target_here(void);
+void site_far(void);
+void site_far_here(void);
+void site_overlap(void);
+void site_overlap_here(void);
+void site_overlap_b(void);
+void site_overlap_b_here(void);
+void site_flags_target(void);
+void site_flags_here(void);
+void site_single(void);
+void site_single_here(void);
+void site_rip_target(void);
+void site_rip_here(void);
+void site_inbound(void);
+void site_inbound_here(void);
+void site_ret_here(void);
+void site_spin(void);
+void site_spin_here(void);
+void site_probe(void);
+void site_probe_here(void);
+void site_xmm_probe(void);
+void site_xmm_here(void);
+void site_vector_probe(void);
+void site_vector_here(void);
+void site_crash(void);
+void site_crash_here(void);
+void site_table(void);
+void site_table_here(void);
+void site_codetable(void);
+void site_noise(void);
+void site_noise_here(void);
+void site_codetable_here(void);
+void site_split(void);
+void site_split_cold(void);
+void site_split_here(void);
+void site_split_free(void);
+void site_callee(void);
+void site_call_short(void);
+void site_call_short_here(void);
+void site_call_last(void);
+void site_call_last_here(void);
+void site_leaf(void);
+void site_leaf_here(void);
+void site_leaf_mid(void);
+void site_leaf_mid_here(void);
+void site_leaf_inbound(void);
+void site_leaf_inbound_here(void);
+void site_early(void);
+void site_early_here(void);
+void site_tail(void);
+void site_tail_here(void);
+void dirty_vectors(void);
 
 __declspec(noinline) void host_unwind_probe(UINT64 *probe)
 {
@@ -377,7 +455,60 @@ static const struct {
 	{ "frame_call", frame_call },
 	{ "frame_hooked", frame_hooked },
 	{ "prologue_target", prologue_target },
+	{ "parked_target", parked_target },
 	{ "filler_code", filler_code },
+	{ "cave_target", cave_target },
+	{ "site_target", site_target },
+	{ "site_target_here", site_target_here },
+	{ "site_far", site_far },
+	{ "site_far_here", site_far_here },
+	{ "site_overlap", site_overlap },
+	{ "site_overlap_here", site_overlap_here },
+	{ "site_overlap_b", site_overlap_b },
+	{ "site_overlap_b_here", site_overlap_b_here },
+	{ "site_flags_target", site_flags_target },
+	{ "site_flags_here", site_flags_here },
+	{ "site_single", site_single },
+	{ "site_single_here", site_single_here },
+	{ "site_rip_target", site_rip_target },
+	{ "site_rip_here", site_rip_here },
+	{ "site_inbound", site_inbound },
+	{ "site_inbound_here", site_inbound_here },
+	{ "site_ret_here", site_ret_here },
+	{ "site_spin", site_spin },
+	{ "site_spin_here", site_spin_here },
+	{ "site_probe", site_probe },
+	{ "site_probe_here", site_probe_here },
+	{ "site_xmm_probe", site_xmm_probe },
+	{ "site_xmm_here", site_xmm_here },
+	{ "site_vector_probe", site_vector_probe },
+	{ "site_vector_here", site_vector_here },
+	{ "site_crash", site_crash },
+	{ "site_crash_here", site_crash_here },
+	{ "site_table", site_table },
+	{ "site_table_here", site_table_here },
+	{ "site_codetable", site_codetable },
+	{ "site_noise", site_noise },
+	{ "site_noise_here", site_noise_here },
+	{ "site_codetable_here", site_codetable_here },
+	{ "site_split", site_split },
+	{ "site_split_here", site_split_here },
+	{ "site_split_free", site_split_free },
+	{ "site_callee", site_callee },
+	{ "site_call_short", site_call_short },
+	{ "site_call_short_here", site_call_short_here },
+	{ "site_call_last", site_call_last },
+	{ "site_call_last_here", site_call_last_here },
+	{ "site_leaf", site_leaf },
+	{ "site_leaf_here", site_leaf_here },
+	{ "site_leaf_mid", site_leaf_mid },
+	{ "site_leaf_mid_here", site_leaf_mid_here },
+	{ "site_leaf_inbound", site_leaf_inbound },
+	{ "site_leaf_inbound_here", site_leaf_inbound_here },
+	{ "site_early", site_early },
+	{ "site_early_here", site_early_here },
+	{ "site_tail", site_tail },
+	{ "site_tail_here", site_tail_here },
 };
 
 static int l_test_function(lua_State *L)
@@ -398,6 +529,8 @@ static int l_test_crash(lua_State *L)
 	lua_pushinteger(L, read_null());
 	return 1;
 }
+
+int l_test_catch_site_call(lua_State *L);
 
 static int l_test_recovered_crash(lua_State *L)
 {
@@ -793,6 +926,125 @@ static void write_move_calls(void)
 	fclose(file);
 }
 
+static volatile LONG park_flag;
+static HANDLE park_thread;
+static void (WINAPI *real_system_info)(LPSYSTEM_INFO info);
+
+static DWORD WINAPI run_parked(void *function)
+{
+	return (DWORD)((INT32 (*)(volatile LONG *))function)(&park_flag);
+}
+
+static BOOL park_rip(DWORD64 *rip)
+{
+	CONTEXT context = { 0 };
+	BOOL found;
+
+	context.ContextFlags = CONTEXT_CONTROL;
+	if (SuspendThread(park_thread) == (DWORD)-1)
+		return FALSE;
+	found = GetThreadContext(park_thread, &context);
+	ResumeThread(park_thread);
+	*rip = context.Rip;
+	return found;
+}
+
+static int l_test_park_start(lua_State *L)
+{
+	DWORD64 function, rip = 0;
+	int tries;
+
+	memcpy(&function, luaL_checkstring(L, 1), sizeof function);
+	park_flag = 0;
+	park_thread = CreateThread(NULL, 0, run_parked, (void *)function, 0, NULL);
+	for (tries = 0; tries < 200; tries++) {
+		Sleep(10);
+		if (park_rip(&rip) && rip >= function && rip < function + 16) {
+			lua_pushboolean(L, 1);
+			return 1;
+		}
+	}
+	lua_pushboolean(L, 0);
+	return 1;
+}
+
+static int l_test_park_rip(lua_State *L)
+{
+	DWORD64 rip = 0;
+
+	if (!park_rip(&rip))
+		return 0;
+	lua_pushlstring(L, (const char *)&rip, sizeof rip);
+	return 1;
+}
+
+static int l_test_park_flag(lua_State *L)
+{
+	void *address = (void *)&park_flag;
+
+	lua_pushlstring(L, (const char *)&address, sizeof address);
+	return 1;
+}
+
+static int l_test_park_finish(lua_State *L)
+{
+	DWORD result = 0;
+	BOOL finished;
+
+	park_flag = 1;
+	finished = WaitForSingleObject(park_thread, 5000) == WAIT_OBJECT_0;
+	if (finished)
+		GetExitCodeThread(park_thread, &result);
+	else
+		TerminateThread(park_thread, 0);
+	CloseHandle(park_thread);
+	if (!finished)
+		return 0;
+	lua_pushinteger(L, result);
+	return 1;
+}
+
+static void WINAPI far_only_system_info(LPSYSTEM_INFO info)
+{
+	real_system_info(info);
+	info->lpMinimumApplicationAddress = info->lpMaximumApplicationAddress;
+	info->lpMaximumApplicationAddress = (LPVOID)(ULONG_PTR)0x10000;
+}
+
+static int l_test_far_function(lua_State *L)
+{
+	static const BYTE code[] = { 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3, 0x90, 0x90 };
+	ULONG_PTR exe = (ULONG_PTR)GetModuleHandleW(NULL);
+	ULONG_PTR distance;
+	BYTE *page = NULL;
+	DWORD old;
+
+	for (distance = 0x100000000ULL; !page && distance < 0x400000000ULL; distance += 0x10000000ULL)
+		page = VirtualAlloc((LPVOID)((exe - distance) & ~(ULONG_PTR)0xFFFF), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	if (!page)
+		return 0;
+	memcpy(page, code, sizeof code);
+	VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+	lua_pushlstring(L, (const char *)&page, sizeof page);
+	return 1;
+}
+
+static int l_test_force_far_hooks(lua_State *L)
+{
+	BOOL on = lua_toboolean(L, 1);
+	void *ignored = NULL;
+
+	find_plus(L, 2);
+	if (on && !real_system_info) {
+		replace_plus_import("GetSystemInfo", (void *)far_only_system_info, (void **)&real_system_info);
+	} else if (!on && real_system_info) {
+		replace_plus_import("GetSystemInfo", (void *)real_system_info, &ignored);
+		real_system_info = NULL;
+	}
+	lua_pushboolean(L, !on || real_system_info != NULL);
+	return 1;
+}
+
 static const struct {
 	const char *name;
 	void (*function)(void);
@@ -864,6 +1116,79 @@ static int l_test_protect(lua_State *L)
 	return 1;
 }
 
+static int l_test_page(lua_State *L)
+{
+	char *page = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+	lua_pushlstring(L, (const char *)&page, sizeof page);
+	return 1;
+}
+
+static int l_test_protection(lua_State *L)
+{
+	MEMORY_BASIC_INFORMATION region;
+	void *address;
+
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	VirtualQuery(address, &region, sizeof region);
+	lua_pushinteger(L, region.Protect);
+	return 1;
+}
+
+static int l_test_system_address(lua_State *L)
+{
+	FARPROC function = GetProcAddress(GetModuleHandleA(luaL_checkstring(L, 1)), luaL_checkstring(L, 2));
+
+	lua_pushlstring(L, (const char *)&function, sizeof function);
+	return 1;
+}
+
+static int l_test_process_id(lua_State *L)
+{
+	lua_pushinteger(L, GetCurrentProcessId());
+	return 1;
+}
+
+static int l_test_has_avx(lua_State *L)
+{
+	lua_pushboolean(L, (GetEnabledXStateFeatures() & XSTATE_MASK_AVX) != 0);
+	return 1;
+}
+
+static int l_test_clobber_vectors(lua_State *L)
+{
+	(void)L;
+	_mm256_zeroupper();
+	return 0;
+}
+
+static struct {
+	BYTE header[4];
+	RUNTIME_FUNCTION parent;
+} chain_info = { { 0x21, 0, 0, 0 } };
+
+static int l_test_chain_cold_part(lua_State *L)
+{
+	DWORD64 base = 0;
+	PRUNTIME_FUNCTION hot = RtlLookupFunctionEntry((DWORD64)site_split, &base, NULL);
+	PRUNTIME_FUNCTION cold = RtlLookupFunctionEntry((DWORD64)site_split_cold, &base, NULL);
+	DWORD old;
+
+	chain_info.parent = *hot;
+	VirtualProtect(cold, sizeof *cold, PAGE_READWRITE, &old);
+	cold->UnwindData = (DWORD)((BYTE *)&chain_info - (BYTE *)base);
+	VirtualProtect(cold, sizeof *cold, old, &old);
+	lua_pushboolean(L, hot && cold && hot != cold);
+	return 1;
+}
+
+static int l_test_dirty_vectors(lua_State *L)
+{
+	(void)L;
+	dirty_vectors();
+	return 0;
+}
+
 static LONG access_faults;
 
 static LONG CALLBACK count_access_fault(EXCEPTION_POINTERS *info)
@@ -912,7 +1237,24 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_fault", l_test_fault);
 	lua_register(L, "test_sleep", l_test_sleep);
 	lua_register(L, "test_protect", l_test_protect);
+	lua_register(L, "test_protection", l_test_protection);
+	lua_register(L, "test_page", l_test_page);
+	lua_register(L, "test_system_address", l_test_system_address);
+	lua_register(L, "test_process_id", l_test_process_id);
+	lua_register(L, "test_has_avx", l_test_has_avx);
+	lua_register(L, "test_clobber_vectors", l_test_clobber_vectors);
+	lua_register(L, "test_dirty_vectors", l_test_dirty_vectors);
+	lua_register(L, "test_chain_cold_part", l_test_chain_cold_part);
+	lua_register(L, "cave_count", l_cave_count);
+	lua_register(L, "cave_count_address", l_cave_count_address);
 	lua_register(L, "test_access_faults", l_test_access_faults);
+	lua_register(L, "test_park_start", l_test_park_start);
+	lua_register(L, "test_park_rip", l_test_park_rip);
+	lua_register(L, "test_park_flag", l_test_park_flag);
+	lua_register(L, "test_park_finish", l_test_park_finish);
+	lua_register(L, "test_force_far_hooks", l_test_force_far_hooks);
+	lua_register(L, "test_far_function", l_test_far_function);
+	lua_register(L, "test_catch_site_call", l_test_catch_site_call);
 	lua_register(L, "test_heap_blocks", l_test_heap_blocks);
 	lua_register(L, "test_open_streams", l_test_open_streams);
 	lua_register(L, "exe_data_address", l_exe_data_address);

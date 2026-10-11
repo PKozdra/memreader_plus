@@ -1,0 +1,50 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+jobs:
+  release:
+    runs-on: windows-2022
+    env:
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pwsh -File build.ps1
+      - run: pwsh -File tests\run.ps1
+      - name: Checksums
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist\memreader_plus.dll, ..\memreader_plus.pack release\
+          Get-ChildItem release | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Move-Item SHA256SUMS.txt release\
+          Get-Content release\SHA256SUMS.txt
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/memreader_plus.dll
+            release/memreader_plus.pack
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/memreader_plus.dll
+            release/memreader_plus.pack
+            release/SHA256SUMS.txt
+      - name: VirusTotal
+        if: ${{ env.VT_API_KEY != '' }}
+        continue-on-error: true
+        uses: crazy-max/ghaction-virustotal@v4
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          github_token: ${{ github.token }}
+          update_release_body: true
+          files: |
+            release/memreader_plus.dll
+            release/memreader_plus.pack

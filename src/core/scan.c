@@ -392,7 +392,7 @@ static void overlay_saved(const SavedCode *code, INT_PTR address, BYTE *out, siz
 		memcpy(out + (from - address), code->bytes + (from - code->start), (size_t)(to - from));
 }
 
-static BOOL copy_original(INT_PTR address, BYTE *out, size_t size)
+BOOL copy_original(INT_PTR address, BYTE *out, size_t size)
 {
 	int i;
 

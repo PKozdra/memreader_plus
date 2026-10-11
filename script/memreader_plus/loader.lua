@@ -116,16 +116,10 @@ local function load_file_edit_specs(plus, folder)
 	end
 end
 
-local function apply_saved_file_edit_switch(plus)
-	local switch = assert(loadfile('/script/memreader_plus/file_edit_switch'))()
-	if get_mct and switch.saved_off() then plus.set_file_edits(false) end
-end
-
 local twui_ok, twui_problem = pcall(load_twui, memreader)
 if not twui_ok then log('TWUI module not loaded: ' .. tostring(twui_problem)) end
 log_file_edit_notes(memreader)
 local edits_ok, edits_problem = pcall(function()
-	apply_saved_file_edit_switch(memreader)
 	load_file_edit_specs(memreader, '/script/memreader_plus/file_edits/')
 end)
 if not edits_ok then log('file edits from script/memreader_plus/file_edits not loaded: ' .. tostring(edits_problem)) end

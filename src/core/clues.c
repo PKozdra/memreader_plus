@@ -29,25 +29,9 @@ static TimingFunction timing[] = {
 	{ "winmm.dll", "timeGetTime", 0, NULL }
 };
 
-static const char *known_programs[] = {
-	"steamclient64.dll", "gameoverlayrenderer64.dll", "tier0_s64.dll", "vstdlib_s64.dll", "MpOav.dll",
-	"DiscordHook64.dll", "NvTelemetryAPI64.dll", "NvTelemetryBridge64.dll", "RTSSHooks64.dll", "nvspcap64.dll"
-};
-
 static const char *private_marks[] = { ":\\", ":/", "\\users\\", "/users/" };
 
 static char user_name[USER_NAME_SIZE];
-
-BOOL is_known_program(const char *name)
-{
-	int i;
-
-	for (i = 0; i < (int)(sizeof known_programs / sizeof known_programs[0]); i++) {
-		if (_stricmp(known_programs[i], name) == 0)
-			return TRUE;
-	}
-	return FALSE;
-}
 
 static const ULONG_PTR *slot_named(ULONG_PTR image, const IMAGE_IMPORT_DESCRIPTOR *entry, const char *name)
 {

@@ -12,9 +12,9 @@ $failed = @()
 $skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
-    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
+    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; far_hook = 0; cave = 0; cave_session = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
     file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
-    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash
+    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash; fault_report_in_site = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
     fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash
     fault_report_two_threads = $crash; fault_report_worker_stuck = $crash; fault_report_worker_waits = $crash
@@ -25,7 +25,7 @@ $expect = [ordered]@{
     report_snapshot = 0; report_native = 0; report_lua_only = 0; report_loader = 0
 }
 $reports = @{
-    fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'
+    fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'; fault_report_in_site = 'started'
     fault_report_stale = 'started'; fault_report_thread = 'started'; fault_report_native_thread = 'started'; fault_report_overflow = 'started'
     fault_report_cpp = 'started'; fault_report_fallback = 'started'; fault_report_clues = 'started'
     fault_report_two_threads = 'started'; fault_report_worker_stuck = 'none'; fault_report_worker_waits = 'started'
@@ -39,7 +39,7 @@ $runtimeCounts = @{
 }
 $readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
-    fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull
+    fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull; fault_report_in_site = $readOfNull
     fault_report_stale = $readOfNull; fault_report_thread = $readOfNull; fault_report_native_thread = $readOfNull
     fault_report_overflow = @('exception 0xc00000fd (stack overflow)'); fault_report_cpp = @('exception 0xe06d7363 (C++ exception, type .H)')
     fault_report_fallback = $readOfNull; fault_report_clues = @('exception 0xc0000005 (access violation)')
@@ -48,7 +48,7 @@ $faultNeedles = @{
 }
 $nativeNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the crashing thread, innermost first:', '  #0 ', ', offset +0x',
-    'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
+    'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: '
 )
 $exitScenarios = @('exit_report', 'exit_report_terminate', 'exit_report_crt')
 $systemHooks = Select-String -Path (Join-Path $root 'build\CMakeCache.txt') -Pattern '^MEMREADER_SYSTEM_EXIT_HOOKS:BOOL=ON$' -Quiet
@@ -56,7 +56,7 @@ if (-not $systemHooks) { foreach ($name in $exitScenarios) { $reports[$name] = '
 $dllText = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes((Join-Path $root 'build\Release\memreader_plus.dll')))
 $exitNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the thread that ended the game, innermost first:', '  #0 ', ', offset +0x',
-    'Warhammer3.exe+0x', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
+    'Warhammer3.exe+0x', 'memreader Plus hooks: '
 )
 $exitAbsent = @('report_me', "The game's crash handler caught it", 'Lua stack', '  #0 memreader_plus', 'Registers of the crashing thread:')
 $offScriptThread = @('fault_report_native_thread', 'fault_report_two_threads', 'fault_report_worker_waits')
@@ -66,7 +66,7 @@ $timeLimits = @{
 $moveCalls = @{ fault_report_move_retry = '4'; fault_report_move_fails = '5' }
 $staleTemporary = 'memreader_crash_report_010101_0000.txt.1.tmp'
 $otherDll = 'fake_overlay64.dll'
-$otherDllCount = "Other programs' DLLs loaded: [1-9]"
+$otherDllCountLine = "Other programs' DLLs loaded"
 $hookerDll = 'fake_speedhack64.dll'
 $noTimingHooks = "No other program's DLL hooks the game's timing functions"
 $steamScenario = 'fault_report_cpp'
@@ -81,6 +81,7 @@ $scenarioNeedles = @{
         '  ... 6 more patches not listed', '[string "newest_patch"]:1'
     )
     fault_report_in_callback = @('RUNNING (on the stack)', ', callback ')
+    fault_report_in_site = @(', site hook, RUNNING (on the stack)', ', callback ')
     fault_report_native_thread = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
     fault_report_two_threads = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
     fault_report_worker_waits = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
@@ -95,6 +96,7 @@ $scenarioNeedles = @{
         "  $hookerDll hooks timeGetTime"
     )
 }
+$scenarioPatterns = @{ fault_report_in_site = 'Warhammer3\.exe\+0x[0-9a-f]+  function \+0x[0-9a-f]+, offset \+0x128\r?\n' }
 $contextNeedles = @(
     'Game context set by script at safe moments:', '  mode: campaign', '  campaign: main_warhammer', '  campaign type: sp', '  difficulty: hard',
     '  turn: 42', '  player: wh_a', '  humans: wh_a, wh_b', '  note: first second', '  phase: quitting'
@@ -111,9 +113,9 @@ $reportLimit = 48 * 1024
 $runtimePrefix = 'memreader_runtime_report_'
 $runtimeNeedles = @(
     ' runtime report', 'written on request, nothing crashed', 'Thread: the script thread', 'Script logging is off', 'Game running for ',
-    'Memory: game ', 'memreader Plus hooks: ', "Other programs' DLLs loaded: "
+    'Memory: game ', 'memreader Plus hooks: '
 )
-$runtimeAbsent = @('Lua stack', 'Registers of the crashing thread:', 'Native stack of', "The game's crash handler caught it", 'exception 0x')
+$runtimeAbsent = @('Lua stack', "Other programs' DLLs loaded", 'Registers of the crashing thread:', 'Native stack of', "The game's crash handler caught it", 'exception 0x')
 $gameFilesNote = "The game's own crash files for this crash, in the game crash folder: D"
 $commandLineStart = 'Command line: '
 $commandLineBuffer = 1039
@@ -246,6 +248,7 @@ foreach ($scenario in $expect.Keys) {
             $missing = @($needles | Where-Object { -not $text -or -not $text.Contains($_) })
             foreach ($needle in $missing) { $failed += "$scenario (report lacks: $needle)" }
             if ($missing) { $text }
+            if ($scenarioPatterns.Contains($scenario) -and $text -notmatch $scenarioPatterns[$scenario]) { $failed += "$scenario (report has no line matching $($scenarioPatterns[$scenario]))" }
             if ($scenario -eq 'fault_report_no_log') {
                 $line = $text -split "`n" | Where-Object { $_.StartsWith($commandLineStart) }
                 if (-not $line -or $line.Length -gt $commandLineStart.Length + $commandLineBuffer -or -not $line.EndsWith('x')) { $failed += "$scenario (long command line not cut at its buffer: $($line.Length) characters)" }
@@ -262,7 +265,7 @@ foreach ($scenario in $expect.Keys) {
             }
             if ($text -and $text.Contains($env:USERPROFILE)) { $failed += "$scenario (report shows the user profile path)" }
             if ($text -and $text.Contains($otherDll)) { $failed += "$scenario (report names another program's DLL)" }
-            if ($text -notmatch $otherDllCount) { $failed += "$scenario (report lacks the count of other programs' DLLs)" }
+            if ($text -and $text.Contains($otherDllCountLine)) { $failed += "$scenario (report shows the count of other programs' DLLs)" }
             if ($scenario -eq $steamScenario) {
                 if (-not $text.Contains($steamCommandLine)) { $failed += "$scenario (report lacks: $steamCommandLine)" }
                 if ($text.Contains((Join-Path $work 'library'))) { $failed += "$scenario (report shows the Steam library path)" }

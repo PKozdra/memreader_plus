@@ -6,7 +6,7 @@
 #include "buffer.h"
 #include "hde/hde64.h"
 
-enum { MAX_HOOKS = 1000, MAX_CALLBACKS = 16, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8, SAVED_REGISTERS = 6 };
+enum { MAX_CALLBACKS = 16, MAX_ERROR_LENGTH = 255, EXTRA_STACK_SLOTS = 8, SAVED_REGISTERS = 6 };
 
 enum { TRAMPOLINE_SIZE = 64, MAX_REPORTED_HOOKS = 24, SITE_JUMP = 5, PROLOGUE_READ = 32 };
 
@@ -20,9 +20,12 @@ typedef struct {
 
 typedef struct {
 	INT_PTR target;
+	int kind;
 	int copied;
 	void *trampoline;
 	void *original;
+	void *cave;
+	size_t cave_size;
 	const char *native;
 	Signature signature;
 	Callback callbacks[MAX_CALLBACKS];
@@ -32,11 +35,6 @@ typedef struct {
 	LONG other_thread_calls;
 	char error[MAX_ERROR_LENGTH + 1];
 } Hook;
-
-typedef struct {
-	UINT64 low;
-	UINT64 high;
-} FloatRegister;
 
 typedef struct {
 	UINT64 registers[SAVED_REGISTERS];
@@ -63,6 +61,7 @@ typedef struct {
 typedef struct HookCall {
 	Hook *hook;
 	HookFrame *frame;
+	SiteFrame *registers;
 	int level;
 	int passed_down;
 	struct HookCall *outer;
@@ -97,17 +96,6 @@ static Hook *find_hook(INT_PTR target)
 			return &hooks[i];
 	}
 	return NULL;
-}
-
-BOOL is_hook_original(INT_PTR address)
-{
-	int i;
-
-	for (i = 0; i < hook_count; i++) {
-		if ((INT_PTR)hooks[i].original == address || (INT_PTR)hooks[i].trampoline == address)
-			return TRUE;
-	}
-	return FALSE;
 }
 
 BOOL in_hooked_prologue(INT_PTR address, size_t size)
@@ -190,24 +178,37 @@ void prepare_hooks(void)
 		memory_near_game = AllocateBuffer(GetModuleHandleW(NULL));
 }
 
-static MH_STATUS new_hook(INT_PTR target, Hook **made)
+static MH_STATUS install_code(INT_PTR target, void *detour, FinishHook finish, void *context, void **trampoline)
 {
-	BYTE window[SAVED_BYTES];
-	Hook *hook = &hooks[hook_count];
-	MH_STATUS status;
+	MH_STATUS status = MH_CreateHook((LPVOID)target, detour, trampoline);
 
-	hook->target = target;
-	hook->copied = copied_length(target);
-	hook->callback_count = 0;
-	capture_code(target, window);
-	status = MH_CreateHook((LPVOID)target, &stubs[hook_count], &hook->trampoline);
 	if (status == MH_OK) {
+		if (finish)
+			finish(context, *trampoline);
 		status = MH_EnableHook((LPVOID)target);
 		if (status != MH_OK)
 			MH_RemoveHook((LPVOID)target);
 	}
 	if (status == MH_ERROR_MEMORY_ALLOC)
-		status = install_far_hook(target, &stubs[hook_count], &hook->trampoline);
+		status = install_far_hook(target, detour, trampoline, finish, context);
+	return status;
+}
+
+static MH_STATUS new_hook(INT_PTR target, int kind, void *detour, FinishHook finish, void *context, Hook **made)
+{
+	BYTE window[SAVED_BYTES];
+	Hook *hook = &hooks[hook_count];
+	int copied = copied_length(target);
+	MH_STATUS status;
+
+	if (in_hooked_prologue(target, copied))
+		return MH_ERROR_ALREADY_CREATED;
+	hook->target = target;
+	hook->kind = kind;
+	hook->copied = copied;
+	hook->callback_count = 0;
+	capture_code(target, window);
+	status = install_code(target, detour, finish, context, &hook->trampoline);
 	if (status != MH_OK)
 		return status;
 	remember_code(target, window);
@@ -219,37 +220,81 @@ static MH_STATUS new_hook(INT_PTR target, Hook **made)
 
 static BOOL can_hook(INT_PTR target)
 {
-	return in_exe_code(target) && is_read_only_code(target);
+	return is_read_only_code(target) && !in_own_module(target);
 }
 
-static Hook *install_hook(lua_State *L, INT_PTR target)
+static const char *kind_name(int kind)
+{
+	switch (kind) {
+	case KIND_SITE: return "site hook";
+	case KIND_CAVE: return "code cave";
+	}
+	return "function hook";
+}
+
+static void check_hook_start(lua_State *L, INT_PTR target, int kind)
+{
+	if (!can_hook(target)) {
+		note_refusal(L, NULL, target);
+		luaL_argerror(L, 1, "refused: this takes only read-only executable code outside memreader Plus's own module");
+	}
+	if (hook_count == MAX_HOOKS)
+		luaL_error(L, "at most %d addresses can be hooked per game session", MAX_HOOKS);
+	if (!start_hooking() || (kind == KIND_SITE && !prepare_site_stubs()))
+		luaL_error(L, "cannot start hooking");
+}
+
+static void fill_detour(int kind, void **detour, FinishHook *finish, void **context)
+{
+	if (kind == KIND_FUNCTION)
+		*detour = &stubs[hook_count];
+	if (kind == KIND_SITE) {
+		*detour = site_stub(hook_count);
+		*finish = finish_site;
+		*context = (void *)(INT_PTR)hook_count;
+	}
+}
+
+static Hook *install_hook(lua_State *L, INT_PTR target, int kind, void *detour, FinishHook finish, void *context)
 {
 	Hook *hook = NULL;
 	MH_STATUS status;
 
-	if (!can_hook(target)) {
-		note_refusal(L, "hook", target);
-		luaL_argerror(L, 1, "refused: hook takes only read-only code in the game's exe");
-	}
-	if (hook_count == MAX_HOOKS)
-		luaL_error(L, "at most %d addresses can be hooked per game session", MAX_HOOKS);
-	if (!start_hooking())
-		luaL_error(L, "cannot start hooking");
-	status = new_hook(target, &hook);
+	check_hook_start(L, target, kind);
+	if (kind != KIND_FUNCTION)
+		check_site_target(L, target);
+	fill_detour(kind, &detour, &finish, &context);
+	status = new_hook(target, kind, detour, finish, context, &hook);
 	if (status == MH_ERROR_MEMORY_ALLOC)
 		luaL_error(L, "cannot hook %p: no free memory near the game's code for the trampoline", (void *)target);
 	if (status == MH_ERROR_UNSUPPORTED_FUNCTION)
 		luaL_error(L, "cannot hook %p: its first bytes cannot run from far memory once the near area is full", (void *)target);
+	if (status == MH_ERROR_ALREADY_CREATED)
+		luaL_error(L, "cannot hook %p: it overlaps the first bytes of another hook", (void *)target);
 	if (status != MH_OK)
 		luaL_error(L, "cannot hook %p: %s", (void *)target, MH_StatusToString(status));
 	return hook;
+}
+
+void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t size, FinishHook finish, void *context)
+{
+	Hook *hook = find_hook(target);
+
+	if (hook)
+		luaL_error(L, "%p already holds a %s", (void *)target, kind_name(hook->kind));
+	hook = install_hook(L, target, KIND_CAVE, detour, finish, context);
+	hook->cave = detour;
+	hook->cave_size = size;
 }
 
 BOOL hook_native(INT_PTR target, void *detour, const char *name, void **next)
 {
 	Hook *hook = find_hook(target);
 
-	if (!hook && (hook_count == MAX_HOOKS || !can_hook(target) || !start_hooking() || new_hook(target, &hook) != MH_OK))
+	if (!hook && (hook_count == MAX_HOOKS || !can_hook(target) || !start_hooking() ||
+			new_hook(target, KIND_FUNCTION, &stubs[hook_count], NULL, NULL, &hook) != MH_OK))
+		return FALSE;
+	if (hook->kind != KIND_FUNCTION)
 		return FALSE;
 	if (hook->native)
 		return FALSE;
@@ -382,6 +427,11 @@ static int dispatch(lua_State *L)
 
 	luaL_checkstack(L, MAX_ARGUMENTS + EXTRA_STACK_SLOTS, "hook arguments");
 	lua_rawgeti(L, LUA_REGISTRYINDEX, call->hook->callbacks[call->level].function);
+	if (call->registers) {
+		push_registers(L);
+		lua_call(L, 1, 0);
+		return 0;
+	}
 	for (i = 0; i < signature->count; i++)
 		push_bits(L, signature->arguments[i], argument_slot(call->frame, i, signature->arguments[i]));
 	lua_call(L, signature->count, 1);
@@ -437,8 +487,11 @@ static BOOL run_callbacks(HookCall *call)
 			return FALSE;
 		lua_rawgeti(L, LUA_REGISTRYINDEX, runner);
 		lua_pushlightuserdata(L, call);
-		if (lua_pcall(L, 1, 0, 0) == 0)
-			return TRUE;
+		if (lua_pcall(L, 1, 0, 0) == 0) {
+			if (!call->registers)
+				return TRUE;
+			continue;
+		}
 		keep_error(hook, L);
 		detach(hook, call->level);
 		if (call->passed_down == call->level)
@@ -449,7 +502,7 @@ static BOOL run_callbacks(HookCall *call)
 
 int run_hook(Hook *hook, HookFrame *frame)
 {
-	HookCall call = { hook, frame, hook->callback_count, -1, innermost };
+	HookCall call = { hook, frame, NULL, hook->callback_count, -1, innermost };
 	enum HookOutcome outcome;
 	LONG paused;
 	BOOL done;
@@ -479,6 +532,51 @@ int run_hook(Hook *hook, HookFrame *frame)
 		compact(hook);
 	}
 	return done ? outcome : RUN_ORIGINAL;
+}
+
+static BOOL has_dirty_upper_halves(const SiteFrame *frame)
+{
+	int i;
+
+	for (i = 0; i < SITE_VECTORS; i++) {
+		if (frame->upper[i].low | frame->upper[i].high)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+void run_site(SiteFrame *frame)
+{
+	Hook *hook = &hooks[site_index(frame)];
+	HookCall call = { hook, NULL, frame, hook->callback_count, -1, innermost };
+	SiteFrame *outer;
+	LONG paused;
+
+	frame->upper_used = site_avx && has_dirty_upper_halves(frame);
+	if (GetCurrentThreadId() != script_thread) {
+		InterlockedIncrement(&hook->other_thread_calls);
+		return;
+	}
+	if (runner == LUA_NOREF || next_runnable(hook, call.level) < 0)
+		return;
+	hook->calls++;
+	hook->running++;
+	callback_depth++;
+	paused = pause_guarded_calls();
+	outer = swap_active_site(frame);
+	frame->spare = frame->return_address;
+	frame->return_address = (UINT64)(hook->target + hook->copied);
+	__try {
+		run_callbacks(&call);
+	} __finally {
+		if (!AbnormalTermination())
+			frame->return_address = frame->spare;
+		swap_active_site(outer);
+		resume_guarded_calls(paused);
+		callback_depth--;
+		hook->running--;
+		compact(hook);
+	}
 }
 
 static HookCall *find_call(INT_PTR target)
@@ -584,26 +682,10 @@ static int l_hook_next(lua_State *L)
 	return passed_down(call, level, results);
 }
 
-static int l_hook(lua_State *L)
+static int add_callback(lua_State *L, Hook *hook, int function, const Signature *signature)
 {
-	INT_PTR target = pointer_argument(L, 1);
-	Signature signature;
 	Callback *callback;
-	Hook *hook;
 
-	parse_signature(L, luaL_checkstring(L, 2), &signature);
-	luaL_checktype(L, 3, LUA_TFUNCTION);
-	if (!target)
-		return luaL_argerror(L, 1, "address is NULL");
-	hook = find_hook(target);
-	if (hook && (attached_count(hook) > 0 || hook->running > 0)) {
-		if (!same_signature(&hook->signature, &signature))
-			return luaL_error(L, "%p is already hooked in this mode with a different signature", (void *)target);
-		if (find_callback(L, hook, 3) >= 0)
-			return luaL_error(L, "this callback is already attached to %p", (void *)target);
-	}
-	if (!hook)
-		hook = install_hook(L, target);
 	compact(hook);
 	if (hook->callback_count == MAX_CALLBACKS && attached_count(hook) < MAX_CALLBACKS)
 		return luaL_error(L, "unhooked callbacks keep their place until the running call returns; at most %d per address", MAX_CALLBACKS);
@@ -611,7 +693,8 @@ static int l_hook(lua_State *L)
 		return luaL_error(L, "at most %d callbacks per address", MAX_CALLBACKS);
 	watch_state_close(L);
 	if (attached_count(hook) == 0) {
-		hook->signature = signature;
+		if (signature)
+			hook->signature = *signature;
 		hook->calls = 0;
 		InterlockedExchange(&hook->other_thread_calls, 0);
 		hook->error[0] = '\0';
@@ -620,9 +703,56 @@ static int l_hook(lua_State *L)
 	callback->state = L;
 	lua_pushthread(L);
 	callback->thread = luaL_ref(L, LUA_REGISTRYINDEX);
-	lua_pushvalue(L, 3);
+	lua_pushvalue(L, function);
 	callback->function = luaL_ref(L, LUA_REGISTRYINDEX);
 	return 0;
+}
+
+static Hook *find_hook_of_kind(lua_State *L, INT_PTR target, int kind)
+{
+	Hook *hook = find_hook(target);
+
+	if (hook && hook->kind != kind)
+		luaL_error(L, "%p already holds a %s", (void *)target, kind_name(hook->kind));
+	return hook;
+}
+
+static int l_hook(lua_State *L)
+{
+	INT_PTR target = pointer_argument(L, 1);
+	Signature signature;
+	Hook *hook;
+
+	parse_signature(L, luaL_checkstring(L, 2), &signature);
+	luaL_checktype(L, 3, LUA_TFUNCTION);
+	if (!target)
+		return luaL_argerror(L, 1, "address is NULL");
+	hook = find_hook_of_kind(L, target, KIND_FUNCTION);
+	if (hook && (attached_count(hook) > 0 || hook->running > 0)) {
+		if (!same_signature(&hook->signature, &signature))
+			return luaL_error(L, "%p is already hooked in this mode with a different signature", (void *)target);
+		if (find_callback(L, hook, 3) >= 0)
+			return luaL_error(L, "this callback is already attached to %p", (void *)target);
+	}
+	if (!hook)
+		hook = install_hook(L, target, KIND_FUNCTION, NULL, NULL, NULL);
+	return add_callback(L, hook, 3, &signature);
+}
+
+static int l_hook_site(lua_State *L)
+{
+	INT_PTR target = pointer_argument(L, 1);
+	Hook *hook;
+
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	if (!target)
+		return luaL_argerror(L, 1, "address is NULL");
+	hook = find_hook_of_kind(L, target, KIND_SITE);
+	if (hook && find_callback(L, hook, 2) >= 0)
+		return luaL_error(L, "this callback is already attached to %p", (void *)target);
+	if (!hook)
+		hook = install_hook(L, target, KIND_SITE, NULL, NULL, NULL);
+	return add_callback(L, hook, 2, NULL);
 }
 
 static int l_unhook(lua_State *L)
@@ -656,7 +786,9 @@ static int l_hook_info(lua_State *L)
 		return 1;
 	}
 	attached = attached_count(hook);
-	lua_createtable(L, 0, 6);
+	lua_createtable(L, 0, 8);
+	lua_pushstring(L, hook->kind == KIND_SITE ? "site" : hook->kind == KIND_CAVE ? "cave" : "function");
+	lua_setfield(L, -2, "kind");
 	push_value(L, VALUE_POINTER, (INT_PTR)hook->original);
 	lua_setfield(L, -2, "original");
 	lua_pushboolean(L, attached > 0);
@@ -667,6 +799,10 @@ static int l_hook_info(lua_State *L)
 	lua_setfield(L, -2, "calls");
 	lua_pushnumber(L, (lua_Number)hook->other_thread_calls);
 	lua_setfield(L, -2, "other_thread_calls");
+	if (hook->cave) {
+		push_value(L, VALUE_POINTER, (INT_PTR)hook->cave);
+		lua_setfield(L, -2, "cave");
+	}
 	if (hook->error[0]) {
 		lua_pushstring(L, hook->error);
 		lua_setfield(L, -2, "error");
@@ -674,23 +810,40 @@ static int l_hook_info(lua_State *L)
 	return 1;
 }
 
+static void describe_target(char *out, size_t size, const char *what, INT_PTR target)
+{
+	if (in_game_image(target, 1))
+		_snprintf_s(out, size, _TRUNCATE, "%s Warhammer3.exe+0x%llx", what, (unsigned long long)exe_offset(target));
+	else
+		_snprintf_s(out, size, _TRUNCATE, "%s %016llx", what, (unsigned long long)target);
+}
+
 BOOL describe_hook_code(ULONG_PTR address, char *out, size_t size)
 {
 	ULONG_PTR stub_start = (ULONG_PTR)stubs, original;
-	int i;
+	int i = site_stub_at(address);
 
+	if (i >= 0 && i < hook_count) {
+		if (out)
+			describe_target(out, size, "Plus site stub for", hooks[i].target);
+		return TRUE;
+	}
 	if (stubs && address >= stub_start && address < stub_start + sizeof(HookStub) * hook_count) {
 		i = (int)((address - stub_start) / sizeof(HookStub));
 		if (out)
-			_snprintf_s(out, size, _TRUNCATE, "Plus hook stub for Warhammer3.exe+0x%llx", (unsigned long long)exe_offset(hooks[i].target));
+			describe_target(out, size, "Plus hook stub for", hooks[i].target);
 		return TRUE;
 	}
 	for (i = 0; i < hook_count; i++) {
+		if (hooks[i].cave && address >= (ULONG_PTR)hooks[i].cave && address < (ULONG_PTR)hooks[i].cave + hooks[i].cave_size) {
+			if (out)
+				describe_target(out, size, "Plus code cave for", hooks[i].target);
+			return TRUE;
+		}
 		original = (ULONG_PTR)hooks[i].trampoline;
 		if (original && address >= original && address < original + TRAMPOLINE_SIZE) {
 			if (out)
-				_snprintf_s(out, size, _TRUNCATE, "trampoline of the Plus hook on Warhammer3.exe+0x%llx",
-					(unsigned long long)exe_offset(hooks[i].target));
+				describe_target(out, size, "trampoline of the Plus hook on", hooks[i].target);
 			return TRUE;
 		}
 	}
@@ -717,9 +870,13 @@ static void add_callback_sources(Text *report, lua_State *live, const Hook *hook
 
 static void add_hook_line(Text *report, lua_State *live, const Hook *hook)
 {
-	add_text(report, "  Warhammer3.exe+0x%llx  calls %lu", (unsigned long long)exe_offset(hook->target), (unsigned long)hook->calls);
+	add_text(report, "  ");
+	add_address(report, (ULONG_PTR)hook->target);
+	add_text(report, "  calls %lu", (unsigned long)hook->calls);
 	if (hook->other_thread_calls)
 		add_text(report, ", other threads %ld", hook->other_thread_calls);
+	if (hook->kind != KIND_FUNCTION)
+		add_text(report, ", %s", kind_name(hook->kind));
 	if (hook->native)
 		add_text(report, ", native %s", hook->native);
 	if (hook->running)
@@ -761,6 +918,7 @@ static int l_hook_depth(lua_State *L)
 
 const luaL_Reg hook_functions[] = {
 	{ "hook", l_hook },
+	{ "hook_site", l_hook_site },
 	{ "unhook", l_unhook },
 	{ "hook_next", l_hook_next },
 	{ "hook_info", l_hook_info },

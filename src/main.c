@@ -21,6 +21,7 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 	luaL_register(L, NULL, vector_functions);
 	luaL_register(L, NULL, text_functions);
 	luaL_register(L, NULL, farhook_functions);
+	luaL_register(L, NULL, cave_functions);
 	luaL_register(L, NULL, pack_functions);
 	luaL_register(L, NULL, file_edit_functions);
 	luaL_register(L, NULL, map_functions);

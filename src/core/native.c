@@ -545,21 +545,3 @@ void add_memory_use(Text *text)
 			(unsigned long long)(system.ullAvailPageFile / MEGABYTE), (unsigned long long)(system.ullTotalPageFile / MEGABYTE));
 	add_text(text, "\n");
 }
-
-void add_other_module_count(Text *text)
-{
-	int count = 0, known = 0;
-	int i;
-
-	for (i = 1; i < module_count; i++) {
-		if (!modules[i].other_program)
-			continue;
-		count++;
-		if (is_known_program(modules[i].name))
-			known++;
-	}
-	add_text(text, "Other programs' DLLs loaded: %d", count);
-	if (known)
-		add_text(text, ", %d of them known overlays, drivers and antivirus", known);
-	add_text(text, "\n");
-}

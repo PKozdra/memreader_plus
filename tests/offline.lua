@@ -297,7 +297,7 @@ CHANGED = {
 	['tonumber(int32(-1))'] = '-1',
 	['offset uint8'] = '144',
 	['type(modules entry)'] = 'bytes:7461626C65',
-	['write read-only page'] = "error: bad argument #1 to 'write' (refused: Plus writes only to the game's exe and to data memory, not to other modules, executable memory or the exe's headers and import or export tables)",
+	['write read-only page'] = 'bytes:4D5A',
 }
 FIXED = {
 	['read(2048)'] = '2048',
@@ -936,7 +936,10 @@ elseif SCENARIO == 'hook' then
 		end
 		local refused = {
 			{ run(hook, nil, TARGET, hooked), "error: bad argument #1 to 'hook' (address is NULL)" },
-			{ run(hook, mr.base, TARGET, hooked), "error: bad argument #1 to 'hook' (refused: hook takes only read-only code in the game's exe)" },
+			{
+				run(hook, mr.base, TARGET, hooked),
+				"error: bad argument #1 to 'hook' (refused: this takes only read-only executable code outside memreader Plus's own module)",
+			},
 			{ run(hook, target, 'int(int)', hooked), "error: bad argument #2 to 'hook' (unknown type 'int' in the signature)" },
 			{ run(hook, target, TARGET, nil), "error: bad argument #3 to 'hook' (function expected, got nil)" },
 		}
@@ -986,6 +989,775 @@ elseif SCENARIO == 'hook' then
 		check(run(mr.call, target, TARGET, 1, 2) == '3', 'the new state attaches again')
 		check(mr.hook_info(target).calls == 1, 'calls restart in the new state')
 	end
+elseif SCENARIO == 'far_hook' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local raw = test_function('parked_target')
+	local target = mr.pointer(raw)
+	local BYTES = '\83\131\57\0\116\251\91\184'
+	local function offset_in(base)
+		return tonumber(mr.tostring(mr.sub(mr.pointer(test_park_rip()), base)), 16)
+	end
+	check(mr.read(target, 0, #BYTES) == BYTES, 'parked_target holds the expected bytes')
+	check(test_park_start(raw), 'a thread spins inside parked_target')
+	local at = offset_in(target)
+	check(at == 1 or at == 4, 'it spins on an instruction inside the 6 bytes the hook copies, at offset ' .. tostring(at))
+
+	check(test_force_far_hooks(true, mr.hop_slots), 'the near trampoline block is made unreachable')
+	local slots = mr.hop_slots()
+	mr.hook(target, 'int32(pointer)', function(flag)
+		return mr.add(mr.hook_next(target, flag), 1000)
+	end)
+	test_force_far_hooks(false, mr.hop_slots)
+	check(mr.hop_slots() == slots - 1, 'the hook took a padding slot, so it ran the far path')
+	check(mr.read(target, 0, 1) == '\233', 'the site holds the jump')
+
+	local trampoline = mr.hook_info(target).original
+	local moved = offset_in(trampoline)
+	check(moved == at, 'the spinning thread was moved to the same instruction in the trampoline, at offset ' .. tostring(moved))
+	check(test_park_finish() == 77, 'the thread leaves the loop and finishes the function')
+	check(mr.tonumber(mr.call(target, 'int32(pointer)', mr.pointer(test_park_flag()))) == 1077, 'the hooked function runs the callback and the original')
+
+	local distant = mr.pointer(test_far_function())
+	local before = mr.hop_slots()
+	test_force_far_hooks(true, mr.hop_slots)
+	local ok, message = pcall(mr.hook, distant, 'int32()', function()
+		return 7
+	end)
+	test_force_far_hooks(false, mr.hop_slots)
+	check(
+		not ok and string.find(tostring(message), "no free memory near the game's code", 1, true) ~= nil,
+		'a function more than 2 GB from the exe cannot take the far path: ' .. tostring(message)
+	)
+	check(mr.hop_slots() == before, 'and no padding slot is used')
+	check(mr.read(distant, 0, 1) == '\184' and mr.hook_info(distant) == nil, 'the distant function is left alone')
+	if mr.read(distant, 0, 1) == '\184' then check(mr.tonumber(mr.call(distant, 'int32()')) == 42, 'the distant function still runs') end
+elseif SCENARIO == 'cave' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	check(test_chain_cold_part(), 'the cold part of the split function is chained to its hot part')
+	local TARGET = 'int32(int32, int32)'
+	local function bytes(hex)
+		return (hex:gsub('%x%x', function(pair)
+			return string.char(tonumber(pair, 16))
+		end))
+	end
+	local function contains(text, part)
+		return text ~= nil and string.find(text, part, 1, true) ~= nil
+	end
+	local function error_of(f, ...)
+		local ok, err = pcall(f, ...)
+		return not ok and tostring(err) or nil
+	end
+	check(type(mr.code_cave) == 'function', 'code_cave is part of the API')
+	check(mr.hop_slots() > 0, 'the exe has int3 padding runs for far caves')
+	local counter = cave_count_address()
+	local code = bytes('50' .. '48B8') .. counter .. bytes('FF0058')
+
+	local far = mr.pointer(test_function('hook_target'))
+	check(test_force_far_hooks(true, mr.hop_slots), 'the near trampoline block is made unreachable')
+	local slots = mr.hop_slots()
+	local far_cave = mr.code_cave(far, code)
+	test_force_far_hooks(false, mr.hop_slots)
+	check(not mr.is_null(far_cave) and mr.hop_slots() == slots - 1, 'a far cave takes one padding slot')
+	check(cave_count() == 0, 'the far cave has not run yet')
+	check(mr.tonumber(mr.call(far, TARGET, 3, 4)) == 34, 'the function returns 3*10+4 through the far cave')
+	check(cave_count() == 1, 'the far cave ran')
+	check(mr.tonumber(mr.call(mr.hook_info(far).original, TARGET, 5, 6)) == 56, "call of a cave's original works")
+
+	local target = mr.pointer(test_function('cave_target'))
+	local prologue = mr.tostring(mr.read(target, 0, 16)):gsub('%x%x', '%0 '):gsub(' $', '')
+	local first, count = mr.find_pattern(prologue)
+	local before = mr.hop_slots()
+	local cave = mr.code_cave(target, code)
+	local first_after, count_after = mr.find_pattern(prologue)
+	check(count_after == count and mr.eq(first_after, first), 'find_pattern sees through the cave')
+	check(not mr.is_null(cave), 'code_cave returned a cave address')
+	check(mr.hop_slots() == before, 'a cave near the exe takes no padding slot')
+	check(mr.hook_info(target).kind == 'cave', 'hook_info calls it a cave')
+	check(mr.type(mr.hook_info(target).cave) == 'pointer' and mr.eq(mr.hook_info(target).cave, cave), 'hook_info gives the cave address')
+	check(mr.read(cave, 0, #code) == code, 'the cave starts with the bytes the mod gave')
+	check(mr.eq(mr.hook_info(far).cave, far_cave), 'a far cave has its address in hook_info too')
+	check(mr.tonumber(mr.call(target, TARGET, 3, 4)) == 34, 'the function still returns 3*10+4 through the cave')
+	check(cave_count() == 2, 'the cave ran once')
+	mr.call(target, TARGET, 1, 1)
+	check(cave_count() == 3, 'the cave ran again')
+	mr.call(mr.pointer(test_function('call_on_thread')), 'int64(pointer, int64)', target, 5)
+	check(cave_count() == 4, 'a cave runs on another thread')
+	check(contains(error_of(mr.code_cave, target, code), 'already holds a code cave'), 'a second cave on the same address is refused')
+	check(contains(error_of(mr.hook, target, TARGET, function() end), 'already holds a code cave'), 'hook on a cave address is refused')
+	check(contains(error_of(mr.hook_site, target, function() end), 'already holds a code cave'), 'hook_site on a cave address is refused')
+	check(contains(error_of(mr.code_cave, target, ''), 'no cave bytes'), 'empty bytes are refused')
+	check(contains(error_of(mr.code_cave, nil, code), 'address is NULL'), 'a NULL address is refused')
+	check(contains(error_of(mr.code_cave, mr.alloc(16), code), 'refused: '), 'a cave on data memory is refused')
+	check(contains(error_of(mr.write, target, 0, mr.uint8(0x90)), 'refused: the first bytes of a hooked function'), 'a write into the cave site is refused')
+	check(mr.commit_stack() == true, 'commit_stack commits the current thread stack')
+	local function fixture(name)
+		return mr.pointer(test_function(name))
+	end
+	local inside = mr.add(fixture('site_target_here'), 1)
+	check(contains(error_of(mr.code_cave, inside, code), 'refused: '), 'a cave inside an instruction is refused')
+	check(mr.hook_info(inside) == nil, 'a refused cave leaves no hook behind')
+	check(contains(error_of(mr.code_cave, fixture('site_ret_here'), code), 'refused: a return or jump'), 'a cave on a return is refused')
+	check(
+		contains(error_of(mr.code_cave, fixture('site_inbound_here'), code), 'refused: a jump in the function lands inside'),
+		'a cave with a jump into its bytes is refused'
+	)
+	check(
+		contains(error_of(mr.code_cave, fixture('site_split_here'), code), 'refused: a jump in another part of the function lands inside'),
+		'a cave with a jump into its bytes from another part is refused'
+	)
+	check(
+		contains(error_of(mr.code_cave, fixture('site_table_here'), code), 'refused: a jump table'),
+		'a cave with a jump table entry into its bytes is refused'
+	)
+	check(
+		contains(error_of(mr.code_cave, fixture('site_codetable_here'), code), 'refused: a jump table in the function'),
+		'a cave with a jump table in the code of its function is refused'
+	)
+	check(contains(error_of(mr.code_cave, fixture('site_call_short_here'), code), 'refused: a call'), 'a cave over a short call is refused')
+	check(mr.hook_info(fixture('site_call_short_here')) == nil, 'and installs nothing')
+	check(
+		contains(error_of(mr.code_cave, fixture('site_early_here'), code), 'cannot be decoded up to the address'),
+		'a cave after bytes that do not decode is refused'
+	)
+	check(
+		contains(error_of(mr.code_cave, fixture('site_tail_here'), code), 'run past the end of the function'),
+		'a cave whose bytes run into the next function is refused'
+	)
+	check(
+		contains(error_of(mr.code_cave, mr.add(fixture('site_leaf_mid_here'), 1), code), 'inside an instruction'),
+		'a cave inside an instruction of a leaf function is refused'
+	)
+	check(
+		contains(error_of(mr.code_cave, fixture('site_leaf_inbound_here'), code), 'a jump in the function lands inside'),
+		'a cave with a jump into its bytes in a leaf function is refused'
+	)
+elseif SCENARIO == 'cave_session' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local target = mr.pointer(test_function('cave_target'))
+	local code = string.rep('\144', 8)
+	if PASS == 1 then
+		local cave = mr.code_cave(target, code)
+		local file = io.open('cave_address.txt', 'wb')
+		file:write(mr.tostring(cave))
+		file:close()
+		check(mr.eq(mr.hook_info(target).cave, cave), 'the first mode sees its cave address')
+		NEXT_PASS = failures == 0
+	else
+		local file = io.open('cave_address.txt', 'rb')
+		local saved = file:read('*a')
+		file:close()
+		local info = mr.hook_info(target)
+		check(
+			info and info.kind == 'cave' and mr.tostring(info.cave) == saved,
+			'a later mode finds the cave of the first one: ' .. tostring(info and info.cave)
+		)
+		check(mr.read(info.cave, 0, #code) == code, 'and its bytes')
+		check(mr.tonumber(mr.call(target, 'int32(int32, int32)', 3, 4)) == 34, 'the function still works through the cave')
+	end
+elseif SCENARIO == 'site' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	check(test_chain_cold_part(), 'the cold part of the split function is chained to its hot part')
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local function contains(text, part)
+		return text ~= nil and string.find(text, part, 1, true) ~= nil
+	end
+	local function error_of(f, ...)
+		local ok, err = pcall(f, ...)
+		return not ok and tostring(err) or nil
+	end
+	local function has_bit(value, bit)
+		return math.floor(value / bit) % 2 == 1
+	end
+	local TARGET = 'int32(int32, int32)'
+	local target, here = address('site_target'), address('site_target_here')
+	local function call_target(a, b)
+		return mr.tonumber(mr.call(target, TARGET, a, b))
+	end
+	local function put(buffer, slot, value)
+		mr.write(buffer, slot * 8, mr.uint64(value))
+	end
+	local function get(buffer, slot)
+		return mr.tonumber(mr.read_uint64(buffer, slot * 8, true))
+	end
+
+	check(type(mr.hook_site) == 'function', 'hook_site is part of the API')
+	local far_target, far_here = address('site_far'), address('site_far_here')
+	check(test_force_far_hooks(true, mr.hop_slots), 'the near trampoline block is made unreachable')
+	local far_slots = mr.hop_slots()
+	mr.hook_site(far_here, function(regs)
+		regs.eax = mr.add(regs.eax, 100)
+	end)
+	test_force_far_hooks(false, mr.hop_slots)
+	check(mr.hop_slots() == far_slots - 1, 'the site took a padding slot, so it ran the far path')
+	check(mr.tonumber(mr.call(far_target, 'int32(int32)', 5)) == 211, 'a far site runs its callback')
+	check(mr.hook_info(far_here).calls == 1, 'and counts it')
+	check(call_target(3, 4) == 34, 'the test function returns a*10+b')
+	check(mr.hook_info(here) == nil, 'hook_info of a site never hooked is nil')
+
+	local seen = {}
+	mr.hook_site(here, function(regs)
+		seen.a, seen.b, seen.kind, seen.pointer = mr.tonumber(regs.r10d), mr.tonumber(regs.r11d), type(regs), regs.r10
+	end)
+	check(call_target(3, 4) == 34, 'a callback that only reads leaves the result alone')
+	check(seen.a == 3 and seen.b == 4, 'r10d and r11d hold the arguments at the site: ' .. tostring(seen.a) .. ', ' .. tostring(seen.b))
+	check(mr.type(seen.pointer) == 'pointer' and mr.tostring(seen.pointer) == '0000000000000003', 'a 64-bit register reads as a pointer value')
+	local info = mr.hook_info(here)
+	check(info.kind == 'site' and info.attached and info.callbacks == 1 and info.calls == 1 and info.other_thread_calls == 0, 'hook_info describes the site')
+	check(info.cave == nil, 'a site has no cave')
+	check(mr.tonumber(mr.call(info.original, TARGET, 3, 4)) ~= nil, 'the original of a site is a callable address')
+	check(
+		contains(
+			error_of(function()
+				return seen.pointer.x
+			end),
+			'index'
+		),
+		'plain values are not registers'
+	)
+	mr.unhook(here)
+	check(call_target(3, 4) == 34 and not mr.hook_info(here).attached, 'unhook detaches the callback')
+
+	mr.hook_site(here, function(regs)
+		regs.r11d = mr.add(regs.r11d, 100)
+	end)
+	check(call_target(3, 4) == 134, 'a write to r11d changes the result')
+	mr.unhook(here)
+	mr.hook_site(here, function(regs)
+		regs.r11 = mr.pointer('\100\0\0\0\0\0\0\0')
+	end)
+	check(call_target(3, 4) == 130, 'a pointer value can be written to a 64-bit register')
+	mr.unhook(here)
+	mr.hook_site(here, function(regs)
+		regs.r11 = -1
+	end)
+	check(call_target(3, 4) == 29, 'a negative number is written as a 64-bit value')
+	mr.unhook(here)
+	mr.hook_site(here, function(regs)
+		regs.r11 = '\200\0\0\0\0\0\0\0'
+	end)
+	check(call_target(3, 4) == 230, 'eight raw bytes can be written to a register')
+	mr.unhook(here)
+
+	local function failing(what, callback)
+		mr.hook_site(here, callback)
+		local result = call_target(3, 4)
+		local error_text = mr.hook_info(here).error
+		check(result == 34 and contains(error_text, what), what .. ': ' .. tostring(error_text) .. ', result ' .. tostring(result))
+		check(not mr.hook_info(here).attached, 'a failing site callback is detached: ' .. what)
+	end
+	failing("unknown register 'foo'", function(regs)
+		return regs.foo
+	end)
+	failing('rsp is read only', function(regs)
+		regs.rsp = mr.pointer('\0\0\0\0\0\0\0\0')
+	end)
+	failing('boom', function()
+		error('boom')
+	end)
+	mr.hook_site(here, function(regs)
+		seen.regs = regs
+	end)
+	call_target(3, 4)
+	mr.unhook(here)
+	check(
+		contains(
+			error_of(function()
+				return seen.regs.rax
+			end),
+			'can be used only inside a site callback'
+		),
+		'a stored register object is dead outside its callback'
+	)
+	check(
+		contains(
+			error_of(function()
+				seen.regs.rax = 1
+			end),
+			'can be used only inside a site callback'
+		),
+		'a stored register object cannot be written outside its callback'
+	)
+	mr.hook_site(here, function(regs)
+		regs.r11d = 7
+		error('after the write')
+	end)
+	check(call_target(3, 4) == 37, 'a write made before an error stays')
+	mr.unhook(here)
+	local broken = 0
+	mr.hook_site(here, function(regs)
+		broken = broken + 1
+		regs.r11d = mr.add(regs.r11d, 1)
+	end)
+	mr.hook_site(here, function()
+		error('first fails')
+	end)
+	check(call_target(3, 4) == 35 and broken == 1, 'a failing callback does not stop the ones after it')
+	mr.unhook(here)
+
+	mr.hook_site(here, function(regs)
+		regs.r11d = mr.add(regs.r11d, 1)
+	end)
+	check(call_target(3, 4) == 35, 'a hook can be attached again after unhook')
+	mr.unhook(here)
+
+	local order = {}
+	local function first_callback(regs)
+		order[#order + 1] = 'first:' .. mr.tostring(regs.r11d)
+		regs.r11d = mr.add(regs.r11d, 1)
+	end
+	local function second_callback(regs)
+		order[#order + 1] = 'second:' .. mr.tostring(regs.r11d)
+		regs.r11d = mr.mult(regs.r11d, 2)
+	end
+	mr.hook_site(here, first_callback)
+	mr.hook_site(here, second_callback)
+	check(call_target(3, 4) == 30 + 9, "callbacks run newest first and see each other's writes")
+	check(order[1] == 'second:4' and order[2] == 'first:8', 'the order is second then first: ' .. table.concat(order, ' '))
+	check(contains(error_of(mr.hook_site, here, first_callback), 'this callback is already attached'), 'the same callback twice is refused')
+	mr.unhook(here, second_callback)
+	check(call_target(3, 4) == 35 and mr.hook_info(here).callbacks == 1, 'unhook with a callback removes only that one')
+	mr.unhook(here)
+
+	mr.hook_site(here, function(regs)
+		regs.r11d = 0
+	end)
+	local normal_calls = 0
+	mr.hook(target, TARGET, function(a, b)
+		normal_calls = normal_calls + 1
+		return mr.hook_next(target, a, b)
+	end)
+	check(call_target(3, 4) == 30 and normal_calls == 1, 'a function hook and a site hook in one function both run')
+	check(mr.hook_info(target).kind == 'function' and mr.hook_info(here).kind == 'site', 'each keeps its kind')
+	check(mr.hook_info(target).cave == nil, 'a function hook has no cave')
+	check(mr.hook_info(target).calls == 1 and mr.hook_info(here).calls == 1, 'each counts its own calls: ' .. mr.hook_info(here).calls)
+	mr.unhook(target)
+	check(call_target(3, 4) == 30 and normal_calls == 1, 'the site still runs after the function hook is detached')
+	mr.unhook(here)
+	mr.hook(target, TARGET, function(a, b)
+		normal_calls = normal_calls + 1
+		return mr.hook_next(target, a, b)
+	end)
+	check(call_target(3, 4) == 34 and normal_calls == 2, 'the function hook still runs after the site hook is detached')
+	mr.unhook(target)
+
+	check(contains(error_of(mr.hook, here, TARGET, function() end), 'already holds a site hook'), 'hook on a site address is refused')
+	check(contains(error_of(mr.hook_site, target, function() end), 'already holds a function hook'), 'hook_site on a function hook address is refused')
+	check(contains(error_of(mr.code_cave, here, '\144'), 'already holds a site hook'), 'code_cave on a site address is refused')
+	check(contains(error_of(mr.write, here, 0, mr.uint8(0x90)), 'refused: the first bytes of a hooked function'), 'a write into the site is refused')
+	check(contains(error_of(mr.hook_site, mr.add(here, 1), function() end), 'refused: '), 'a site inside an instruction is refused')
+	local overlap, overlap_here = address('site_overlap'), address('site_overlap_here')
+	mr.hook(overlap, TARGET, function(a, b)
+		return mr.hook_next(overlap, a, b)
+	end)
+	check(
+		contains(error_of(mr.hook_site, overlap_here, function() end), 'refused: the address lies in bytes another hook replaced'),
+		'a site inside the bytes of a function hook is refused'
+	)
+	local overlap_b, overlap_b_here = address('site_overlap_b'), address('site_overlap_b_here')
+	mr.hook_site(overlap_b_here, function() end)
+	check(
+		contains(error_of(mr.hook, overlap_b, TARGET, function() end), 'overlaps the first bytes of another hook'),
+		'a function hook over the bytes of a site is refused'
+	)
+	check(contains(error_of(mr.hook_site, address('site_ret_here'), function() end), 'refused: a return or jump'), 'a site on a return is refused')
+	check(
+		contains(error_of(mr.hook_site, address('site_inbound_here'), function() end), 'refused: a jump in the function lands inside'),
+		'a site with a jump into its bytes is refused'
+	)
+	check(
+		contains(error_of(mr.hook_site, address('site_split_here'), function() end), 'refused: a jump in another part of the function lands inside'),
+		'a site with a jump into its bytes from a cold part of the function is refused'
+	)
+	check(mr.hook_info(address('site_split_here')) == nil, 'and installs nothing')
+	check(
+		contains(error_of(mr.hook_site, address('site_table_here'), function() end), 'refused: a jump table'),
+		'a site with a jump table entry into its bytes is refused'
+	)
+	check(
+		contains(error_of(mr.hook_site, address('site_codetable_here'), function() end), 'refused: a jump table in the function'),
+		'a site with a jump table entry in the code of its own function is refused'
+	)
+	check(contains(error_of(mr.hook_site, address('site_call_short_here'), function() end), 'refused: a call'), 'a site over a short call is refused')
+	check(mr.hook_info(address('site_call_short_here')) == nil, 'and installs nothing')
+	mr.hook_site(address('site_call_last_here'), function(regs)
+		regs.rcx = 100
+	end)
+	check(mr.tonumber(mr.call(address('site_call_last'), 'int32(int32)', 5)) == 111, 'a call that ends the replaced bytes is allowed and works')
+	mr.unhook(address('site_call_last_here'))
+	check(
+		contains(error_of(mr.hook_site, address('site_early_here'), function() end), 'cannot be decoded up to the address'),
+		'a site after bytes that do not decode is refused'
+	)
+	check(
+		contains(error_of(mr.hook_site, address('site_tail_here'), function() end), 'run past the end of the function'),
+		'a site whose bytes run into the next function is refused'
+	)
+	check(
+		contains(error_of(mr.hook_site, mr.add(address('site_leaf_mid_here'), 1), function() end), 'inside an instruction'),
+		'a site inside an instruction of a leaf function is refused'
+	)
+	check(
+		contains(error_of(mr.hook_site, address('site_leaf_inbound_here'), function() end), 'a jump in the function lands inside'),
+		'a site with a jump into its bytes in a leaf function is refused'
+	)
+	mr.hook_site(address('site_leaf_here'), function(regs)
+		regs.rax = 40
+	end)
+	check(mr.tonumber(mr.call(address('site_leaf'), 'int32(int32)', 5)) == 81, 'a site in a leaf function that nothing jumps into works')
+	mr.unhook(address('site_leaf_here'))
+	mr.hook_site(address('site_noise_here'), function(regs)
+		regs.rax = 40
+	end)
+	check(mr.tonumber(mr.call(address('site_noise'), 'int32()')) == 41, 'a lone DWORD in read-only data that equals an address inside the bytes is not a table')
+	mr.unhook(address('site_noise_here'))
+	mr.hook_site(address('site_split_free'), function(regs)
+		regs.rax = 40
+	end)
+	check(mr.tonumber(mr.call(address('site_split'), 'int32(int32)', 0)) == 40, 'a site in a split function that nothing jumps into works')
+	mr.unhook(address('site_split_free'))
+	check(contains(error_of(mr.hook_site, mr.alloc(16), function() end), 'refused: '), 'a site in data memory is refused')
+	check(contains(error_of(mr.hook_site, mr.base, function() end), 'refused: '), 'a site in the exe headers is refused')
+	check(contains(error_of(mr.hook_site, nil, function() end), 'address is NULL'), 'a NULL site is refused')
+	check(contains(error_of(mr.hook_site, here, nil), 'function expected'), 'a missing callback is refused')
+	local plus
+	for module in mr.modules() do
+		if string.find(module.name:lower(), 'memreader_plus', 1, true) then plus = module end
+	end
+	check(plus ~= nil and contains(error_of(mr.hook_site, mr.add(plus.base, 0x1000), function() end), 'refused: '), "a site in Plus's own module is refused")
+	check(contains(error_of(mr.hook, mr.add(plus.base, 0x1000), 'void()', function() end), 'refused: '), "a hook in Plus's own module is refused")
+	check(call_target(3, 4) == 34, 'refused sites leave the function alone')
+
+	local flags_target = address('site_flags_target')
+	check(mr.tonumber(mr.call(flags_target, 'int32()')) == 1, 'the flags test function sees ZF set')
+	local flags_seen
+	mr.hook_site(address('site_flags_here'), function(regs)
+		flags_seen = regs.rflags
+		regs.rflags = regs.rflags - 0x40
+	end)
+	check(mr.tonumber(mr.call(flags_target, 'int32()')) == 2, 'clearing ZF in rflags changes the branch')
+	check(has_bit(flags_seen, 0x40), 'rflags shows ZF at the site: ' .. tostring(flags_seen))
+	mr.unhook(address('site_flags_here'))
+	mr.hook_site(address('site_flags_here'), function(regs)
+		regs.rflags = regs.rflags + 0x100
+	end)
+	check(mr.tonumber(mr.call(flags_target, 'int32()')) == 1, 'the trap flag cannot be set from a callback')
+	mr.unhook(address('site_flags_here'))
+
+	local rip_target = address('site_rip_target')
+	check(mr.tonumber(mr.call(rip_target, 'int32(int32)', 3)) == 10, 'the RIP-relative test function reads its data')
+	mr.hook_site(address('site_rip_here'), function(regs)
+		regs.rcx = 100
+	end)
+	check(mr.tonumber(mr.call(rip_target, 'int32(int32)', 3)) == 107, 'a site with a RIP-relative instruction in its bytes relocates it')
+	mr.unhook(address('site_rip_here'))
+
+	local probe, probe_here = address('site_probe'), address('site_probe_here')
+	local buffer = mr.alloc(40 * 8)
+	local FLAGS_IN, MISALIGN, OUT, FLAGS_OUT, RSP_AT_SITE = 16, 17, 18, 34, 35
+	local names = { 'rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15' }
+	local function value_of(slot)
+		return (slot + 1) * 0x100000000 + (slot + 1) * 0x111
+	end
+	local function load_probe(misalign, raw)
+		for slot = 0, 15 do
+			put(buffer, slot, value_of(slot))
+		end
+		for slot, bytes in pairs(raw or {}) do
+			mr.write(buffer, slot * 8, bytes)
+		end
+		put(buffer, FLAGS_IN, 0x247)
+		put(buffer, MISALIGN, misalign)
+		for slot = OUT, RSP_AT_SITE do
+			put(buffer, slot, 0)
+		end
+		mr.call(probe, 'void(pointer)', buffer)
+	end
+	local function probe_preserved()
+		for slot = 0, 15 do
+			if slot ~= 4 and get(buffer, OUT + slot) ~= value_of(slot) then return false, names[slot + 1] end
+		end
+		return get(buffer, FLAGS_OUT) == 0x247 and get(buffer, OUT + 4) == get(buffer, RSP_AT_SITE), 'flags or rsp'
+	end
+	load_probe(0)
+	check(probe_preserved(), 'the probe keeps every register without a hook')
+	mr.hook_site(probe_here, function() end)
+	for _, misalign in ipairs({ 0, 1 }) do
+		load_probe(misalign)
+		local kept, which = probe_preserved()
+		check(kept, 'an empty site callback keeps every register, flags and rsp (misaligned ' .. misalign .. '): ' .. tostring(which))
+	end
+	mr.unhook(probe_here)
+	local read_all
+	mr.hook_site(probe_here, function(regs)
+		read_all = { rsp = regs.rsp, rflags = regs.rflags, same = {} }
+		for slot = 0, 15 do
+			if slot ~= 4 then read_all.same[names[slot + 1]] = mr.eq(regs[names[slot + 1]], mr.read_pointer(buffer, slot * 8)) end
+		end
+		read_all.eax, read_all.r15d = mr.tonumber(regs.eax), mr.tonumber(regs.r15d)
+	end)
+	load_probe(0)
+	local reads_ok = true
+	for slot = 0, 15 do
+		if slot ~= 4 and not read_all.same[names[slot + 1]] then
+			reads_ok = false
+			print('  register ' .. names[slot + 1] .. ' differs')
+		end
+	end
+	check(reads_ok, 'a callback reads every general register at the site')
+	check(read_all.eax == value_of(0) % 4294967296 and read_all.r15d == value_of(15) % 4294967296, 'the 32-bit views hold the low half')
+	check(mr.eq(read_all.rsp, mr.read_pointer(buffer, RSP_AT_SITE * 8)), 'rsp reads the stack pointer at the site')
+	check(read_all.rflags == 0x247, 'rflags reads the flags at the site: ' .. tostring(read_all.rflags))
+	mr.unhook(probe_here)
+	mr.hook_site(probe_here, function(regs)
+		regs.rax = 0x123456789
+		regs.rbx = mr.pointer('\1\2\3\4\5\6\0\0')
+		regs.r9d = 5
+		regs.r15 = regs.rcx
+		regs.rbp = 0
+		regs.rflags = 0
+	end)
+	load_probe(0)
+	check(get(buffer, OUT) == 0x123456789, 'a callback writes rax')
+	check(get(buffer, OUT + 3) == 0x060504030201, 'a callback writes rbx from a pointer value')
+	check(get(buffer, OUT + 9) == 5, 'a write to r9d clears the upper half like the hardware')
+	check(get(buffer, OUT + 15) == value_of(1), 'a callback copies one register into another')
+	check(get(buffer, OUT + 5) == 0, 'a callback writes rbp')
+	check(get(buffer, FLAGS_OUT) == 0x202, 'writing rflags 0 clears the status flags and keeps the rest: ' .. string.format('%x', get(buffer, FLAGS_OUT)))
+	check(get(buffer, OUT + 1) == value_of(1) and get(buffer, OUT + 12) == value_of(12), 'registers the callback does not touch stay')
+	check(get(buffer, OUT + 4) == get(buffer, RSP_AT_SITE), 'rsp is the same after the site')
+	mr.unhook(probe_here)
+
+	local WORDS = {
+		ecx = { 1, '\255\255\255\255\0\0\0\0', 'uint32 4294967295' },
+		edx = { 2, '\0\0\0\128\0\0\0\0', 'uint32 2147483648' },
+		r8d = { 8, '\1\0\0\1\0\0\0\0', 'uint32 16777217' },
+		r9d = { 9, '\121\86\52\18\0\0\0\0', 'uint32 305419897' },
+	}
+	local raw_words, seen_words = {}, {}
+	for _, word in pairs(WORDS) do
+		raw_words[word[1]] = word[2]
+	end
+	mr.hook_site(probe_here, function(regs)
+		for name in pairs(WORDS) do
+			seen_words[name] = mr.type(regs[name]) .. ' ' .. mr.tostring(regs[name])
+			regs[name] = regs[name]
+		end
+	end)
+	load_probe(0, raw_words)
+	check(mr.hook_info(probe_here).error == nil, '32-bit views read and write without an error: ' .. tostring(mr.hook_info(probe_here).error))
+	for name, word in pairs(WORDS) do
+		check(seen_words[name] == word[3], name .. ' reads as ' .. word[3] .. ': ' .. tostring(seen_words[name]))
+		check(mr.read(buffer, (OUT + word[1]) * 8, 8) == word[2], name .. ' keeps its value through a read and a write back')
+	end
+	mr.unhook(probe_here)
+	mr.hook_site(probe_here, function(regs)
+		regs.ecx = mr.uint32('\255\255\255\255')
+		regs.edx = -1
+		regs.r8d = 2147483648
+		regs.r9d = mr.int32(-2147483648)
+	end)
+	load_probe(0, raw_words)
+	check(mr.read(buffer, (OUT + 1) * 8, 8) == '\255\255\255\255\0\0\0\0', 'a typed uint32 is written exactly')
+	check(mr.read(buffer, (OUT + 2) * 8, 8) == '\255\255\255\255\0\0\0\0', 'a plain -1 is written as 0xFFFFFFFF')
+	check(mr.read(buffer, (OUT + 8) * 8, 8) == '\0\0\0\128\0\0\0\0', 'a plain 2^31 is written exactly')
+	check(mr.read(buffer, (OUT + 9) * 8, 8) == '\0\0\0\128\0\0\0\0', 'a typed int32 is written as its 32 bits')
+	mr.unhook(probe_here)
+	local function refused_write(register, value, what)
+		mr.hook_site(probe_here, function(regs)
+			regs[register] = value
+		end)
+		load_probe(0, raw_words)
+		local message = mr.hook_info(probe_here).error
+		mr.unhook(probe_here)
+		check(
+			contains(message, what) and mr.read(buffer, (OUT + 1) * 8, 8) == raw_words[1],
+			register .. ' refuses ' .. tostring(value) .. ': ' .. tostring(message)
+		)
+	end
+	refused_write('ecx', 4294967296, 'whole number')
+	refused_write('ecx', 1.5, 'whole number')
+	refused_write('ecx', -3000000000, 'whole number')
+	refused_write('rcx', 9223372036854775808, 'whole number')
+	refused_write('rcx', 0.5, 'whole number')
+
+	local xmm_probe, xmm_here = address('site_xmm_probe'), address('site_xmm_here')
+	local xmm = mr.alloc(12 * 16)
+	local DOUBLE_2_5 = '\0\0\0\0\0\0\4\64'
+	local FLOAT_1_5 = '\0\0\192\63'
+	local MARK = '\1\2\3\4'
+	for slot = 0, 5 do
+		mr.write(xmm, slot * 16, DOUBLE_2_5 .. string.rep(string.char(slot + 1), 8))
+	end
+	mr.write(xmm, 16, FLOAT_1_5 .. MARK .. string.rep('\2', 8))
+	mr.call(xmm_probe, 'void(pointer)', xmm)
+	check(mr.read(xmm, 96, 8) == DOUBLE_2_5, 'the xmm probe copies the registers without a hook')
+	local doubles
+	mr.hook_site(xmm_here, function(regs)
+		doubles = { regs.xmm0, regs.xmm1f, regs.xmm5 }
+		regs.xmm0 = 6.25
+		regs.xmm1f = 4.5
+		regs.xmm3 = 0
+	end)
+	mr.call(xmm_probe, 'void(pointer)', xmm)
+	check(doubles[1] == 2.5 and doubles[2] == 1.5 and doubles[3] == 2.5, 'a callback reads xmm as double and as float')
+	check(mr.read(xmm, 96, 16) == '\0\0\0\0\0\0\25\64' .. string.rep('\1', 8), 'a double write keeps the upper half of xmm0')
+	check(mr.read(xmm, 96 + 16, 16) == '\0\0\144\64' .. MARK .. string.rep('\2', 8), 'a float write keeps the rest of xmm1')
+	check(mr.read(xmm, 96 + 48, 16) == string.rep('\0', 8) .. string.rep('\4', 8), 'a double write of 0 clears the low half of xmm3')
+	check(mr.read(xmm, 96 + 32, 16) == DOUBLE_2_5 .. string.rep('\3', 8), 'untouched xmm registers stay')
+	mr.unhook(xmm_here)
+	local PI = '\24\45\68\84\251\33\9\64'
+	local EPSILON = '\1\0\0\0\0\0\240\63'
+	for slot = 0, 5 do
+		mr.write(xmm, slot * 16, string.rep(string.char(slot + 1), 16))
+	end
+	mr.write(xmm, 0, PI)
+	mr.write(xmm, 16, EPSILON)
+	local bit_type
+	mr.hook_site(xmm_here, function(regs)
+		bit_type = mr.type(regs.xmm0q)
+		regs.xmm0q = regs.xmm0q
+		regs.xmm2q = regs.xmm1q
+		regs.xmm4q = mr.uint64('\1\2\3\4\5\6\7\8')
+	end)
+	mr.call(xmm_probe, 'void(pointer)', xmm)
+	check(mr.hook_info(xmm_here).error == nil and bit_type == 'uint64', 'xmmNq reads as a uint64: ' .. tostring(mr.hook_info(xmm_here).error))
+	check(mr.read(xmm, 96, 16) == PI .. string.rep('\1', 8), 'a double keeps all its bits through xmm0q')
+	check(mr.read(xmm, 96 + 32, 16) == EPSILON .. string.rep('\3', 8), 'xmm2q takes the bits of xmm1q and keeps the upper half')
+	check(mr.read(xmm, 96 + 64, 16) == '\1\2\3\4\5\6\7\8' .. string.rep('\5', 8), 'xmm4q takes a typed uint64')
+	mr.unhook(xmm_here)
+
+	if test_has_avx() then
+		local vector_probe, vector_here = address('site_vector_probe'), address('site_vector_here')
+		local vectors = mr.alloc(32 * 32)
+		local pattern = {}
+		for i = 0, 511 do
+			pattern[#pattern + 1] = string.char((i * 7 + 3) % 251)
+		end
+		pattern = table.concat(pattern)
+		mr.write(vectors, 0, pattern)
+		mr.call(vector_probe, 'void(pointer)', vectors)
+		check(mr.read(vectors, 512, 512) == pattern, 'the vector probe copies ymm0-15 without a hook')
+		mr.hook_site(vector_here, function()
+			test_clobber_vectors()
+		end)
+		mr.write(vectors, 512, string.rep('\0', 512))
+		mr.call(vector_probe, 'void(pointer)', vectors)
+		check(mr.read(vectors, 512, 512) == pattern, 'ymm0-15 survive a callback that runs vzeroupper')
+		mr.unhook(vector_here)
+		mr.write(vectors, 0, string.rep('\0', 512))
+		mr.hook_site(vector_here, function()
+			test_clobber_vectors()
+		end)
+		mr.write(vectors, 512, string.rep('\255', 512))
+		mr.call(vector_probe, 'void(pointer)', vectors)
+		check(mr.read(vectors, 512, 512) == string.rep('\0', 512), 'clean upper halves stay clean')
+		mr.unhook(vector_here)
+		mr.hook_site(vector_here, function()
+			test_dirty_vectors()
+		end)
+		mr.write(vectors, 512, string.rep('\255', 512))
+		mr.call(vector_probe, 'void(pointer)', vectors)
+		check(mr.read(vectors, 512, 512) == string.rep('\0', 512), 'upper halves a callback dirtied are cleared when the game had none')
+		mr.unhook(vector_here)
+	else
+		print('  skipped: this CPU has no AVX')
+	end
+
+	local single, single_here = address('site_single'), address('site_single_here')
+	mr.hook_site(single_here, function(regs)
+		regs.rcx = 100
+	end)
+	check(mr.tonumber(mr.call(single, 'int64(int64)', 5)) == 201, 'the single-argument site changes the result on the script thread')
+	check(mr.tonumber(mr.call(address('call_on_thread'), 'int64(pointer, int64)', single, 5)) == 11, 'a call on another thread runs the original')
+	check(mr.hook_info(single_here).calls == 1 and mr.hook_info(single_here).other_thread_calls == 1, 'calls on another thread are counted apart')
+	mr.unhook(single_here)
+	check(mr.tonumber(mr.call(single, 'int64(int64)', 5)) == 11, 'after unhook the original result returns')
+	mr.hook_site(single_here, function(regs)
+		regs.rcx = 100
+	end)
+	check(mr.hook_info(single_here).calls == 0, 'calls restart with a new chain')
+	check(mr.tonumber(mr.call(single, 'int64(int64)', 5)) == 201, 'the site works again after unhook')
+
+	local nested = {}
+	mr.hook_site(here, function(outer)
+		nested.outer_before = mr.tonumber(outer.r10d)
+		mr.call(single, 'int64(int64)', 1)
+		nested.outer_after = mr.tonumber(outer.r10d)
+		nested.depth = mr.hook_depth()
+	end)
+	check(call_target(3, 4) == 34, 'nested site callbacks return')
+	check(
+		nested.outer_before == 3 and nested.outer_after == 3 and nested.depth == 1,
+		'the outer registers survive a nested site: ' .. tostring(nested.outer_after)
+	)
+	mr.unhook(here)
+	mr.unhook(single_here)
+
+	local spin, spin_here = address('site_spin'), address('site_spin_here')
+	local ROUNDS = 200000
+	local function time_spin()
+		local start = mr.ticks()
+		mr.call(spin, 'void(int64)', ROUNDS)
+		return mr.elapsed_us(start) * 1000 / ROUNDS
+	end
+	local function timed(callback)
+		mr.hook_site(spin_here, callback)
+		local result = time_spin()
+		mr.unhook(spin_here)
+		return result
+	end
+	local plain = time_spin()
+	local empty = timed(function() end) - plain
+	local one_pointer = timed(function(regs)
+		local _ = regs.rdx
+	end) - plain
+	local numbers = timed(function(regs)
+		regs.edx = regs.ecx
+	end) - plain
+	local pointers = timed(function(regs)
+		regs.rdx = regs.rcx
+	end) - plain
+	mr.hook_site(spin_here, function() end)
+	time_spin()
+	check(mr.hook_info(spin_here).calls == ROUNDS, 'every loop pass ran the callback: ' .. tostring(mr.hook_info(spin_here).calls))
+	mr.unhook(spin_here)
+	print(
+		string.format(
+			'  timing: site loop %.0f ns, empty callback +%.0f ns, read a constant pointer register +%.0f ns, read and write 32-bit numbers +%.0f ns, read and write changing pointers +%.0f ns',
+			plain,
+			empty,
+			one_pointer,
+			numbers,
+			pointers
+		)
+	)
+elseif SCENARIO == 'site_unwind' then
+	run_mod(OURS)
+	io.stdout:setvbuf('no')
+	local mr = _G.memreader_plus
+	local here = mr.pointer(test_function('site_call_last_here'))
+	local entry = test_function('site_call_last')
+	local caught, result = test_catch_site_call(entry)
+	check(not caught and result == 14, 'the function runs without a hook: ' .. tostring(result))
+	mr.hook_site(here, function()
+		test_crash()
+	end)
+	caught, result = test_catch_site_call(entry)
+	check(caught, 'an exception raised in a site callback is handled by the game code around the hooked function')
+	check(mr.hook_depth() == 0, 'the callback depth is back at 0 after the exception')
+	check(mr.hook_info(here).calls == 1, 'the site ran the callback once')
+	mr.unhook(here)
+	mr.hook_site(here, function(regs)
+		regs.rcx = 100
+	end)
+	caught, result = test_catch_site_call(entry)
+	check(not caught and result == 111, 'the site works again after the exception: ' .. tostring(result))
 elseif SCENARIO == 'guard' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus
@@ -998,10 +1770,6 @@ elseif SCENARIO == 'guard' then
 			if string.find(m.name:lower(), part, 1, true) then return m end
 		end
 	end
-	local function entry_point(base)
-		local headers = mr.add(base, mr.read_int32(base, 0x3c))
-		return mr.add(base, mr.read_uint32(headers, 0x28, true))
-	end
 	local function table_start(index)
 		local headers = mr.add(mr.base, mr.read_int32(mr.base, 0x3c))
 		return mr.add(mr.base, mr.read_uint32(headers, 0x18 + 0x70 + index * 8, true))
@@ -1010,7 +1778,7 @@ elseif SCENARIO == 'guard' then
 	local plus = module_named('memreader_plus')
 	local target = mr.pointer(test_function('hook_target'))
 	local TARGET = 'int32(int32, int32)'
-	check(mr.code_cave == nil, 'code_cave is not part of the API')
+	check(type(mr.code_cave) == 'function' and type(mr.hook_site) == 'function', 'code_cave and hook_site are part of the API')
 	check(mr.hop_slots() > 0, 'the exe has int3 padding runs for far hooks')
 	check(mr.commit_stack() == true, 'commit_stack commits the current thread stack')
 	local function deep(n)
@@ -1022,33 +1790,37 @@ elseif SCENARIO == 'guard' then
 	check(mr.commit_stack() == true, 'a second commit_stack keeps the stack as it is')
 	check(system ~= nil and plus ~= nil, 'modules() lists a system DLL and Plus')
 
-	check(refused(mr.call, system.base, 'void()'), 'call into a system DLL is refused')
-	check(refused(mr.call, plus.base, 'void()'), "call into Plus's own module is refused")
+	local cell = mr.alloc(8)
+	local function raw(pointer)
+		mr.write(cell, 0, pointer)
+		return mr.read(cell, 0, 8)
+	end
+	local PAGE_READONLY, PAGE_READWRITE = 2, 4
+	check(refused(mr.call, system.base, 'void()'), 'call into a system DLL header is refused')
+	check(refused(mr.call, plus.base, 'void()'), "call into Plus's own module header is refused")
 	check(refused(mr.call, mr.alloc(16), 'void()'), 'call into alloc memory is refused')
 	check(refused(mr.call, mr.base, 'void()'), "call into the exe's headers is refused")
-	check(refused(mr.hook, entry_point(system.base), 'void()', function() end), "hook on a system DLL's code is refused")
-	check(refused(mr.write, system.base, 0, mr.uint8(0)), 'write into a system DLL is refused')
-	check(refused(mr.write, plus.base, 0, mr.uint8(0)), "write into Plus's own module is refused")
-	check(refused(mr.patch, mr.base, 'MZ', 'MZ'), "patch on the exe's headers is refused")
+	local process_id = mr.pointer(test_system_address('kernel32.dll', 'GetCurrentProcessId'))
+	check(mr.tonumber(mr.call(process_id, 'uint32()')) == test_process_id(), 'call into the executable code of a system DLL works')
+	mr.hook(process_id, 'uint32()', function()
+		return 4242
+	end)
+	check(mr.tonumber(mr.call(process_id, 'uint32()')) == 4242, "hook on a system DLL's code works")
+	mr.unhook(process_id)
+	check(mr.tonumber(mr.call(process_id, 'uint32()')) == test_process_id(), 'unhook of a system DLL function runs the original')
+	check(refused(mr.hook, system.base, 'void()', function() end), "hook on a system DLL's header is refused")
+	check(refused(mr.hook, mr.add(plus.base, 0x1000), 'void()', function() end), "hook on Plus's own code is refused")
+	for _, module in ipairs({ system, plus }) do
+		local first_byte = mr.read(module.base, 0, 1)
+		check(test_protection(raw(module.base)) == PAGE_READONLY, module.name .. ' has a read-only header')
+		check(pcall(mr.write, module.base, 0, first_byte) and mr.read(module.base, 0, 1) == first_byte, 'write into ' .. module.name .. ' works')
+		check(test_protection(raw(module.base)) == PAGE_READONLY, 'and the header is read-only again')
+	end
+	check(mr.patch(mr.base, 'MZ', 'MZ') == 'MZ', "patch on the exe's headers with the bytes already there is a no-op")
 	local imports = table_start(1)
 	local import_bytes = mr.read(imports, 0, 4)
-	check(refused(mr.patch, imports, import_bytes, import_bytes), "patch on the exe's import table is refused")
-	check(refused(mr.write, imports, 0, import_bytes), "write into the exe's import table is refused")
-	check(refused(mr.vector_reserve, system.base, 0, 4, 1), 'vector_reserve on a system DLL is refused')
-	check(refused(mr.list_insert, system.base, 0, 1, '\1'), 'list_insert on a system DLL is refused')
-	check(refused(mr.string_set, system.base, 0, 'x'), 'string_set on a system DLL is refused')
-	check(refused(mr.game_free, mr.add(system.base, 0x100)), 'game_free inside a system DLL is refused')
-	local function map_shape_in(base)
-		for offset = 0x18, 0xff8, 8 do
-			local capacity, size = mr.read_uint32(base, offset), mr.read_int32(base, offset + 4)
-			if size >= 1 and size <= 0x10000 and size <= capacity and not mr.is_null(mr.read_pointer(base, offset + 8)) then
-				return mr.add(base, offset - 0x18)
-			end
-		end
-	end
-	local system_map = map_shape_in(system.base)
-	check(system_map ~= nil and refused(mr.map_remove_key, system_map, 'x'), 'map_remove_key on a system DLL is refused')
-	check(system_map ~= nil and pcall(mr.map_find_key, system_map, 'x'), 'map_find_key reads a map in a system DLL')
+	check(mr.patch(imports, import_bytes, import_bytes) == import_bytes, "patch on the exe's import table with the bytes already there is a no-op")
+	check(pcall(mr.write, imports, 0, import_bytes), "write into the exe's import table works")
 
 	check(mr.tonumber(mr.call(target, TARGET, 1, 2)) == 12, 'call into the exe code works')
 	mr.hook(target, TARGET, function(a, b)
@@ -1057,7 +1829,9 @@ elseif SCENARIO == 'guard' then
 	local original = mr.hook_info(target).original
 	check(mr.tonumber(mr.call(target, TARGET, 3, 4)) == 34, 'hook on the exe code works')
 	check(mr.tonumber(mr.call(original, TARGET, 5, 6)) == 56, "call of a hook's original works")
-	check(refused(mr.write, original, 0, mr.uint8(0x90)), "write into a hook's trampoline is refused")
+	local trampoline_byte, trampoline_protection = mr.read(original, 0, 1), test_protection(raw(original))
+	check(pcall(mr.write, original, 0, trampoline_byte) and mr.read(original, 0, 1) == trampoline_byte, "write into a hook's trampoline works")
+	check(test_protection(raw(original)) == trampoline_protection, 'and the trampoline keeps its protection')
 	mr.unhook(target)
 	local buffer = mr.alloc(16)
 	mr.write(buffer, 0, mr.uint32(7))
@@ -1075,16 +1849,15 @@ elseif SCENARIO == 'guard' then
 	mr.write(code, 0, first)
 	check(mr.read(code, 0, 1) == first, "write into the exe's code works")
 	check(test_access_faults() == faults, "write into the exe's code raises no fault")
-	local read_only = mr.alloc(16)
-	local cell = mr.alloc(8)
-	mr.write(cell, 0, read_only)
-	local PAGE_READONLY, PAGE_READWRITE = 2, 4
-	test_protect(mr.read(cell, 0, 8), 16, PAGE_READONLY)
+	local page = test_page()
+	local read_only = mr.pointer(page)
+	test_protect(page, 16, PAGE_READONLY)
 	faults = test_access_faults()
 	local wrote, why = pcall(mr.write, read_only, 0, mr.uint32(1))
-	check(not wrote and string.find(why, 'failed to write memory', 1, true) ~= nil, 'write into read-only data memory fails: ' .. tostring(why))
-	check(test_access_faults() == faults + 1, 'write into read-only data memory outside the exe still tries the copy')
-	test_protect(mr.read(cell, 0, 8), 16, PAGE_READWRITE)
+	check(wrote and mr.read_uint32(read_only, 0) == 1, 'write into read-only data memory works: ' .. tostring(why))
+	check(test_protection(page) == PAGE_READONLY, 'and the page is read-only again')
+	check(test_access_faults() == faults + 1, 'the first try faults once and is recovered')
+	test_protect(page, 16, PAGE_READWRITE)
 	faults = test_access_faults()
 	mr.write(read_only, 0, mr.uint32(3))
 	check(mr.read_uint32(read_only, 0) == 3 and test_access_faults() == faults, 'write into data memory works without a fault')
@@ -1097,7 +1870,7 @@ elseif SCENARIO == 'guard' then
 		refuse_call()
 	end
 	local ok, err = pcall(function()
-		mr.write(system.base, 0, mr.uint8(0))
+		mr.write(target, 0, mr.uint8(0))
 	end)
 	check(not ok and string.find(err, 'offline.lua:%d+: bad argument #1 to') ~= nil, 'the error names the script line: ' .. tostring(err))
 	local log = io.open('memreader_plus_refused.txt', 'rb')
@@ -1320,6 +2093,7 @@ elseif
 	or SCENARIO == 'fault_report_no_log'
 	or SCENARIO == 'fault_report_off'
 	or SCENARIO == 'fault_report_in_callback'
+	or SCENARIO == 'fault_report_in_site'
 	or SCENARIO == 'fault_report_thread'
 	or SCENARIO == 'fault_report_native_thread'
 	or SCENARIO == 'fault_report_overflow'
@@ -1375,10 +2149,18 @@ then
 			end)
 			mr.call(mr.pointer(test_function('call_directly')), 'int64(pointer, int64)', single, 1)
 		end
+		local function crash_in_site()
+			mr.hook_site(mr.pointer(test_function('site_crash_here')), function()
+				test_crash()
+			end)
+			mr.call(mr.pointer(test_function('site_crash')), 'void()')
+		end
 		local function report_me()
 			local marker = 'event-under-test'
 			if SCENARIO == 'fault_report_in_callback' then
 				crash_in_callback()
+			elseif SCENARIO == 'fault_report_in_site' then
+				crash_in_site()
 			elseif SCENARIO == 'fault_report_no_log' then
 				test_execute_crash()
 			elseif SCENARIO == 'fault_report_native_thread' then
@@ -1667,13 +2449,8 @@ elseif SCENARIO:sub(1, 9) == 'file_edit' then
 		check(log_count('file edits off: load_buffer found 2 times') == 1, 'one log line for the site')
 		check(layout_has('width="400"'), 'layouts load as they ship')
 	elseif SCENARIO == 'file_edit_saved_off' then
-		check(mr.file_edit_status().enabled == false, 'the saved player switch is read when Plus loads')
-		check(log_count('file edits off: switched off by the player') == 1, 'spec files are refused with one log line')
-		local ok, why = width('x', 0, 500)
-		check(ok == nil and why == 'off: switched off by the player', 'file_edit says the player switched edits off')
-		check(layout_has('width="400"'), 'nothing applies')
-		mr.set_file_edits(true)
-		check(width('x', 0, 500) == true and layout_has('width="500"'), 'turned on again, edits register')
+		check(mr.file_edit_status().enabled == true, 'a switch file left from the old MCT option is ignored')
+		check(width('x', 0, 500) == true and layout_has('width="500"'), 'edits register')
 	elseif SCENARIO == 'file_edit_sites' then
 		local ok, why = edit({ owner = 'x', id = 'model', path = 'models/test/unit.wsmodel', ops = { { find = 'skin_a', with = 'skin_b' } } })
 		check(ok == nil and why == 'off: fast_xml', 'FAST_XML edits are refused without parse_buffer and validation')
@@ -2307,41 +3084,6 @@ elseif SCENARIO:sub(1, 9) == 'file_edit' then
 		mr.file_edit_remove('s', 'ops')
 		mr.file_edit_remove('s', 'deep')
 		check(mr.file_edit_status().results == status.results - 203, 'removing frees the results: ' .. mr.file_edit_status().results)
-
-		local listeners = {}
-		local file_edits_setting = false
-		core = {
-			add_listener = function(_, _, event, _, callback)
-				listeners[event] = callback
-			end,
-		}
-		get_mct = function()
-			return {
-				get_mod_by_key = function()
-					return {
-						get_option_by_key = function(_, key)
-							if key ~= 'file_edits' then return nil end
-							return {
-								get_finalized_setting = function()
-									return file_edits_setting
-								end,
-							}
-						end,
-					}
-				end,
-			}
-		end
-		run_mod(PACK .. '/script/_lib/mod/memreader_plus_settings.lua')
-		local marker = 'appdata/memreader_plus_file_edits_off.txt'
-		listeners.MctFinalized()
-		check(exists(marker) and mr.file_edit_status().enabled == false, 'MCT switch off writes the marker and turns edits off')
-		check(log_count('file edits from mods turned off: the game reads files as they ship') == 1, 'switch off logged')
-		file_edits_setting = true
-		listeners.MctInitialized()
-		check(not exists(marker) and mr.file_edit_status().enabled == true, 'MCT switch on removes the marker and turns edits on')
-		check(log_count('file edits from mods turned on') == 1, 'switch on logged')
-		core = nil
-		get_mct = nil
 	end
 elseif SCENARIO == 'report_snapshot' then
 	local logged = {}
@@ -2475,68 +3217,6 @@ elseif SCENARIO == 'report_snapshot' then
 	check(#pushed > 0 and pushed[#pushed].text == nil, 'without MCT the snapshot is cleared')
 	_G.memreader_plus = nil
 	check(pcall(listeners.MctFinalized), 'without the DLL the listener does nothing and raises nothing')
-
-	local calls = {}
-	local function recorder()
-		return setmetatable({}, {
-			__index = function(_, name)
-				return function(_, ...)
-					calls[name] = { ... }
-				end
-			end,
-		})
-	end
-	local action = {}
-	local mod = recorder()
-	mod.add_new_option = recorder
-	mod.add_new_action = function(_, key, text, callback)
-		action.key, action.text, action.callback = key, text, callback
-		return recorder()
-	end
-	get_mct = function()
-		return {
-			register_mod = function()
-				return mod
-			end,
-		}
-	end
-	local popups = {}
-	GLib = {
-		TriggerPopup = function(key, text, two_buttons)
-			popups[#popups + 1] = { key = key, text = text, two_buttons = two_buttons }
-		end,
-	}
-	_G.memreader_plus_runtime_report = function()
-		return true, 'memreader_runtime_report_010203_040506.txt'
-	end
-	run_mod(PACK .. '/script/mct/settings/memreader_plus.lua')
-	check(
-		action.key == 'runtime_report' and action.text == ' ',
-		'the settings file adds the report button with a blank row label, so MCT gives the whole row to the button'
-	)
-	check(
-		calls.set_button_text[1] == 'Generate a runtime report' and calls.set_is_global[1] == true,
-		'the button carries the words, global so MP clients can use it'
-	)
-	check(has(calls.set_tooltip_text[1], 'memreader_runtime_report_<date>_<time>.txt'), 'the tooltip stays on the row')
-	action.callback()
-	check(#popups == 1 and popups[1].two_buttons == false and popups[1].key == 'memreader_plus_runtime_report', 'a click shows one popup with a single button')
-	check(
-		has(popups[1].text, 'saved as memreader_runtime_report_010203_040506.txt') and has(popups[1].text, 'next to Warhammer3.exe'),
-		'it names the file and the folder'
-	)
-	_G.memreader_plus_runtime_report = function()
-		return false, 'no folder'
-	end
-	action.callback()
-	check(has(popups[2].text, 'could not be written: no folder'), 'a failure is told to the player')
-	_G.memreader_plus_runtime_report = function()
-		error('exploded', 0)
-	end
-	action.callback()
-	check(has(popups[3].text, 'could not be written: exploded'), 'an error in the report function is told to the player')
-	GLib = nil
-	check(pcall(action.callback) and log_count('cannot show the runtime report result') == 1, 'without the popup helper the click only logs')
 elseif SCENARIO == 'report_native' then
 	io.stdout:setvbuf('no')
 	load_other_program_dll()

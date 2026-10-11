@@ -341,9 +341,9 @@ static int l_call(lua_State *L)
 	Signature signature;
 
 	parse_signature(L, luaL_checkstring(L, 2), &signature);
-	if (function && !in_exe_code(function) && !is_hook_original(function)) {
+	if (function && !in_exe_code(function) && !is_executable(function)) {
 		note_refusal(L, "call", function);
-		return luaL_argerror(L, 1, "refused: call takes only code in the game's exe or a hook's original");
+		return luaL_argerror(L, 1, "refused: call takes only executable memory");
 	}
 	return call_with_signature(L, function, &signature, 3);
 }
