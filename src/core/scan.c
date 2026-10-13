@@ -538,6 +538,27 @@ INT_PTR find_unique(const char *text)
 	return matches && matches->count == 1 ? (INT_PTR)matches->first : 0;
 }
 
+int find_pattern_count(const char *text, INT_PTR *first)
+{
+	int error;
+	const Matches *matches = search_one(text, &error);
+
+	if (!matches)
+		return -1;
+	*first = (INT_PTR)matches->first;
+	return matches->count;
+}
+
+int original_matches(INT_PTR address, const char *text)
+{
+	Pattern pattern;
+	int error = parse_pattern(text, &pattern);
+
+	if (error != PATTERN_OK && error != PATTERN_STARTS_UNKNOWN)
+		return -1;
+	return matches_original(address, &pattern);
+}
+
 INT_PTR call_destination(INT_PTR call)
 {
 	BYTE opcode;

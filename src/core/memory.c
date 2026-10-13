@@ -3,7 +3,6 @@
 #include "common.h"
 
 enum {
-	MAX_PATCH_SIZE = 4096,
 	PATCH_PAGES = 2,
 	STACK_BUFFER_SIZE = 1024,
 	MAX_READ_SIZE = 16 * 1024 * 1024,

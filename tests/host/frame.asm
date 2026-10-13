@@ -158,8 +158,59 @@ spin:
 	ret
 parked_target ENDP
 
+park_frame PROC FRAME
+	push rbx
+	.pushreg rbx
+	.endprolog
+	mov eax, 1
+	mov edx, 3
+spin:
+	cmp dword ptr [rcx], 0
+	je spin
+	pop rbx
+	mov eax, 78
+	ret
+park_frame ENDP
+
+park_grow PROC FRAME
+	push rbx
+	.pushreg rbx
+	sub rsp, 0C0h
+	.allocstack 0C0h
+	.endprolog
+spin:
+	cmp dword ptr [rcx], 0
+	je spin
+	add rsp, 0C0h
+	pop rbx
+	mov eax, 79
+	ret
+park_grow ENDP
+
+park_outer PROC FRAME
+	sub rsp, 28h
+	.allocstack 28h
+	.endprolog
+	mov eax, 1
+	call park_inner
+	add rsp, 28h
+	ret
+park_outer ENDP
+
+park_inner PROC
+spin:
+	cmp dword ptr [rcx], 0
+	je spin
+	mov eax, 80
+	ret
+park_inner ENDP
+
+fillcode SEGMENT ALIGN(4096) READ EXECUTE ALIAS(".text$zz") 'CODE'
+
 filler_code PROC
 	BYTE 40960 DUP (0)
 filler_code ENDP
+
+fillcode ENDS
 
 END

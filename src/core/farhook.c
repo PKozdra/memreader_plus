@@ -1,13 +1,12 @@
 #include <string.h>
 
 #include "common.h"
-#include <tlhelp32.h>
 #include "MinHook.h"
 #include "buffer.h"
 #include "trampoline.h"
 #include "hde/hde64.h"
 
-enum { HOP_SIZE = 14, SITE_JUMP = 5, PROLOGUE_SCAN = 32, FAR_BUFFER_SIZE = 64, RIP_MODRM = 0x05, RIP_MODRM_MASK = 0xC7, STACK_GUARD_KEEP = 0x3000, MAX_THREADS = 1024 };
+enum { HOP_SIZE = 14, SITE_JUMP = 5, PROLOGUE_SCAN = 32, FAR_BUFFER_SIZE = 64, RIP_MODRM = 0x05, RIP_MODRM_MASK = 0xC7, STACK_GUARD_KEEP = 0x3000 };
 
 #pragma pack(push, 1)
 typedef struct {
@@ -22,7 +21,6 @@ _Static_assert(sizeof(AbsoluteJump) == HOP_SIZE, "an absolute jump is 14 bytes")
 static const BYTE JUMP_RIP[2] = { 0xFF, 0x25 };
 static const BYTE INT3 = 0xCC;
 
-static HANDLE suspended[MAX_THREADS];
 static BYTE *padding_next;
 static BYTE *padding_end;
 
@@ -46,17 +44,11 @@ static BYTE *find_padding_run(BYTE *from, BYTE *section_end)
 	return NULL;
 }
 
-static BYTE *take_hop_slot(void)
+static BYTE *find_hop_slot(void)
 {
-	BYTE *run;
-
 	if (!padding_next && !code_section(0, &padding_next, &padding_end))
 		return NULL;
-	run = find_padding_run(padding_next, padding_end);
-	if (!run)
-		return NULL;
-	padding_next = run + HOP_SIZE;
-	return run;
+	return find_padding_run(padding_next, padding_end);
 }
 
 static BOOL padding_reaches(INT_PTR target)
@@ -75,13 +67,6 @@ static AbsoluteJump absolute_jump(UINT64 destination)
 	AbsoluteJump jump = { { JUMP_RIP[0], JUMP_RIP[1] }, 0, destination };
 
 	return jump;
-}
-
-static void write_absolute_jump(BYTE *at, UINT64 destination)
-{
-	AbsoluteJump jump = absolute_jump(destination);
-
-	patch_memory((INT_PTR)at, (const char *)&jump, sizeof jump);
 }
 
 void write_jump_back(BYTE *at, void *destination)
@@ -110,15 +95,6 @@ static BOOL prologue_relocatable(BYTE *target)
 	return TRUE;
 }
 
-static HANDLE open_thread(DWORD id)
-{
-	HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, id);
-
-	if (!thread)
-		thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, id);
-	return thread;
-}
-
 static void leave_prologue(HANDLE thread, INT_PTR target, const TRAMPOLINE *ct)
 {
 	CONTEXT context = { 0 };
@@ -136,41 +112,16 @@ static void leave_prologue(HANDLE thread, INT_PTR target, const TRAMPOLINE *ct)
 	}
 }
 
-static int suspend_others(INT_PTR target, const TRAMPOLINE *ct)
+typedef struct {
+	INT_PTR target;
+	const TRAMPOLINE *trampoline;
+} PrologueMove;
+
+static void move_out_of_prologue(HANDLE thread, void *context)
 {
-	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-	THREADENTRY32 entry = { sizeof entry };
-	DWORD self = GetCurrentThreadId();
-	DWORD process = GetCurrentProcessId();
-	int count = 0;
+	const PrologueMove *move = context;
 
-	if (snapshot == INVALID_HANDLE_VALUE)
-		return 0;
-	for (BOOL more = Thread32First(snapshot, &entry); more && count < MAX_THREADS; more = Thread32Next(snapshot, &entry)) {
-		HANDLE thread;
-
-		if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self)
-			continue;
-		thread = open_thread(entry.th32ThreadID);
-		if (thread && SuspendThread(thread) != (DWORD)-1) {
-			leave_prologue(thread, target, ct);
-			suspended[count++] = thread;
-		} else if (thread) {
-			CloseHandle(thread);
-		}
-	}
-	CloseHandle(snapshot);
-	return count;
-}
-
-static void resume_others(int count)
-{
-	int i;
-
-	for (i = 0; i < count; i++) {
-		ResumeThread(suspended[i]);
-		CloseHandle(suspended[i]);
-	}
+	leave_prologue(thread, move->target, move->trampoline);
 }
 
 int install_far_hook(INT_PTR target, void *detour, void **original, FinishHook finish, void *context)
@@ -179,8 +130,11 @@ int install_far_hook(INT_PTR target, void *detour, void **original, FinishHook f
 	BYTE site_jump[SITE_JUMP] = { 0xE9, 0, 0, 0, 0 };
 	BYTE *far_buffer;
 	BYTE *hop;
+	AbsoluteJump jump;
 	INT32 distance;
-	int suspended_count;
+	PrologueMove move = { target, &ct };
+	FreezeJob job = { NULL, 0, move_out_of_prologue, &move };
+	int busy;
 
 	if (!prologue_relocatable((BYTE *)target))
 		return MH_ERROR_UNSUPPORTED_FUNCTION;
@@ -196,21 +150,31 @@ int install_far_hook(INT_PTR target, void *detour, void **original, FinishHook f
 		VirtualFree(far_buffer, 0, MEM_RELEASE);
 		return MH_ERROR_UNSUPPORTED_FUNCTION;
 	}
-	hop = take_hop_slot();
+	hop = find_hop_slot();
 	if (!hop) {
 		VirtualFree(far_buffer, 0, MEM_RELEASE);
 		return MH_ERROR_MEMORY_ALLOC;
 	}
+	remember_original((INT_PTR)hop, HOP_SIZE);
 	VirtualProtect(far_buffer, FAR_BUFFER_SIZE, PAGE_EXECUTE_READ, &(DWORD){ 0 });
 	FlushInstructionCache(GetCurrentProcess(), far_buffer, FAR_BUFFER_SIZE);
 	if (finish)
 		finish(context, far_buffer);
-	write_absolute_jump(hop, (UINT64)ct.pRelay);
 	distance = (INT32)((INT_PTR)hop - (target + SITE_JUMP));
 	memcpy(site_jump + 1, &distance, sizeof distance);
-	suspended_count = suspend_others(target, &ct);
-	patch_memory(target, (const char *)site_jump, sizeof site_jump);
-	resume_others(suspended_count);
+	if (freeze_threads(&job, &busy) != FREEZE_OK)
+		return FAR_HOOK_NO_FREEZE;
+	jump = absolute_jump((UINT64)ct.pRelay);
+	if (!patch_memory((INT_PTR)hop, (const char *)&jump, sizeof jump)) {
+		thaw_threads();
+		return MH_ERROR_MEMORY_PROTECT;
+	}
+	padding_next = hop + HOP_SIZE;
+	if (!patch_memory(target, (const char *)site_jump, sizeof site_jump)) {
+		thaw_threads();
+		return MH_ERROR_MEMORY_PROTECT;
+	}
+	thaw_threads();
 	*original = ct.pTrampoline;
 	return MH_OK;
 }

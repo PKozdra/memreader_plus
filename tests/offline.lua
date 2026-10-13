@@ -84,6 +84,14 @@ local function context_script_env(listeners)
 		add_listener = function(_, _, event, _, callback)
 			listeners[event] = callback
 		end,
+		timers = {},
+		get_tm = function(self)
+			return {
+				repeat_real_callback = function(_, callback, milliseconds, name)
+					self.timers[#self.timers + 1] = { callback = callback, milliseconds = milliseconds, name = name }
+				end,
+			}
+		end,
 		event_callback = function(_, eventname, context)
 			if listeners[eventname] then listeners[eventname](context) end
 		end,
@@ -143,6 +151,12 @@ local function fill_crash_context(mr)
 	mr.set_crash_context('temp')
 	mr.set_crash_context('note', 'first' .. string.char(10) .. 'second')
 	check(listeners.WorldStartRound ~= nil, 'the context script listens for every round')
+	local timer = core.timers[1]
+	check(
+		#core.timers == 1 and timer.milliseconds == 5000 and timer.name == 'memreader_plus_flush_log',
+		'the context script flushes the link log every 5 seconds'
+	)
+	check(pcall(timer.callback), 'and the timer callback runs')
 end
 
 local SETTINGS = table.concat({
@@ -564,6 +578,7 @@ local HOST_FAULTS = {
 	exit_report_terminate = { 'terminate_process', true },
 	exit_report_crt = { 'crt_exit', false },
 	fault_report_two_threads = { 'two_threads', false },
+	fault_report_overlap = { 'overlap', false },
 	fault_report_worker_stuck = { 'worker_stuck', false },
 	fault_report_worker_waits = { 'worker_waits', false },
 	fault_report_worker_blocked = { 'worker_blocked', false },
@@ -989,6 +1004,1121 @@ elseif SCENARIO == 'hook' then
 		check(run(mr.call, target, TARGET, 1, 2) == '3', 'the new state attaches again')
 		check(mr.hook_info(target).calls == 1, 'calls restart in the new state')
 	end
+elseif SCENARIO == 'links' then
+	io.stdout:setvbuf('no')
+	local logged = {}
+	ModLog = function(message)
+		logged[#logged + 1] = message
+		print('  log: ' .. message)
+	end
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local target, single, float, store = address('hook_target'), address('hook_single'), address('hook_float'), address('hook_store')
+	local TARGET, SINGLE, FLOAT, STORE = 'int32(int32, int32)', 'int64(int64)', 'float(float, float)', 'void(pointer, int32)'
+	local function contains(text, part)
+		return type(text) == 'string' and string.find(text, part, 1, true) ~= nil
+	end
+	local function error_of(f, ...)
+		local ok, err = pcall(f, ...)
+		return not ok and tostring(err) or nil
+	end
+	local function call_target(a, b)
+		return mr.tonumber(mr.call(target, TARGET, a, b))
+	end
+	local trace = {}
+	local function mark(text)
+		trace[#trace + 1] = text
+	end
+	local function seen()
+		local text = table.concat(trace, ' ')
+		trace = {}
+		return text
+	end
+	local function lines_with(part)
+		local count = 0
+		for _, line in ipairs(logged) do
+			if contains(line, part) then count = count + 1 end
+		end
+		return count
+	end
+	local function prefix(p, name, priority)
+		return p:prefix(target, TARGET, name, function()
+			mark('P:' .. name)
+		end, priority)
+	end
+	local function postfix(p, name, priority)
+		return p:postfix(target, TARGET, name, function()
+			mark('F:' .. name)
+		end, priority)
+	end
+	local function around(p, name, priority)
+		return p:around(target, TARGET, name, function(game, x, y)
+			mark('>' .. name)
+			local result = game(x, y)
+			mark('<' .. name)
+			return result
+		end, priority)
+	end
+	local function clean(...)
+		for _, p in ipairs({ ... }) do
+			p:remove_all()
+		end
+		mr.unhook(target)
+		seen()
+	end
+
+	if PASS == 1 then
+		local a, b = mr.patcher('link_a'), mr.patcher('link_b')
+		check(type(mr.patch_info) == 'function' and type(a.prefix) == 'function', 'patch_info and the link methods are part of the API')
+		check(mr.patch_info(address('call_directly')) == nil, 'patch_info of an address with no hook and no claim is nil')
+
+		check(call_target(1, 2) == 12, 'the original result before any link')
+		for _, spec in ipairs({ { a, 'low', -5 }, { b, 'high', 10 }, { a, 'mid1', 0 }, { b, 'mid2', 0 } }) do
+			local label = spec[2]
+			check(spec[1]:prefix(target, TARGET, 'p_' .. label, function()
+				mark('P:' .. label)
+			end, spec[3]) == true, 'prefix ' .. label)
+			check(spec[1]:postfix(target, TARGET, 'f_' .. label, function()
+				mark('F:' .. label)
+			end, spec[3]) == true, 'postfix ' .. label)
+			check(spec[1]:around(target, TARGET, 'a_' .. label, function(game, x, y)
+				mark('>' .. label)
+				local result = game(x, y)
+				mark('<' .. label)
+				return result
+			end, spec[3]) == true, 'around ' .. label)
+		end
+		check(call_target(1, 2) == 12, 'links that change nothing keep the result')
+		check(
+			seen() == 'P:high P:mid1 P:mid2 P:low >high >mid1 >mid2 >low <low <mid2 <mid1 <high F:high F:mid1 F:mid2 F:low',
+			'every list runs highest priority first, ties by registration, the highest around is outermost'
+		)
+		check(
+			#mr.patch_info(target).links == 12 and mr.hook_info(target).callbacks == 0 and not mr.hook_info(target).attached,
+			'patch_info lists the links, hook_info counts old callbacks only'
+		)
+		mr.hook(target, TARGET, function(x, y)
+			mark('>L1')
+			local result = mr.hook_next(target, x, y)
+			mark('<L1')
+			return result
+		end)
+		mr.hook(target, TARGET, function(x, y)
+			mark('>L2')
+			local result = mr.hook_next(target, x, y)
+			mark('<L2')
+			return result
+		end)
+		check(call_target(1, 2) == 12, 'old callbacks and links on one address')
+		check(
+			seen() == 'P:high P:mid1 P:mid2 P:low >high >mid1 >mid2 >L2 >L1 >low <low <L1 <L2 <mid2 <mid1 <high F:high F:mid1 F:mid2 F:low',
+			'old callbacks are one group of priority 0 arounds, newest first, placed at their oldest member, and hook_next and game walk one order'
+		)
+		check(
+			mr.hook_info(target).callbacks == 2 and mr.hook_info(target).attached and #mr.patch_info(target).links == 14,
+			'hook_info counts the old callbacks, patch_info all'
+		)
+		mr.unhook(target)
+		check(
+			mr.hook_info(target).callbacks == 0 and not mr.hook_info(target).attached and #mr.patch_info(target).links == 12,
+			'unhook removes only the old callbacks'
+		)
+		check(call_target(1, 2) == 12 and seen() ~= '', 'the links still run after unhook')
+		clean(a, b)
+		check(mr.hook_info(target).callbacks == 0 and not mr.hook_info(target).attached, 'remove_all detaches every link')
+		check(call_target(1, 2) == 12 and seen() == '', 'an address with no links runs the original')
+
+		local skipped_by, skipped_result
+		local cell = mr.alloc(4)
+		prefix(a, 'before', 9)
+		check(a:prefix(target, TARGET, 'skipper', function(call)
+			mark('P:skipper')
+			call:skip(77)
+		end, 5) == true, 'a skipping prefix')
+		prefix(a, 'after', 0)
+		around(a, 'never', 0)
+		check(a:postfix(target, TARGET, 'watcher', function(call, result)
+			mark('F:watcher')
+			skipped_by, skipped_result = call.skipped, mr.tonumber(result)
+		end, 0) == true, 'a postfix')
+		check(call_target(1, 2) == 77, 'a skip returns the given result')
+		check(seen() == 'P:before P:skipper F:watcher', 'a skip removes the lower prefixes and the arounds, every postfix still runs')
+		check(skipped_by == 'link_a/skipper' and skipped_result == 77, 'the postfix sees who skipped and the result: ' .. tostring(skipped_by))
+		check(a:info('skipper').skips == 1 and a:info('skipper').calls == 1, 'the skipping link counts its skip')
+		check(a:info('before').skips == 0 and a:info('after').calls == 0, 'other links count no skip, and a link that did not run counts no call')
+		a:remove('skipper')
+		check(call_target(1, 2) == 12 and skipped_by == nil, 'without the skipper the original runs and call.skipped is nil')
+		seen()
+		a:remove('never')
+		check(a:around(target, TARGET, 'gate', function(game, x, y)
+			mark('>gate')
+			return 99
+		end, 5) == true, 'an around that never calls game')
+		around(a, 'below_gate', 0)
+		check(call_target(1, 2) == 99, 'an around that returns without game skips the original')
+		check(seen() == 'P:before P:after >gate F:watcher', 'an around skip removes the arounds below, every postfix runs')
+		check(skipped_by == 'link_a/gate' and a:info('gate').skips == 1, 'the around that did not call game is the skipper and counts it')
+		check(a:info('below_gate').calls == 0, 'the around below it never ran')
+		clean(a)
+		mr.hook(target, TARGET, function()
+			return 5
+		end)
+		a:postfix(target, TARGET, 'watcher', function(call, result)
+			skipped_by = call.skipped
+		end)
+		check(call_target(1, 2) == 5 and skipped_by == 'hook', 'an old callback that skips shows as hook')
+		clean(a)
+		check(a:prefix(store, STORE, 'void_skip', function(call, p, v)
+			call:skip()
+		end) == true, 'a prefix on a void function')
+		mr.call(store, STORE, cell, 5)
+		check(mr.read_int32(cell, 0) == 0, 'a skip on a void function runs no original')
+		a:remove('void_skip')
+		mr.call(store, STORE, cell, 5)
+		check(mr.read_int32(cell, 0) == 6, 'and without it the original writes')
+		local bare_value
+		a:postfix(store, STORE, 'void_post', function(call, result, p, v)
+			bare_value = { result, mr.tonumber(v) }
+		end)
+		a:prefix(store, STORE, 'void_set', function(call, p, v)
+			call:set(2, 40)
+		end)
+		mr.call(store, STORE, cell, 5)
+		check(
+			mr.read_int32(cell, 0) == 41 and bare_value[1] == nil and bare_value[2] == 40,
+			'set works on a void function and the postfix gets nil for the result'
+		)
+		a:remove_all()
+
+		local boom = 0
+		prefix(a, 'good_prefix', 0)
+		check(a:prefix(target, TARGET, 'bad_prefix', function(call)
+			boom = boom + 1
+			call:set(2, 9)
+			call:skip(55)
+			error('prefix boom ' .. boom)
+		end, 10) == true, 'a prefix that raises')
+		check(call_target(1, 2) == 12 and seen() == 'P:good_prefix', 'a raising prefix loses its set and skip, the next prefix runs')
+		check(call_target(1, 2) == 12, 'and again')
+		seen()
+		check(lines_with('link_a/bad_prefix') == 0, 'nothing is logged inside the call')
+		local row = a:info('bad_prefix')
+		check(
+			row.errors == 2 and contains(row.error, 'prefix boom 1') and not contains(row.error, 'boom 2'),
+			'the link counts its errors and keeps the first text: ' .. tostring(row.error)
+		)
+		check(a:info('bad_prefix').state == 'stays' and #mr.patch_info(target).links > 0, 'the link stays attached')
+		check(mr.hook_info(target).error == nil and mr.hook_info(target).callbacks == 0, 'a link error does not touch hook_info')
+		mr.patch_info(target)
+		mr.patch_info(target)
+		check(lines_with('[memreader Plus] link_a/bad_prefix (prefix): ') == 1 and lines_with('prefix boom 1') == 1, 'the first error is logged once')
+		a:remove_all()
+
+		check(a:around(target, TARGET, 'bad_around', function()
+			error('around boom')
+		end, 10) == true, 'an around that raises before game')
+		around(a, 'inner', 0)
+		check(call_target(1, 2) == 12 and seen() == '>inner <inner', 'a raising around is skipped as if absent, the ones below run')
+		a:remove('inner')
+		a:around(target, TARGET, 'inner', function(game, x, y)
+			return mr.add(game(x, y), 1000)
+		end, 0)
+		check(call_target(1, 2) == 1012, 'and the inner chain result is used')
+		a:remove('bad_around')
+		a:around(target, TARGET, 'late_error', function(game, x, y)
+			local result = game(x, y)
+			error('late boom')
+		end, 10)
+		check(call_target(1, 2) == 1012, 'an around that raises after game keeps the result of game')
+		check(a:info('late_error').errors == 1 and a:info('inner').errors == 0, 'only the raising around counts an error')
+		a:remove_all()
+		a:around(target, TARGET, 'wrong_type', function(game, x, y)
+			game(x, y)
+			return {}
+		end, 0)
+		check(
+			call_target(1, 2) == 12 and contains(a:info('wrong_type').error, 'int32 expected'),
+			'a result of the wrong type is an error and the kept result stands'
+		)
+		a:remove_all()
+		a:around(target, TARGET, 'returns_nothing', function(game, x, y) end, 0)
+		check(call_target(1, 2) == 12 and contains(a:info('returns_nothing').error, 'returned nothing'), 'returning nothing is an error and the original runs')
+		a:remove_all()
+
+		local final_seen
+		a:postfix(target, TARGET, 'replace', function(call, result)
+			return 50
+		end, 10)
+		a:postfix(target, TARGET, 'breaks', function(call, result)
+			error('postfix boom')
+		end, 0)
+		a:postfix(target, TARGET, 'last', function(call, result)
+			final_seen = mr.tonumber(result)
+		end, -5)
+		check(call_target(1, 2) == 50 and final_seen == 50, 'a postfix can replace the result and the next one sees it, a raising postfix leaves it as it was')
+		a:remove('replace')
+		a:postfix(target, TARGET, 'bad_type', function(call, result)
+			return {}
+		end, 20)
+		check(
+			call_target(1, 2) == 12 and final_seen == 12 and contains(a:info('bad_type').error, 'int32 expected'),
+			'a postfix result of the wrong type leaves the result'
+		)
+		check(a:info('breaks').errors == 2 and #mr.patch_info(target).links == 3, 'raising postfixes stay attached')
+		mr.patch_info(target)
+		check(lines_with('link_a/breaks (postfix): ') == 1 and lines_with('link_a/bad_type (postfix): ') == 1, 'each raising link logs its first error once')
+		clean(a)
+
+		local objects, in_around, game_is_call = {}, {}, nil
+		check(a:prefix(target, TARGET, 'setter', function(call, x, y)
+			call:set(1, 5)
+			call:set(2, 7)
+		end, 10) == true, 'a prefix with set')
+		a:around(target, TARGET, 'sees', function(game, x, y)
+			in_around = { mr.tonumber(x), mr.tonumber(y) }
+			return game(x, y)
+		end)
+		local post_seen
+		a:postfix(target, TARGET, 'sees_post', function(call, result, x, y)
+			post_seen = { mr.tonumber(x), mr.tonumber(y) }
+		end)
+		check(call_target(1, 2) == 57, 'the original runs with the changed arguments')
+		check(in_around[1] == 5 and in_around[2] == 7, 'the around gets them')
+		check(post_seen[1] == 5 and post_seen[2] == 7, 'the postfix gets the arguments as they were after the prefixes')
+		a:remove('setter')
+		local problems = {}
+		a:prefix(target, TARGET, 'bad_sets', function(call)
+			problems[1] = error_of(call.set, call, 3, 1)
+			problems[2] = error_of(call.set, call, 1, {})
+			problems[3] = error_of(call.skip, call)
+			problems[4] = error_of(call.set, call, 0, 1)
+		end, 10)
+		a:around(target, TARGET, 'phase', function(game, x, y)
+			problems[5] = error_of(game.set, game, 1, 1)
+			problems[6] = error_of(game.skip, game, 1)
+			return game(x, y)
+		end, 10)
+		check(call_target(1, 2) == 12, 'wrong set and skip calls change nothing')
+		check(
+			contains(problems[1], 'must be a whole number from 1 to 2') and contains(problems[4], 'must be a whole number from 1 to 2'),
+			'an argument number outside the signature raises'
+		)
+		check(contains(problems[2], 'int32') and contains(problems[3], 'skip needs a result'), 'a wrong value or a missing skip result raises')
+		check(
+			contains(problems[5], 'set works only inside a prefix') and contains(problems[6], 'skip works only inside a prefix'),
+			'set and skip outside a prefix raise'
+		)
+		clean(a)
+
+		check(a:around(target, TARGET, 'thrice', function(game, x, y)
+			return mr.tonumber(game(1, 1)) + mr.tonumber(game(2, 2)) + mr.tonumber(game(3, 3))
+		end) == true, 'an around that calls game three times')
+		check(call_target(9, 9) == 66, 'game runs the rest of the chain every time')
+		check(a:around(target, TARGET, 'thrice', function(game, x, y)
+			return 7
+		end) == true and call_target(9, 9) == 7 and #mr.patch_info(target).links == 1, 'the same name replaces the link')
+		clean(a)
+		check(
+			a:around(target, TARGET, 'wrong_count', function(game, x, y)
+					return game(1)
+				end) == true
+				and call_target(1, 2) == 12
+				and contains(a:info('wrong_count').error, 'the signature takes 2 arguments, got 1'),
+			'game with the wrong number of arguments is an error'
+		)
+		clean(a)
+
+		a:around(target, TARGET, 'lower', function(game, x, y)
+			return mr.add(game(x, y), 1000)
+		end, 0)
+		a:around(target, TARGET, 'direct', function(game, x, y)
+			return game:original(x, y)
+		end, 10)
+		a:prefix(target, TARGET, 'direct_prefix', function(call, x, y)
+			mark('P')
+		end, 0)
+		check(call_target(1, 2) == 12 and seen() == 'P', 'call:original skips the arounds below')
+		local nested = {}
+		a:remove_all()
+		a:prefix(target, TARGET, 'recurse', function(call, x, y)
+			nested[#nested + 1] = { call.depth, call, call.site }
+			if mr.tonumber(x) > 0 then mr.call(target, TARGET, mr.tonumber(x) - 1, y) end
+		end)
+		call_target(2, 0)
+		check(#nested == 3 and nested[1][1] == 1 and nested[2][1] == 2 and nested[3][1] == 3, 'call.depth counts nested calls')
+		check(nested[1][2] ~= nested[2][2] and nested[2][2] ~= nested[3][2], 'nested calls get their own call object')
+		check(nested[1][3] == 'recurse', 'call.site is the link name')
+		local first_objects = { nested[1][2], nested[2][2], nested[3][2] }
+		nested = {}
+		call_target(2, 0)
+		check(nested[1][2] == first_objects[1] and nested[2][2] == first_objects[2], 'a later call reuses the object of its depth: no allocation')
+		local stash
+		a:remove_all()
+		a:prefix(target, TARGET, 'stasher', function(call)
+			stash = call
+		end)
+		call_target(1, 2)
+		check(
+			contains(
+				error_of(function()
+					return stash.skipped
+				end),
+				'call object used after its call returned'
+			),
+			'a call object used after its call raises'
+		)
+		check(contains(error_of(stash.set, stash, 1, 1), 'call object used after its call returned'), 'also its methods')
+		check(
+			contains(
+				error_of(function()
+					return stash.depth
+				end),
+				'call object used after its call returned'
+			),
+			'also call.depth'
+		)
+		check(
+			contains(
+				error_of(function()
+					return stash(1, 2)
+				end),
+				'call object used after its call returned'
+			),
+			'also game'
+		)
+		check(
+			contains(
+				error_of(function()
+					return stash:original(1, 2)
+				end),
+				'call object used after its call returned'
+			),
+			'also call:original'
+		)
+		check(error_of(a.prefix, stash, target, TARGET, 'x', function() end) ~= nil, 'a call object is not a handle')
+		clean(a)
+
+		local edited, late_ran = false, false
+		a:postfix(target, TARGET, 'goner', function()
+			mark('F:goner')
+		end)
+		a:prefix(target, TARGET, 'editor', function()
+			if edited then return end
+			edited = true
+			mark('edit')
+			mark(tostring(a:postfix(target, TARGET, 'newcomer', function()
+				mark('F:newcomer')
+			end)))
+			mark(tostring(a:remove('goner')))
+		end)
+		call_target(1, 2)
+		check(seen() == 'edit true true F:goner', 'a link added during a call runs from the next call, a removed one still finishes this call')
+		call_target(1, 2)
+		check(seen() == 'F:newcomer', 'the next call has the new set')
+		check(#mr.patch_info(target).links == 2, 'the removed link is gone from patch_info')
+		clean(a)
+
+		a:remove_all()
+		for i = 1, 32 do
+			a:postfix(single, SINGLE, 'f' .. i, function() end)
+		end
+		check(select(2, a:postfix(single, SINGLE, 'f33', function() end)) == 'at most 32 links on this address', 'the 33rd link is refused')
+		check(a:info('f33') == nil, 'and registers nothing')
+		check(a:remove('f1') == true and a:postfix(single, SINGLE, 'f33', function() end) == true, 'a free slot takes the next one')
+		a:remove_all()
+		local midcall = {}
+		for i = 1, 32 do
+			a:postfix(single, SINGLE, 'g' .. i, function()
+				if i == 1 then
+					midcall[1] = a:remove('g2')
+					midcall[2], midcall[3] = a:postfix(single, SINGLE, 'g33', function() end)
+				end
+			end)
+		end
+		mr.call(single, SINGLE, 1)
+		check(
+			midcall[1] == true and midcall[2] == nil and contains(midcall[3], 'removed links keep their place until the running call returns'),
+			'during a call a removed link still holds its slot'
+		)
+		check(a:postfix(single, SINGLE, 'g33', function() end) == true, 'and the slot is free after the call')
+		a:remove_all()
+		check(mr.hook_info(single).callbacks == 0, 'remove_all frees every slot')
+
+		for _ = 1, 16 do
+			mr.hook(single, SINGLE, function(x)
+				return mr.hook_next(single, x)
+			end)
+		end
+		check(contains(error_of(mr.hook, single, SINGLE, function() end), 'at most 16 callbacks per address'), 'old callbacks keep their limit of 16')
+		local made = 0
+		for i = 1, 16 do
+			if a:postfix(single, SINGLE, 'm' .. i, function() end) == true then made = made + 1 end
+		end
+		check(
+			made == 16 and select(2, a:postfix(single, SINGLE, 'm17', function() end)) == 'at most 32 links on this address',
+			'sixteen old callbacks and sixteen links fill the 32 places'
+		)
+		check(contains(error_of(mr.hook, single, SINGLE, function() end), 'at most 16 callbacks per address'), 'and the old limit holds')
+		check(mr.tonumber(mr.call(single, SINGLE, 2)) == 7, 'a call through all of them')
+		mr.unhook(single)
+		a:remove_all()
+
+		local c = mr.patcher('sig_c')
+		check(c:prefix(single, SINGLE, 'first_link', function() end) == true, 'a first link sets the signature')
+		local ok, why = c:prefix(single, 'int64(int64, int64)', 'second', function() end)
+		check(ok == nil and why == 'signature differs from sig_c/first_link', 'another signature is refused with the holder: ' .. tostring(why))
+		check(c:info('second') == nil, 'and registers nothing')
+		check(
+			contains(error_of(mr.hook, single, 'int64(int64, int64)', function() end), 'different signature'),
+			'an old hook with another signature is refused too'
+		)
+		check(c:prefix(single, SINGLE, 'second', function() end) == true, 'the same signature is accepted')
+		ok, why = c:prefix(single, 'int32(int32)', 'first_link', function() end)
+		check(ok == nil and why == 'signature differs from sig_c/first_link', 'a replacement needs the same signature while other links exist')
+		c:remove('second')
+		check(c:prefix(single, 'int32(int32)', 'first_link', function() end) == true, 'a link replacing the only link may change the signature')
+		c:remove_all()
+		mr.hook(float, FLOAT, function(x, y)
+			return mr.hook_next(float, x, y)
+		end)
+		ok, why = c:prefix(float, 'float(float)', 'other', function() end)
+		check(ok == nil and why == 'signature differs from hook', 'an old callback holds the signature: ' .. tostring(why))
+		mr.unhook(float)
+		check(c:prefix(float, 'float(float)', 'other', function() end) == true, 'with the old callback gone another signature is accepted')
+		c:remove_all()
+
+		check(select(2, a:prefix(target, TARGET, 'bad name', function() end)) == 'name must be 1 to 47 letters, digits or underscores', 'a bad name is refused')
+		check(
+			select(2, a:prefix(target, TARGET, 'x', function() end, 5000)) == 'priority must be a whole number from -1000 to 1000',
+			'a priority out of range is refused'
+		)
+		check(select(2, a:prefix(nil, TARGET, 'x', function() end)) == 'address is NULL', 'a NULL address is refused')
+		check(not pcall(a.prefix, a, target, 'int(int)', 'x', function() end), 'an unknown type in the signature raises')
+		check(not pcall(a.prefix, a, target, TARGET, 'x', nil), 'a missing function raises')
+		check(not pcall(a.prefix, 5, target, TARGET, 'x', function() end), 'a call without the handle raises')
+		a:prefix(target, TARGET, 'kind_name', function() end)
+		check(
+			select(2, a:postfix(target, TARGET, 'kind_name', function() end)) == 'the name is already used for a different change',
+			'a name cannot change its kind'
+		)
+		check(select(2, a:prefix(single, SINGLE, 'kind_name', function() end)) == 'the name is already used for a different change', 'or its address')
+		local same = function() end
+		a:prefix(target, TARGET, 'same_function', same)
+		local count_before = mr.hook_info(target).callbacks
+		check(
+			a:prefix(target, TARGET, 'same_function', same) == true and mr.hook_info(target).callbacks == count_before,
+			'the same name with the same function is a no-op'
+		)
+		check(
+			a:prefix(target, TARGET, 'same_function', function() end) == true and mr.hook_info(target).callbacks == count_before,
+			'with another function it replaces the link'
+		)
+		check(a:prefix(target, TARGET, 'same_function', same, 7) == true and mr.hook_info(target).callbacks == count_before, 'with another priority too')
+		check(
+			a:remove('same_function') == true and select(2, a:remove('same_function')) == 'unknown name',
+			'remove drops the link and answers unknown name afterwards'
+		)
+		local here = address('site_target_here')
+		check(a:site('a_site', here, function() end) == true, 'a site on another address')
+		ok, why = a:prefix(here, 'int32()', 'on_site', function() end)
+		check(ok == nil and contains(why, 'already holds a site hook'), 'a link on a site address is refused: ' .. tostring(why))
+		clean(a)
+		local claim_target = address('patch_target')
+		check(b:patch('claimed', claim_target, '\184\1\0\0\0', '\184\1\0\0\0') == true, 'a patch claims the start of a function')
+		ok, why = a:prefix(claim_target, 'int32()', 'over_claim', function() end)
+		check(
+			ok == nil and why == 'held by link_b/claimed' and mr.hook_info(claim_target) == nil,
+			'a link over a claimed range is refused and hooks nothing: ' .. tostring(why)
+		)
+		b:remove('claimed')
+
+		check(a:prefix(target, TARGET, 'info_pre', function() end, 3) == true, 'rows')
+		b:around(target, TARGET, 'info_around', function(game, x, y)
+			return game(x, y)
+		end)
+		a:postfix(target, TARGET, 'info_post', function() end, 1)
+		mr.hook(target, TARGET, function(x, y)
+			return mr.hook_next(target, x, y)
+		end)
+		call_target(1, 2)
+		local info = mr.patch_info(target)
+		check(info.kind == 'function' and info.other_thread_calls == 0 and #info.links == 4 and #info.claims == 0, 'patch_info of a hooked function')
+		local names = {}
+		for i, row in ipairs(info.links) do
+			names[i] = row.owner .. '/' .. row.name .. ':' .. row.link .. ':' .. row.priority
+		end
+		check(
+			table.concat(names, ' ') == 'link_a/info_pre:prefix:3 link_b/info_around:around:0 /:around:0 link_a/info_post:postfix:1',
+			'the rows are in run order, an old callback is an around with no owner: ' .. table.concat(names, ' ')
+		)
+		check(
+			info.links[1].calls == 1 and info.links[1].skips == 0 and info.links[1].errors == 0 and info.links[1].error == nil,
+			'rows carry calls, skips and errors'
+		)
+		check(info.links[3].calls == nil, 'an old callback has no counters')
+		local list = mr.patch_list('link_a')
+		local by_name = {}
+		for _, entry in ipairs(list) do
+			by_name[entry.name] = entry
+		end
+		check(
+			by_name.info_pre.kind == 'prefix' and by_name.info_post.kind == 'postfix' and by_name.info_pre.state == 'stays',
+			'patch_list names the link kinds'
+		)
+		check(by_name.info_pre.priority == 3 and by_name.info_pre.calls == 1 and mr.eq(by_name.info_pre.at, target), 'and gives counters and the address')
+		check(b:info('info_around').kind == 'around' and b:info('info_around').calls == 1, 'info of one link')
+		a:patch('claim_row', claim_target, '\184\1\0\0\0', '\184\2\0\0\0')
+		local claim_info = mr.patch_info(claim_target)
+		check(
+			claim_info.kind == nil and #claim_info.claims == 1 and claim_info.claims[1].owner == 'link_a' and claim_info.claims[1].name == 'claim_row',
+			'patch_info lists the claims over an address'
+		)
+		check(
+			mr.type(claim_info.claims[1].from) == 'pointer' and mr.eq(mr.add(claim_info.claims[1].from, 5), claim_info.claims[1].to),
+			'with the claimed range'
+		)
+		a:remove('claim_row')
+		clean(a, b)
+
+		a:prefix(single, SINGLE, 'worker', function()
+			mark('P:worker')
+		end)
+		local before_calls = mr.hook_info(single).calls
+		check(mr.tonumber(mr.call(address('call_on_thread'), 'int64(pointer, int64)', single, 5)) == 16, 'a call on another thread runs the original')
+		check(seen() == '' and mr.hook_info(single).calls == before_calls, 'no link ran and the call is not counted')
+		check(mr.patch_info(single).other_thread_calls == 1 and mr.hook_info(single).other_thread_calls == 1, 'it is counted apart')
+		a:remove_all()
+
+		local seen_float = {}
+		a:prefix(float, FLOAT, 'f_set', function(call, x, y)
+			call:set(1, 10.5)
+		end)
+		a:around(float, FLOAT, 'f_around', function(game, x, y)
+			seen_float[1] = x
+			return game(x, y)
+		end)
+		a:postfix(float, FLOAT, 'f_post', function(call, result, x, y)
+			seen_float[2] = result
+			return result * 2
+		end)
+		check(mr.call(float, FLOAT, 1.5, 2.5) == 16, 'float arguments and results through links')
+		check(seen_float[1] == 10.5 and seen_float[2] == 8, 'floats reach the links as numbers')
+		a:remove_all()
+		a:prefix(float, FLOAT, 'f_skip', function(call)
+			call:skip(2.25)
+		end)
+		check(mr.call(float, FLOAT, 1.5, 2.5) == 2.25, 'a float skip result')
+		a:remove_all()
+		local keeper, leaf = address('call_keeping_registers'), address('leaf_add_one')
+		local saved = mr.alloc(152)
+		local before = {}
+		for i = 1, 152 do
+			before[i] = string.char((i * 37 + 11) % 256)
+		end
+		mr.write(saved, 0, table.concat(before))
+		a:postfix(leaf, 'uint64(uint64)', 'leaf_post', function() end)
+		mr.call(keeper, 'void(pointer, pointer)', leaf, saved)
+		check(
+			mr.tostring(mr.read_uint64(saved, 144)) == mr.tostring(mr.add(mr.read_uint64(saved, 96), 1)),
+			'a link on a leaf function gives the original result'
+		)
+		a:remove_all()
+
+		local pattern_function = address('hook_mixed')
+		local function hex_of(at, size)
+			local bytes, parts = mr.read(at, 0, size), {}
+			for i = 1, size do
+				parts[i] = string.format('%02X', bytes:byte(i))
+			end
+			return table.concat(parts, ' ')
+		end
+		local pattern = hex_of(pattern_function, 40)
+		local first, count = mr.find_pattern(pattern)
+		check(count == 1 and mr.eq(first, pattern_function), 'the 40 byte pattern of hook_mixed is unique: ' .. tostring(count))
+		local MIXED = 'double(int64, double, float, int32, int8, double)'
+		local expect = hex_of(pattern_function, 6)
+		check(a:prefix({ pattern = pattern }, MIXED, 'by_pattern', function() end) == true, 'a target table with a pattern')
+		check(mr.eq(a:info('by_pattern').at, pattern_function), 'it hooks the address the pattern found')
+		check(a:prefix({ pattern = pattern, at = 0, expect = expect }, MIXED, 'by_expect', function() end) == true, 'with at and expect')
+		check(a:prefix({ pattern = pattern, expect = '?? ?? ??' }, MIXED, 'by_wild', function() end) == true, 'expect may start with a wildcard')
+		check(mr.call(pattern_function, MIXED, 1, 2, 3, 4, -5, 6) == 123356, 'links on a function with register and stack arguments pass them all')
+		check(a:prefix(pattern_function, MIXED, 'mixed_set', function(call)
+			call:set(6, 10)
+			call:set(3, 4)
+		end) == true and mr.call(pattern_function, MIXED, 1, 2, 3, 4, -5, 6) == 124360, 'set changes a float register argument and a stack argument')
+		ok, why = a:prefix({ pattern = pattern, at = 1, expect = expect }, MIXED, 'wrong_expect', function() end)
+		check(ok == nil and why == 'unexpected bytes' and a:info('wrong_expect') == nil, 'unexpected bytes at the address are refused')
+		ok, why = a:prefix({ pattern = 'C3' }, MIXED, 'many', function() end)
+		check(
+			ok == nil and string.match(tostring(why), '^pattern found %d+ times$') and why ~= 'pattern found 1 times',
+			'a pattern that matches many places is refused: ' .. tostring(why)
+		)
+		ok, why = a:prefix({ pattern = 'DE AD BE EF DE AD BE EF 01 02 03 04 05 06 07' }, MIXED, 'none', function() end)
+		check(ok == nil and why == 'pattern found 0 times', 'a pattern that matches nowhere is refused')
+		ok, why = a:prefix({ pattern = 'zz' }, MIXED, 'bad', function() end)
+		check(ok == nil and contains(why, 'bad pattern'), 'a bad pattern is refused: ' .. tostring(why))
+		ok, why = a:prefix({ pattern = '?? 48' }, MIXED, 'bad', function() end)
+		check(ok == nil and contains(why, 'bad pattern'), 'a pattern that starts with ?? is refused')
+		ok, why = a:prefix({ at = 3 }, MIXED, 'bad', function() end)
+		check(ok == nil and why == 'a target table needs a pattern string', 'a table without a pattern is refused')
+		ok, why = a:prefix({ pattern = pattern, at = 1.5 }, MIXED, 'bad', function() end)
+		check(ok == nil and why == 'at must be a whole number', 'a fractional offset is refused')
+		ok, why = a:prefix({ pattern = pattern, expect = 'xx' }, MIXED, 'bad', function() end)
+		check(ok == nil and contains(why, 'expect must be hex bytes'), 'a bad expect is refused')
+		a:remove_all()
+
+		local prologue = address('prologue_target')
+		local prologue_pattern = hex_of(prologue, 32)
+		local _, prologue_count = mr.find_pattern(prologue_pattern)
+		check(prologue_count == 1, 'the 32 byte pattern of prologue_target is unique: ' .. tostring(prologue_count))
+		check(
+			a:patch('table_patch', { pattern = prologue_pattern, at = 5, expect = '01 00 00 00' }, '\1\0\0\0', '\2\0\0\0') == true
+				and mr.tonumber(mr.call(prologue, 'int32()')) == 2,
+			'an owned patch takes a target table'
+		)
+		ok, why = a:patch('table_patch_bad', { pattern = prologue_pattern, at = 5, expect = '07 00 00 00' }, '\1\0\0\0', '\2\0\0\0')
+		check(ok == nil and why == 'unexpected bytes', 'and refuses unexpected bytes at the address')
+		check(a:remove('table_patch') == true and mr.tonumber(mr.call(prologue, 'int32()')) == 1, 'remove puts the patch back')
+		check(
+			a:relocate('table_reloc', { { { pattern = prologue_pattern, at = 5, expect = '01 00 00 00' }, '\1\0\0\0', '\3\0\0\0' } }) == true,
+			'a relocation takes target tables'
+		)
+		ok, why = a:relocate('table_reloc_bad', { { { pattern = 'C3' }, '\1\0\0\0', '\3\0\0\0' } })
+		check(ok == nil and contains(why, 'site 1: pattern found'), 'a bad target in a relocation names the site: ' .. tostring(why))
+		check(a:site('table_site', { pattern = hex_of(address('site_single_here'), 24) }, function() end) ~= nil, 'a site takes a target table')
+
+		mr.set_log(nil)
+		a:postfix(target, TARGET, 'unlogged', function()
+			error('quiet')
+		end)
+		call_target(1, 2)
+		local before_lines = #logged
+		mr.patch_info(target)
+		check(#logged == before_lines, 'without a log sink nothing is written')
+		local sink_lines = {}
+		mr.set_log(function(message)
+			sink_lines[#sink_lines + 1] = message
+		end)
+		mr.patch_info(target)
+		check(#sink_lines == 1 and contains(sink_lines[1], '[memreader Plus] link_a/unlogged (postfix): '), 'a sink set later gets the waiting line')
+		check(not pcall(mr.set_log, 5), 'set_log refuses a non-function')
+		mr.set_log(ModLog)
+		a:remove_all()
+		a:postfix(target, TARGET, 'inside', function()
+			mr.patch_info(target)
+			mark('depth ' .. mr.hook_depth())
+		end)
+		a:postfix(target, TARGET, 'raises_inside', function()
+			error('late line')
+		end, 10)
+		call_target(1, 2)
+		check(lines_with('late line') == 0, 'nothing is flushed from inside a callback')
+		mr.patch_info(target)
+		check(lines_with('late line') == 1, 'it is flushed at the next call from script code')
+		seen()
+		clean(a)
+
+		local shorts = mr.patcher('review_short')
+		local mixed_function = address('hook_mixed')
+		local FULL = 'double(int64, double, float, int32, int8, double)'
+		local seen_first = nil
+		check(mr.call(mixed_function, FULL, 7, 2.5, 1.5, 4, 5, 0.25) == 726950.25, 'hook_mixed without links')
+		check(shorts:postfix(mixed_function, 'double(int64)', 'short_post', function(call, result, first)
+			seen_first = mr.tonumber(first)
+		end) == true, 'a postfix with a one argument signature on a six argument function')
+		check(
+			mr.call(mixed_function, FULL, 7, 2.5, 1.5, 4, 5, 0.25) == 726950.25 and seen_first == 7,
+			'it leaves the result and every argument of the game function intact'
+		)
+		check(shorts:prefix(mixed_function, 'double(int64)', 'short_pre', function(call, first)
+			call:set(1, 8)
+		end) == true, 'a prefix with a short signature')
+		check(mr.call(mixed_function, FULL, 7, 2.5, 1.5, 4, 5, 0.25) == 826950.25, 'set changes only the named argument')
+		check(shorts:around(mixed_function, 'double(int64)', 'short_around', function(game, first)
+			return game(mr.tonumber(first) + 1)
+		end) == true, 'an around with a short signature')
+		check(mr.call(mixed_function, FULL, 7, 2.5, 1.5, 4, 5, 0.25) == 926950.25, 'game changes only the named argument as well')
+		shorts:remove_all()
+		check(shorts:around(mixed_function, FULL, 'forward', function(game, a, b, c, d, e, f)
+			return game()
+		end) == true and mr.call(mixed_function, FULL, 7, 2.5, 1.5, 4, 5, 0.25) == 726950.25, 'game() forwards the entry arguments unchanged')
+		shorts:remove_all()
+		shorts:prefix(target, TARGET, 'changer', function(call)
+			call:set(1, 9)
+		end, 10)
+		shorts:around(target, TARGET, 'outer_around', function(game, x, y)
+			return game(5, 6)
+		end, 5)
+		shorts:around(target, TARGET, 'inner_around', function(game, x, y)
+			mark(mr.tonumber(x) .. mr.tonumber(y))
+			return game()
+		end, 0)
+		check(call_target(1, 2) == 56 and seen() == '56', 'game() forwards what the outer around passed down')
+		shorts:remove_all()
+
+		local null_function = address('read_null')
+		check(shorts:postfix(null_function, 'int32()', 'null_watch', function() end) == true, 'a link on a function that faults')
+		local ok, why = pcall(mr.call, null_function, 'int32()')
+		check(
+			not ok and contains(why, 'the called function crashed'),
+			'a guarded call of a linked function still turns a fault into an error: ' .. tostring(why)
+		)
+		check(call_target(1, 2) == 12, 'and the game goes on')
+		mr.hook(null_function, 'int32()', function()
+			return mr.hook_next(null_function)
+		end)
+		check(mr.tonumber(mr.call(null_function, 'int32()')) == 0, 'an old callback calling hook_next below links survives a fault in the original')
+		check(
+			contains(mr.hook_info(null_function).error, 'the called function crashed') and mr.hook_info(null_function).callbacks == 0,
+			'it gets the error and detaches as before'
+		)
+		check(shorts:around(null_function, 'int32()', 'null_around', function(game)
+			return game()
+		end) == true, 'an around that calls game on a function that faults')
+		ok, why = pcall(mr.call, null_function, 'int32()')
+		check(
+			not ok and contains(why, 'the called function crashed') and contains(why, 'access violation at 0000000000000010'),
+			'a probing mr.call raises although an around covers the function: ' .. tostring(why)
+		)
+		check(call_target(1, 2) == 12 and not pcall(mr.call, null_function, 'int32()'), 'and the dispatcher is intact afterwards')
+		check(contains(shorts:info('null_around').error, 'the called function crashed'), 'counted as the error of the link')
+		shorts:remove_all()
+		mr.unhook(null_function)
+
+		local call_dir = address('call_directly')
+		local DIRECT = 'int64(pointer, int64)'
+		local kept, inner_error = nil, nil
+		shorts:prefix(call_dir, DIRECT, 'keeper', function(call)
+			kept = call
+		end)
+		shorts:prefix(single, SINGLE, 'inner_watch', function()
+			inner_error = error_of(function()
+				return kept.skipped
+			end)
+		end)
+		mr.call(call_dir, DIRECT, single, 5)
+		check(contains(inner_error, 'call object used after its call returned'), 'a kept call object raises in a link of another hook during the original')
+		check(contains(error_of(kept.set, kept, 1, 1), 'call object used after its call returned'), 'and outside any call')
+		local usable = 'unset'
+		shorts:postfix(call_dir, DIRECT, 'same_call', function()
+			usable = error_of(function()
+				return kept.depth
+			end)
+		end)
+		mr.call(call_dir, DIRECT, single, 5)
+		check(usable == nil, 'inside a link of the same call it still works')
+		shorts:remove_all()
+
+		a:remove_all()
+		around(a, 'first_around', 0)
+		mr.hook(target, TARGET, function(x, y)
+			mark('>L1')
+			local result = mr.hook_next(target, x, y)
+			mark('<L1')
+			return result
+		end)
+		around(a, 'late_around', 0)
+		call_target(1, 2)
+		check(seen() == '>first_around >L1 >late_around <late_around <L1 <first_around', 'an old callback sits among the priority 0 arounds where it was added')
+		clean(a)
+
+		local function old_callback(name)
+			mr.hook(target, TARGET, function(x, y)
+				mark('>' .. name)
+				local result = mr.hook_next(target, x, y)
+				mark('<' .. name)
+				return result
+			end)
+		end
+		old_callback('O1')
+		old_callback('O2')
+		call_target(1, 2)
+		check(seen() == '>O2 >O1 <O1 <O2', 'two old callbacks run newest first')
+		around(a, 'added_later', 0)
+		call_target(1, 2)
+		check(seen() == '>O2 >O1 >added_later <added_later <O1 <O2', 'a link added after them leaves their order unchanged')
+		clean(a)
+		around(a, 'before_group', 0)
+		old_callback('O1')
+		around(a, 'between_group', 0)
+		old_callback('O2')
+		around(a, 'after_group', 0)
+		call_target(1, 2)
+		check(
+			seen() == '>before_group >O2 >O1 >between_group >after_group <after_group <between_group <O1 <O2 <before_group',
+			'the group sits at the registration place of its oldest member, links keep theirs'
+		)
+		clean(a)
+
+		local sig = mr.patcher('review_sig')
+		local same_function = function() end
+		check(sig:prefix(single, SINGLE, 'swap', same_function) == true, 'a link with its first signature')
+		check(sig:prefix(single, 'int32(int32)', 'swap', same_function) == true, 'the same name, function and priority with a new signature is applied')
+		check(sig:prefix(single, 'int32(int32)', 'next', function() end) == true, 'the new signature is the one in force')
+		check(select(2, sig:prefix(single, SINGLE, 'third', function() end)) == 'signature differs from review_sig/swap', 'and the old one is refused')
+		sig:remove_all()
+
+		local doomed_tag = nil
+		a:prefix(target, TARGET, 'self_skip', function(call)
+			a:remove('self_skip')
+			call:skip(5)
+		end, 10)
+		a:postfix(target, TARGET, 'doomed_watch', function(call)
+			doomed_tag = call.skipped
+		end)
+		check(
+			call_target(1, 2) == 5 and doomed_tag == 'link_a/self_skip',
+			'a link removed in its own call is still named when it skips: ' .. tostring(doomed_tag)
+		)
+		clean(a)
+
+		a:postfix(target, TARGET, 'flush_one', function()
+			error('flush me one')
+		end)
+		call_target(1, 2)
+		check(lines_with('flush me one') == 0, 'a link error waits while no patcher method is called')
+		mr.set_crash_context('flush_probe', 'x')
+		check(lines_with('flush me one') == 1, 'set_crash_context flushes the link log')
+		a:postfix(target, TARGET, 'flush_two', function()
+			error('flush me two')
+		end)
+		call_target(1, 2)
+		mr.flush_log()
+		check(lines_with('flush me two') == 1, 'flush_log flushes it as well')
+		clean(a)
+
+		local worker = coroutine.create(function()
+			a:postfix(target, TARGET, 'suspended', function()
+				mark('F:suspended')
+			end)
+			coroutine.yield()
+		end)
+		coroutine.resume(worker)
+		check(call_target(1, 2) == 12 and seen() == '', 'a link of a suspended coroutine does not run')
+		coroutine.resume(worker)
+		check(call_target(1, 2) == 12 and seen() == 'F:suspended', 'it runs once the coroutine can run')
+		clean(a)
+
+		local plain_calls = 20000
+		local ENFORCE = os.getenv('PLUS_PERF') == '1'
+		local ROUNDS = ENFORCE and 15 or 5
+		local function block()
+			local start = mr.ticks()
+			for _ = 1, plain_calls do
+				mr.call(target, TARGET, 1, 2)
+			end
+			return mr.elapsed_us(start) * 1000 / plain_calls
+		end
+		local function least(values)
+			return math.min(unpack(values))
+		end
+		local function budget(met, what)
+			if met or ENFORCE then
+				check(met, what)
+			else
+				print('WARN ' .. what .. ' (a budget, enforced by tests\\run.ps1 -Perf)')
+			end
+		end
+		local function measure(install, remove)
+			install()
+			local value = block()
+			remove()
+			return value
+		end
+		local function link(install)
+			return function()
+				install(mr.patcher('cost_mod'))
+			end
+		end
+		local function drop_links()
+			mr.patcher('cost_mod'):remove_all()
+		end
+		local function drop_hook()
+			mr.unhook(target)
+		end
+		local PLAIN = {
+			through = function()
+				mr.hook(target, TARGET, function(x, y)
+					return mr.hook_next(target, x, y)
+				end)
+			end,
+			constant = function()
+				mr.hook(target, TARGET, function(x, y)
+					return x
+				end)
+			end,
+		}
+		local CASES = {
+			{
+				'bare_post',
+				'through',
+				link(function(p)
+					p:postfix(target, TARGET, 'bare', function() end)
+				end),
+			},
+			{
+				'bare_pre',
+				'through',
+				link(function(p)
+					p:prefix(target, TARGET, 'bare', function() end)
+				end),
+			},
+			{
+				'bare_through',
+				'through',
+				link(function(p)
+					p:around(target, TARGET, 'bare', function(game, x, y)
+						return game(x, y)
+					end)
+				end),
+			},
+			{
+				'bare_constant',
+				'constant',
+				link(function(p)
+					p:around(target, TARGET, 'bare', function(game, x, y)
+						return x
+					end)
+				end),
+			},
+			{
+				'field_post',
+				'through',
+				link(function(p)
+					p:postfix(target, TARGET, 'fields', function(call)
+						local site, skipped, depth = call.site, call.skipped, call.depth
+					end)
+				end),
+			},
+			{
+				'field_pre',
+				'through',
+				link(function(p)
+					p:prefix(target, TARGET, 'fields', function(call)
+						local site, skipped, depth = call.site, call.skipped, call.depth
+					end)
+				end),
+			},
+			{
+				'two_links',
+				'through',
+				link(function(p)
+					p:prefix(target, TARGET, 'pre', function() end)
+					p:postfix(target, TARGET, 'post', function() end)
+				end),
+			},
+		}
+		local absolute = { unhooked = {}, through = {}, constant = {} }
+		for _, case in ipairs(CASES) do
+			absolute[case[1]] = {}
+		end
+		for _ = 1, ROUNDS do
+			table.insert(absolute.unhooked, block())
+			table.insert(absolute.through, measure(PLAIN.through, drop_hook))
+			table.insert(absolute.constant, measure(PLAIN.constant, drop_hook))
+			for _, case in ipairs(CASES) do
+				table.insert(absolute[case[1]], measure(case[3], drop_links))
+			end
+		end
+		local function ns(name)
+			return least(absolute[name])
+		end
+		local BASE = {}
+		for _, case in ipairs(CASES) do
+			BASE[case[1]] = case[2]
+		end
+		local function cost(name)
+			local plain = ns(BASE[name]) - ns('unhooked')
+			return plain > 0 and (ns(name) - ns('unhooked')) / plain or math.huge
+		end
+		local function total(name)
+			return ns(name) / ns(BASE[name])
+		end
+		print(
+			string.format(
+				'  timing (ns per mr.call, host, least of %d rounds): unhooked %.0f, plain hook with hook_next %.0f, plain hook returning a value %.0f',
+				ROUNDS,
+				ns('unhooked'),
+				ns('through'),
+				ns('constant')
+			)
+		)
+		print(
+			string.format(
+				'  timing: bare postfix %.0f, bare prefix %.0f, around with game %.0f, around returning a value %.0f, postfix reading 3 fields %.0f, prefix reading 3 fields %.0f, prefix and postfix %.0f',
+				ns('bare_post'),
+				ns('bare_pre'),
+				ns('bare_through'),
+				ns('bare_constant'),
+				ns('field_post'),
+				ns('field_pre'),
+				ns('two_links')
+			)
+		)
+		print(
+			string.format(
+				'  cost above unhooked, link / plain hook (least of the rounds): postfix %.2f, prefix %.2f, around with game %.2f, around returning a value %.2f, postfix with fields %.2f, prefix with fields %.2f',
+				cost('bare_post'),
+				cost('bare_pre'),
+				cost('bare_through'),
+				cost('bare_constant'),
+				cost('field_post'),
+				cost('field_pre')
+			)
+		)
+		print(
+			string.format(
+				'  whole call, link / plain hook (least of the rounds): postfix %.2f, prefix %.2f, around with game %.2f, around returning a value %.2f, postfix with fields %.2f, prefix with fields %.2f',
+				total('bare_post'),
+				total('bare_pre'),
+				total('bare_through'),
+				total('bare_constant'),
+				total('field_post'),
+				total('field_pre')
+			)
+		)
+		budget(total('bare_post') <= 1.2 and total('bare_pre') <= 1.2 and total('bare_through') <= 1.2, 'a bare link costs at most 1.2 times a plain hook')
+		budget(total('field_post') <= 1.2 and total('field_pre') <= 1.2, 'a link reading call fields costs at most 1.2 times a plain hook')
+		budget(total('bare_constant') <= 1.2, 'an around that returns a value costs at most 1.2 times a plain hook that does')
+		for _, case in ipairs(CASES) do
+			if cost(case[1]) > 1.2 then
+				print(('  warning: %s costs %.2f times what a plain hook costs above an unhooked call (budget 1.2)'):format(case[1], cost(case[1])))
+			end
+			budget(cost(case[1]) <= 1.5, case[1] .. ' costs at most 1.5 times what a plain hook costs above an unhooked call')
+		end
+
+		a:prefix(target, TARGET, 'keep_pre', function() end, 4)
+		a:postfix(target, TARGET, 'keep_post', function()
+			error('first mode error')
+		end)
+		call_target(1, 2)
+		NEXT_PASS = failures == 0
+	else
+		local a = mr.patcher('link_a')
+		check(
+			mr.hook_info(target) ~= nil and not mr.hook_info(target).attached and mr.hook_info(target).callbacks == 0,
+			'a new state starts with every link detached'
+		)
+		check(a:info('keep_pre').state == 'detached' and a:info('keep_post').state == 'detached', 'the registry lists them as detached')
+		check(lines_with('first mode error') == 0, 'a line that was waiting when the mode ended is not written in the next one')
+		check(call_target(1, 2) == 12, 'the original runs')
+		check(mr.patch_info(target).links[1] == nil, 'patch_info lists no links')
+		check(a:prefix(target, TARGET, 'keep_pre', function()
+			mark('P:keep')
+		end, 4) == true and a:info('keep_pre').state == 'stays', 'the same name attaches again in the new mode')
+		check(a:postfix(target, TARGET, 'keep_post', function()
+			error('second mode error')
+		end) == true, 'the postfix attaches again')
+		check(a:info('keep_pre').calls == 0 and a:info('keep_post').calls == 0, 'counters start again')
+		check(call_target(1, 2) == 12 and call_target(1, 2) == 12 and seen() == 'P:keep P:keep', 'the links run in the new mode')
+		check(a:info('keep_post').errors == 2, 'and count their errors from zero: ' .. a:info('keep_post').errors)
+		mr.patch_info(target)
+		check(lines_with('link_a/keep_post (postfix): ') == 1 and lines_with('second mode error') == 1, 'the first error is logged once in every mode')
+		check(#mr.patch_list('link_a') > 0, 'the registry survived')
+	end
 elseif SCENARIO == 'far_hook' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus
@@ -1032,6 +2162,33 @@ elseif SCENARIO == 'far_hook' then
 	check(mr.hop_slots() == before, 'and no padding slot is used')
 	check(mr.read(distant, 0, 1) == '\184' and mr.hook_info(distant) == nil, 'the distant function is left alone')
 	if mr.read(distant, 0, 1) == '\184' then check(mr.tonumber(mr.call(distant, 'int32()')) == 42, 'the distant function still runs') end
+
+	local victim = mr.pointer(test_function('hook_target'))
+	local victim_head = mr.read(victim, 0, 16)
+	local slots_before = mr.hop_slots()
+	local TWO = 'int32(int32, int32)'
+	test_deny_next_thread(true, mr.hop_slots)
+	test_deny_snapshot(true, mr.hop_slots)
+	test_force_far_hooks(true, mr.hop_slots)
+	ok, message = pcall(mr.hook, victim, TWO, function()
+		return 1
+	end)
+	test_force_far_hooks(false, mr.hop_slots)
+	test_deny_snapshot(false, mr.hop_slots)
+	test_deny_next_thread(false, mr.hop_slots)
+	check(
+		not ok and string.find(tostring(message), 'the other threads could not be stopped', 1, true) ~= nil,
+		'a far hook is refused when the other threads cannot be stopped: ' .. tostring(message)
+	)
+	check(mr.read(victim, 0, 16) == victim_head and mr.hook_info(victim) == nil, 'and the function keeps its first bytes')
+	check(mr.hop_slots() == slots_before, 'and no padding slot is used up')
+	check(mr.tonumber(mr.call(victim, TWO, 3, 4)) == 34, 'and still runs')
+	test_force_far_hooks(true, mr.hop_slots)
+	mr.hook(victim, TWO, function()
+		return 1
+	end)
+	test_force_far_hooks(false, mr.hop_slots)
+	check(mr.tonumber(mr.call(victim, TWO, 3, 4)) == 1 and mr.read(victim, 0, 1) == '\233', 'once the threads can be stopped the same hook goes in')
 elseif SCENARIO == 'cave' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus
@@ -1133,6 +2290,22 @@ elseif SCENARIO == 'cave' then
 		contains(error_of(mr.code_cave, fixture('site_leaf_inbound_here'), code), 'a jump in the function lands inside'),
 		'a cave with a jump into its bytes in a leaf function is refused'
 	)
+	local jump = mr.read(far, 0, 5)
+	local top = jump:byte(5)
+	if top >= 128 then top = top - 256 end
+	local hop = mr.add(far, 5 + jump:byte(2) + jump:byte(3) * 256 + jump:byte(4) * 65536 + top * 16777216)
+	check(mr.eq(hop, fixture('hop_leaf_pad')), 'the far cave took the first padding run, the one after the hop fixture')
+	check(mr.read_original(hop, 0, 14) == string.rep('\204', 14), 'the original bytes of a used hop slot are its padding')
+	local relay_bytes = mr.read(hop, 6, 2)
+	mr.write(hop, 6, mr.uint8(0xEB))
+	mr.write(hop, 7, mr.uint8(0xF3))
+	local hits = cave_count()
+	local after_junk = error_of(mr.code_cave, fixture('hop_leaf_here'), code)
+	mr.write(hop, 6, mr.uint8(relay_bytes:byte(1)))
+	mr.write(hop, 7, mr.uint8(relay_bytes:byte(2)))
+	check(after_junk == nil, 'a hop slot behind a leaf function does not refuse a cave whatever address it holds: ' .. tostring(after_junk))
+	check(mr.tonumber(mr.call(fixture('hop_leaf_here'), 'int32(int32)', 3)) == 4 and cave_count() == hits + 1, 'that cave runs')
+	check(mr.tonumber(mr.call(far, TARGET, 3, 4)) == 34, 'and the far cave still works with its address back')
 elseif SCENARIO == 'cave_session' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus
@@ -2094,6 +3267,10 @@ elseif
 	or SCENARIO == 'fault_report_off'
 	or SCENARIO == 'fault_report_in_callback'
 	or SCENARIO == 'fault_report_in_site'
+	or SCENARIO == 'fault_report_in_cave'
+	or SCENARIO == 'fault_report_in_link'
+	or SCENARIO == 'fault_report_in_original'
+	or SCENARIO == 'fault_report_in_around'
 	or SCENARIO == 'fault_report_thread'
 	or SCENARIO == 'fault_report_native_thread'
 	or SCENARIO == 'fault_report_overflow'
@@ -2155,10 +3332,42 @@ then
 			end)
 			mr.call(mr.pointer(test_function('site_crash')), 'void()')
 		end
+		local function crash_in_cave()
+			local target = test_function('cave_target')
+			mr.patcher('crash_owner'):cave('crash_cave', mr.pointer(target), '\72\49\192\139\64\16')
+			test_run(target, 1, 2)
+		end
+		local function crash_in_link()
+			local single = mr.pointer(test_function('hook_single'))
+			mr.patcher('crash_owner'):prefix(single, 'int64(int64)', 'crash_link', function()
+				test_crash()
+			end)
+			mr.call(mr.pointer(test_function('call_directly')), 'int64(pointer, int64)', single, 1)
+		end
+		local function crash_in_original()
+			local target = test_function('read_null')
+			mr.patcher('crash_owner'):postfix(mr.pointer(target), 'int32()', 'crash_post', function() end)
+			test_run(target, 0, 0)
+		end
+		local function crash_in_around()
+			local target = test_function('read_null')
+			mr.patcher('crash_owner'):around(mr.pointer(target), 'int32()', 'crash_around', function(game)
+				return game()
+			end)
+			test_run(target, 0, 0)
+		end
 		local function report_me()
 			local marker = 'event-under-test'
 			if SCENARIO == 'fault_report_in_callback' then
 				crash_in_callback()
+			elseif SCENARIO == 'fault_report_in_cave' then
+				crash_in_cave()
+			elseif SCENARIO == 'fault_report_in_link' then
+				crash_in_link()
+			elseif SCENARIO == 'fault_report_in_original' then
+				crash_in_original()
+			elseif SCENARIO == 'fault_report_in_around' then
+				crash_in_around()
 			elseif SCENARIO == 'fault_report_in_site' then
 				crash_in_site()
 			elseif SCENARIO == 'fault_report_no_log' then
@@ -2232,6 +3441,1531 @@ elseif SCENARIO:sub(1, 14) == 'runtime_report' then
 			check(exists(name), 'the named file is in the report folder')
 		end
 	end
+elseif SCENARIO == 'owner_report' then
+	io.stdout:setvbuf('no')
+	load_other_program_dll()
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local filler = address('filler_code')
+	local ONES, ZEROS = '\1\0\0\0', '\0\0\0\0'
+	local function relocation_sites()
+		return { { mr.add(filler, 0x200), ZEROS, ONES }, { mr.add(filler, 0x208), ZEROS, ONES } }
+	end
+	local function install_all(p, code, with_site)
+		local cave = p:cave('keep_health', address('cave_target'), code)
+		local results = {
+			{ 'cave', mr.type(cave) == 'pointer' },
+			{ 'patch', p:patch('load_copy', address('patch_target'), '\184\1\0\0\0', '\184\2\0\0\0') == true },
+			{ 'set', p:set('army_cap', mr.add(filler, 0x100), 4, 5, 0, 100) == true },
+			{ 'frame', p:frame('planner', address('frame_target'), 0x360) == true },
+			{ 'relocate', p:relocate('fields', relocation_sites()) == true },
+		}
+		if with_site then results[#results + 1] = { 'site', p:site('on_target', address('site_target_here'), function() end) == true } end
+		for _, result in ipairs(results) do
+			check(result[2], 'owned ' .. result[1] .. ' is installed or already ours')
+		end
+		return cave
+	end
+	local code = '\80\72\184' .. cave_count_address() .. '\255\0\88'
+	if PASS == 1 then
+		check(type(mr.patcher) == 'function' and type(mr.patch_list) == 'function', 'patcher and patch_list are part of the API')
+		local p = mr.patcher('alpha_mod')
+		check(type(p) == 'userdata' and mr.patcher('alpha_mod') == p, 'the same owner gets the same handle in a mode')
+		check(mr.patcher('beta_mod') ~= p, 'another owner gets another handle')
+		check(#mr.patch_list() == 0, 'patch_list starts empty')
+		local cave = install_all(p, code, true)
+		check(mr.tonumber(mr.call(address('cave_target'), 'int32(int32, int32)', 3, 4)) == 34 and cave_count() == 1, 'the owned cave runs')
+		check(mr.patcher('beta_mod'):patch('other_patch', mr.add(filler, 0x300), ZEROS, ONES) == true, 'a second owner patches too')
+		loadstring('local mr, target, code = ...; mr.code_cave(target, code)', 'raw_cave_caller')(mr, address('hook_target'), code)
+		local rows = mr.patch_list('alpha_mod')
+		local by_name = {}
+		for _, row in ipairs(rows) do
+			by_name[row.name] = row
+		end
+		check(#rows == 6 and #mr.patch_list('beta_mod') == 1 and #mr.patch_list() == 7, 'patch_list lists every owned item, by owner too')
+		check(#mr.patch_list('nobody') == 0, 'an owner without items lists nothing')
+		check(by_name.keep_health.kind == 'cave' and by_name.keep_health.state == 'stays', 'a cave stays for the session')
+		check(by_name.load_copy.kind == 'patch' and by_name.load_copy.state == 'ours', 'a patch is ours while its bytes are there')
+		check(by_name.army_cap.kind == 'value' and by_name.fields.kind == 'relocate' and by_name.planner.kind == 'frame', 'kinds are named')
+		check(by_name.on_target.kind == 'site' and by_name.on_target.state == 'stays', 'an attached site stays')
+		check(mr.eq(by_name.on_target.at, address('site_target_here')), 'a site row carries its address')
+		check(mr.eq(p:info('load_copy').at, address('patch_target')) and p:info('load_copy').owner == 'alpha_mod', 'info gives the row of one name')
+		check(p:info('nothing') == nil and select(2, p:info('nothing')) == 'unknown name', 'info of an unknown name is nil and why')
+		local flood = mr.patcher('flood_mod')
+		local floods = 0
+		for i = 0, 40 do
+			if flood:patch('flood_' .. i, mr.add(filler, 0x1000 + i * 8), ZEROS, ONES) == true then floods = floods + 1 end
+		end
+		loadstring('local mr, address = ...; mr.patch(address, "\\0", "\\1")', 'raw_hidden_patch')(mr, mr.add(filler, 0x2000))
+		for i = 41, 46 do
+			if flood:patch('flood_' .. i, mr.add(filler, 0x1000 + i * 8), ZEROS, ONES) == true then floods = floods + 1 end
+		end
+		check(floods == 47, 'one owner patches 47 named places from one line')
+		NEXT_PASS = failures == 0
+	else
+		local p = mr.patcher('alpha_mod')
+		check(#mr.patch_list('alpha_mod') == 6, 'the registry survives the mode switch')
+		check(p:info('on_target').state == 'detached', 'a site without its callback after the mode switch is detached')
+		local cave = install_all(p, code, false)
+		check(mr.eq(cave, mr.hook_info(address('cave_target')).cave), 'repeating every name is a no-op and the cave pointer is the same')
+		check(#mr.patch_list('alpha_mod') == 6, 'and adds nothing')
+		fill_crash_context(mr)
+		set_report_settings(mr)
+		local first_name = mr.write_runtime_report()
+		check(type(first_name) == 'string' and exists(first_name), 'a runtime report is written while the site has no callback: ' .. tostring(first_name))
+		local first = read_all(first_name)
+		check(has(first, '), 1 frame, 2 relocations, 1 link not attached\n'), 'the owner block counts the detached site as not attached')
+		check(not has(first, '1 link, '), 'and not as a link')
+		check(not has(first, 'by alpha_mod/on_target'), 'its hook line is not named after it')
+		test_sleep(1100)
+		local name
+		check(p:site('on_target', address('site_target_here'), function()
+			name = mr.write_runtime_report()
+		end) == true, 'the site attaches again')
+		check(p:info('on_target').state == 'stays', 'and is attached')
+		check(
+			mr.patcher('gamma_mod'):site('shared', address('site_target_here'), function() end) == true,
+			'a second owner shares the site, its callback runs first'
+		)
+		mr.call(address('site_target'), 'int32(int32, int32)', 3, 4)
+		check(type(name) == 'string' and exists(name), 'a runtime report is written from inside the site callback: ' .. tostring(name))
+		local text = read_all(name)
+		local owner_at, hooks_at = text:find('memreader Plus changes by owner:', 1, true), text:find('memreader Plus hooks: ', 1, true)
+		check(owner_at and hooks_at and owner_at < hooks_at, 'the owner block comes before the hook list')
+		for _, part in ipairs({
+			'  alpha_mod: 1 link, 1 value, 1 cave (keep_health Warhammer3.exe+0x',
+			'), 1 patch (load_copy Warhammer3.exe+0x',
+			'), 1 frame, 2 relocations\n',
+			'  beta_mod: 1 patch (other_patch Warhammer3.exe+0x',
+			'  gamma_mod: 1 link\n',
+			'  ?: 1 code cave at Warhammer3.exe+0x',
+			' from [string "raw_cave_caller"]:1\n',
+			'memreader Plus link running: alpha_mod/on_target (site) on Warhammer3.exe+0x',
+			', code cave, by alpha_mod/keep_health\n',
+			', code cave, from [string "raw_cave_caller"]:1\n',
+			', site hook, RUNNING (on the stack)',
+			', by alpha_mod/on_target, gamma_mod/shared\n',
+			', by alpha_mod/load_copy\n',
+			', by alpha_mod/army_cap\n',
+			', by alpha_mod/planner\n',
+			'  relocate_field x2 spread between ',
+			', by alpha_mod/fields\n',
+			', by beta_mod/other_patch\n',
+			'[string "raw_hidden_patch"]:1',
+			'more owned patches not listed',
+		}) do
+			check(has(text, part), 'the report has: ' .. part:gsub('\n', '\\n'))
+		end
+		check(
+			not has(text, 'link running: gamma_mod') and count_lines(text, 'memreader Plus link running') == 1,
+			'link running names only the callback on the stack'
+		)
+		check(not has(text, 'alpha_mod: 1 link, 1 value, 1 cave (keep_health Warhammer3.exe+0x0'), 'the cave address is a real offset')
+	end
+elseif SCENARIO == 'change_rows' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local filler = mr.pointer(test_function('filler_code'))
+	local EXE = 'Warhammer3%.exe%+0x(%x+)'
+	local function relocate(name, offsets)
+		local sites = {}
+		for i, offset in ipairs(offsets) do
+			sites[i] = { mr.add(filler, offset), '\0\0\0\0', '\1\0\0\0' }
+		end
+		assert(loadstring('local mr, sites = ...; assert(mr.relocate_field(sites))', name))(mr, sites)
+	end
+	local function patch(name, offsets)
+		for _, offset in ipairs(offsets) do
+			patch_from_chunk(name, mr, mr.add(filler, offset))
+		end
+	end
+	relocate('spread_sites', { 0x400, 0x408, 0x410 })
+	relocate('block_sites', { 0x500, 0x504, 0x508 })
+	relocate('descending_sites', { 0x604, 0x600 })
+	relocate('single_site', { 0x700 })
+	patch('spread_patches', { 0x800, 0x900 })
+	patch('block_patches', { 0xA00, 0xA01 })
+	local text = read_all(assert(mr.write_runtime_report()))
+	local function row(name)
+		for line in text:gmatch('[^\r\n]+') do
+			if has(line, '[string "' .. name .. '"]:1') then return line end
+		end
+		return ''
+	end
+	local function shape(name, pattern, distance, spread)
+		local line = row(name)
+		local low, high = line:match(pattern)
+		local gap = low and high and tonumber(high, 16) - tonumber(low, 16)
+		check(gap == distance, name .. ' row: ' .. line)
+		check(has(line, 'not one block') == spread and has(line, 'spread between') == spread, name .. ' row spread flag is ' .. tostring(spread))
+	end
+	local ending = ', %d bytes, from '
+	shape('spread_sites', '^  relocate_field x3 spread between ' .. EXE .. ' and ' .. EXE .. ' %(not one block%)' .. ending:format(4), 0x10, true)
+	shape('block_sites', '^  relocate_field x3 at ' .. EXE .. ' to ' .. EXE .. ending:format(4), 8, false)
+	shape('descending_sites', '^  relocate_field x2 at ' .. EXE .. ' to ' .. EXE .. ending:format(4), 4, false)
+	shape('spread_patches', '^  patch x2 spread between ' .. EXE .. ' and ' .. EXE .. ' %(not one block%)' .. ending:format(1), 0x100, true)
+	shape('block_patches', '^  patch x2 at ' .. EXE .. ' to ' .. EXE .. ending:format(1), 1, false)
+	local single = row('single_site')
+	check(single:match('^  relocate_field at ' .. EXE .. ', 4 bytes, from ') ~= nil, 'a single site keeps the plain form: ' .. single)
+	check(not has(single, 'spread'), 'and says nothing about a spread')
+elseif SCENARIO == 'claims' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local function contains(text, part)
+		return type(text) == 'string' and string.find(text, part, 1, true) ~= nil
+	end
+	local filler = address('filler_code')
+	local function at(offset)
+		return mr.add(filler, offset)
+	end
+	local Z4, ONE4, TWO4, NINE4 = '\0\0\0\0', '\1\0\0\0', '\2\0\0\0', '\9\9\9\9'
+	local function bytes_at(offset, size)
+		return mr.read(at(offset), 0, size)
+	end
+	local a, b = mr.patcher('claim_a'), mr.patcher('claim_b')
+	check(select(2, mr.patcher('bad name')) == 'owner must be 1 to 63 letters, digits or underscores', 'an owner with a space is refused')
+	check(mr.patcher('') == nil and mr.patcher(string.rep('x', 64)) == nil, 'an empty or 64 byte owner is refused')
+	check(mr.patcher(string.rep('y', 63)) ~= nil, 'a 63 byte owner is accepted')
+	check(not pcall(mr.patcher) and not pcall(mr.patcher, {}), 'a missing or wrong type owner raises')
+	check(not pcall(a.patch, 'x', filler, Z4, ONE4), 'a method called without the handle raises')
+	check(select(2, a:patch('bad name', at(0), Z4, ONE4)) == 'name must be 1 to 47 letters, digits or underscores', 'a name with a space is refused')
+	check(a:patch('first', at(0), Z4, ONE4) == true and bytes_at(0, 4) == ONE4, 'claim_a patches 4 bytes')
+	check(#mr.patch_list('claim_a') == 1, 'and owns one item')
+	local ok, why, found = b:patch('overlap', at(2), Z4, TWO4)
+	check(ok == nil and why == 'held by claim_a/first', 'claim_b is refused over claim_a bytes: ' .. tostring(why))
+	check(bytes_at(2, 4) == '\0\0\0\0' and #mr.patch_list('claim_b') == 0, 'the refused patch wrote and registered nothing')
+	ok, why = b:set('over_field', at(1), 1, 5, 0, 10)
+	check(ok == nil and why == 'held by claim_a/first', 'claim_b set is refused over claim_a bytes')
+	ok, why = b:relocate('over_sites', { { at(100), Z4, ONE4 }, { at(3), '\0', '\3' } })
+	check(ok == nil and why == 'site 2: held by claim_a/first', 'a relocation with one held site is refused: ' .. tostring(why))
+	check(bytes_at(100, 4) == Z4 and #mr.patch_list('claim_b') == 0, 'and writes none of its sites')
+	ok, why, found = b:patch('wrong_bytes', at(200), ONE4, TWO4)
+	check(ok == nil and why == 'unexpected bytes' and found == Z4, 'wrong expected bytes give nil, why and the bytes found')
+	check(a:patch('first', at(0), Z4, ONE4) == true and #mr.patch_list('claim_a') == 1, 'the same owner and name again is a no-op')
+	ok, why = a:patch('again', at(1), '\0\0\0\0', TWO4)
+	check(ok == nil and why == 'held by claim_a/first', 'the same owner cannot overlap its own other name')
+	ok, why = a:patch('first', at(0), Z4, TWO4)
+	check(ok == nil and why == 'the name is already used for a different change', 'the same name with other bytes is refused')
+	check(a:remove('first') == true and bytes_at(0, 4) == Z4 and #mr.patch_list('claim_a') == 0, 'remove puts the held bytes back')
+	check(b:patch('overlap', at(2), Z4, TWO4) == true, 'after the removal claim_b may patch the range')
+	check(select(2, a:remove('first')) == 'unknown name', 'removing a removed name is nil and why')
+	mr.patch(at(2), TWO4, NINE4)
+	ok, why = b:remove('overlap')
+	check(ok == nil and why == 'the bytes were changed by something else', 'remove refuses bytes changed by someone else: ' .. tostring(why))
+	check(b:info('overlap').state == 'missing' and bytes_at(2, 4) == NINE4, 'the state says missing and the bytes stay')
+	mr.patch(at(2), NINE4, Z4)
+	check(b:info('overlap').state == 'held', 'bytes put back by someone else read as held')
+	check(b:remove('overlap') == true and #mr.patch_list('claim_b') == 0, 'then remove drops the item')
+
+	check(a:set('cap', at(0x400), 4, 7, 0, 100) == true and mr.read_int32(at(0x400), 0) == 7, 'set writes a number')
+	check(a:set('cap', at(0x400), 4, 9, 0, 100) == true and mr.read_int32(at(0x400), 0) == 9, 'the same name sets another number')
+	ok, why = a:set('cap', at(0x400), 4, 400, 0, 100)
+	check(ok == nil and contains(why, 'number must lie between low and high'), 'a number outside low and high is refused')
+	ok, why = a:set('bad_start', at(0x500), 4, 20, 10, 100)
+	check(ok == nil and why == 'the current value is outside low and high', 'a current value outside low and high is refused')
+	ok, why = a:set('bad_size', at(0x500), 3, 5, 0, 100)
+	check(ok == nil and why == 'size must be 1 or 4', 'a size other than 1 or 4 is refused')
+	ok, why = b:set('cap_steal', at(0x400), 4, 5, 0, 100)
+	check(ok == nil and why == 'held by claim_a/cap', 'another owner cannot set a held field')
+	mr.patch(at(0x400), '\9\0\0\0', '\4\0\0\0')
+	ok, why = a:set('cap', at(0x400), 4, 10, 0, 100)
+	check(ok == nil and why == 'the bytes were changed by something else' and mr.read_int32(at(0x400), 0) == 4, 'set refuses a field changed by someone else')
+	check(a:set('small', at(0x600), 1, 200, 0, 255) == true and bytes_at(0x600, 1) == '\200', 'a one byte field takes 0 to 255')
+	check(a:remove('small') == true and bytes_at(0x600, 1) == '\0', 'remove puts the one byte field back')
+
+	local target = address('hook_target')
+	local first = mr.read(target, 0, 1)
+	check(a:patch('claim_start', target, first, first) == true, 'a patch with equal bytes claims a range without changing it')
+	ok, why = b:cave('cave_over', target, '\144')
+	check(ok == nil and why == 'held by claim_a/claim_start' and mr.hook_info(target) == nil, 'a cave over a held range is refused and installs nothing')
+	local cave = b:cave('own_cave', address('cave_target'), '\144')
+	check(mr.type(cave) == 'pointer' and mr.eq(b:cave('own_cave', address('cave_target'), '\144'), cave), 'a cave and the same cave again return one pointer')
+	ok, why = b:cave('own_cave', address('cave_target'), '\144\144')
+	check(ok == nil and why == 'the name is already used for a different change', 'the same cave name with other bytes is refused')
+	ok, why = a:cave('other_cave', address('cave_target'), '\144')
+	check(
+		ok == nil and (why == 'held by claim_b/own_cave' or contains(why, 'already holds a code cave')),
+		'a second owner cannot cave the same address: ' .. tostring(why)
+	)
+	check(select(2, b:remove('own_cave')) == 'stays for the session', 'a cave stays for the session')
+
+	local frame = address('frame_target')
+	check(a:frame('planner', frame, 0x360) == true and a:frame('planner', frame, 0x360) == true, 'a frame grows once and the same name again is a no-op')
+	ok, why = b:frame('stolen', frame, 0x360)
+	check(ok == nil and why == 'held by claim_a/planner', 'another owner cannot claim a grown function')
+	ok, why = a:frame('bad_amount', frame, 15)
+	check(ok == nil and contains(why, 'multiple of 16'), 'a bad amount is refused with the reason')
+	ok, why = a:frame('elsewhere', mr.alloc(16), 0x40)
+	check(ok == nil and why == "address is outside the game's exe", 'a frame outside the exe is refused')
+	check(select(2, a:remove('planner')) == 'stays for the session', 'a frame stays for the session')
+
+	local under = address('prologue_target')
+	check(a:patch('under_hook', mr.add(under, 5), ONE4, TWO4) == true, 'an owned patch inside a function prologue')
+	mr.hook(under, 'int32()', function()
+		return mr.hook_next(under)
+	end)
+	check(a:info('under_hook').state == 'copied', 'a hook installed later copies the patch, so the state says copied')
+	ok, why = a:remove('under_hook')
+	check(
+		ok == nil and contains(why, 'refused: the first bytes of a hooked function'),
+		'remove refuses a patch that now runs from a hook copy: ' .. tostring(why)
+	)
+	check(mr.tonumber(mr.call(under, 'int32()')) == 2 and a:info('under_hook') ~= nil, 'the patch still runs and stays listed')
+	local field_function = address('patch_target')
+	check(a:set('under_field', mr.add(field_function, 1), 4, 2, 0, 10) == true, 'an owned value inside a function prologue')
+	mr.hook(field_function, 'int32()', function()
+		return mr.hook_next(field_function)
+	end)
+	ok, why = a:set('under_field', mr.add(field_function, 1), 4, 3, 0, 10)
+	check(ok == nil and contains(why, 'refused: the first bytes of a hooked function'), 'set refuses a new number under a hook: ' .. tostring(why))
+	check(mr.tonumber(mr.call(field_function, 'int32()')) == 2, 'and the value is unchanged')
+	local single = address('site_single_here')
+	local single_byte = mr.read(single, 0, 1)
+	check(a:patch('hold_site', single, single_byte, single_byte) == true, 'a patch with equal bytes claims the start of a site')
+	ok, why = b:site('over_claim', single, function() end)
+	check(
+		ok == nil and why == 'held by claim_a/hold_site' and mr.hook_info(single) == nil,
+		'a site over a claimed range is refused and hooks nothing: ' .. tostring(why)
+	)
+
+	check(mr.grow_frame(address('frame_twin'), 0x20) == true, 'a raw grow_frame still grows')
+	ok, why = a:frame('adopt', address('frame_twin'), 0x20)
+	check(ok == nil and why == 'grown by 32 already', 'a frame grown by a raw call is not adopted: ' .. tostring(why))
+	ok, why = a:frame('planner', frame, 0x380)
+	check(ok == nil and why == 'the name is already used for a different change', 'the same frame name with another amount is refused')
+	local xmm = address('frame_xmm_target')
+	local head = mr.read(xmm, 0, 16)
+	check(b:patch('frame_head', xmm, head, head) == true, 'a patch with equal bytes claims the start of a function')
+	ok, why = a:frame('blocked', xmm, 0x360)
+	check(
+		ok == nil and why == 'held by claim_b/frame_head' and mr.read(xmm, 0, 16) == head,
+		'a frame is refused over another owner claim and writes nothing: ' .. tostring(why)
+	)
+	local pointer = address('frame_pointer_target')
+	check(a:frame('claims_back', pointer, 0x100) == true, 'a frame grows a function with no claims in it')
+	local grown_head = mr.read(pointer, 0, 16)
+	ok, why = b:patch('after_frame', pointer, grown_head, grown_head)
+	check(ok == nil and why == 'held by claim_a/claims_back', 'the bytes a frame rewrote are claimed by it: ' .. tostring(why))
+
+	local hits = 0
+	local here = address('site_target_here')
+	local function call_target()
+		mr.call(address('site_target'), 'int32(int32, int32)', 3, 4)
+	end
+	check(a:site('s1', here, function()
+		hits = hits + 1
+	end) == true, 'an owned site attaches')
+	call_target()
+	check(hits == 1, 'the site callback runs')
+	check(a:site('s1', here, function()
+		hits = hits + 10
+	end) == true and mr.hook_info(here).callbacks == 1, 'the same name replaces the callback')
+	hits = 0
+	call_target()
+	check(hits == 10, 'only the new callback runs')
+	check(b:site('s2', here, function()
+		hits = hits + 100
+	end) == true and mr.hook_info(here).callbacks == 2, 'two owners share a site')
+	hits = 0
+	call_target()
+	check(hits == 110, 'both callbacks run')
+	check(a:remove('s1') == true and mr.hook_info(here).callbacks == 1, 'remove detaches only that link')
+	hits = 0
+	call_target()
+	check(hits == 100 and a:info('s1') == nil, 'the other owner keeps its link and the item is gone')
+	ok, why = b:site('s2', address('site_single_here'), function() end)
+	check(ok == nil and why == 'the name is already used for a different change', 'a site name cannot move to another address')
+	ok, why = b:site('s3', here, function() end, 5000)
+	check(ok == nil and contains(why, 'priority'), 'a priority out of range is refused')
+	check(b:site('s3', here, function() end, 5) == true, 'a priority in range is accepted')
+	check(select(2, b:site('s4', nil, function() end)) == 'address is NULL', 'a NULL site is refused')
+
+	check(b:remove_all() == true, 'remove_all succeeds')
+	local summary = { b:remove_all() }
+	check(
+		summary[1] == true and summary[2] == 0 and summary[3] == 1,
+		'a second remove_all removes nothing and counts what stays: ' .. tostring(summary[2]) .. ', ' .. tostring(summary[3])
+	)
+	check(#mr.patch_list('claim_b') == 1 and mr.patch_list('claim_b')[1].name == 'own_cave', 'only the cave of claim_b is left')
+
+	local owners = 3
+	for i = 1, 70 do
+		if mr.patcher('limit_' .. i) then owners = owners + 1 end
+	end
+	check(owners == 64, 'at most 64 owners are accepted: ' .. owners)
+	check(select(2, mr.patcher('one_more')) == 'at most 64 owners per game session', 'the 65th owner is refused with the reason')
+	check(mr.patcher('claim_a') == a, 'an owner that exists still gets its handle')
+
+	local existing = #mr.patch_list()
+	local made = 0
+	while a:set('field_' .. made, at(0x1000 + made), 1, 1, 0, 255) == true do
+		made = made + 1
+	end
+	check(made + existing == 2048, 'at most 2048 items are accepted: ' .. made .. ' new, ' .. existing .. ' before')
+	check(select(2, a:set('field_over', at(0x3000), 1, 1, 0, 255)) == 'full', 'the item after that is refused as full')
+	check(bytes_at(0x3000, 1) == '\0', 'and writes nothing')
+	for i = 0, made - 1 do
+		a:remove('field_' .. i)
+	end
+	check(#mr.patch_list() == existing, 'removing them frees the slots')
+	local function site_list(base, count)
+		local list = {}
+		for i = 1, count do
+			list[i] = { at(base + i * 4), Z4, ONE4 }
+		end
+		return list
+	end
+	local total = 0
+	for round = 1, 4 do
+		if a:relocate('wave_' .. round, site_list(0x4000 + (round - 1) * 0x1000, 1000)) == true then total = total + 1 end
+	end
+	check(total == 4, 'four relocations of 1000 sites are accepted')
+	ok, why = a:relocate('wave_5', site_list(0x8000, 1000))
+	check(ok == nil and why == 'full', 'the claim table is full after 4000 sites: ' .. tostring(why))
+	check(bytes_at(0x8004, 4) == Z4, 'and nothing of the refused relocation was written')
+	check(
+		select(2, a:relocate('wave_1', site_list(0x4000, 999))) == 'the name is already used for a different change',
+		'a relocation name with other sites is refused'
+	)
+	check(a:relocate('wave_1', site_list(0x4000, 1000)) == true, 'the same relocation again is a no-op')
+	check(select(2, a:relocate('too_many', site_list(0x9000, 1025))) == 'at most 1024 sites', 'more than 1024 sites are refused')
+	check(select(2, a:relocate('none', {})) == 'no sites', 'no sites are refused')
+	ok, why = a:relocate('overlap_sites', { { at(0x9100), Z4, ONE4 }, { at(0x9102), Z4, ONE4 } })
+	check(ok == nil and why == 'sites 1 and 2 overlap', 'overlapping sites in one call are refused')
+	ok, why = a:relocate('broken', { { at(0x9200), Z4, ONE4 }, 5 })
+	check(ok == nil and why == 'site 2: is not a table {address, expected, bytes}', 'a site that is not a table is refused')
+elseif SCENARIO == 'held_bytes' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local FULL_LINE = 'saved original code is full'
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local function log_has(part)
+		local log = io.open('memreader_plus_refused.txt', 'rb')
+		local text = log and log:read('*a') or ''
+		if log then log:close() end
+		return string.find(text, part, 1, true) ~= nil
+	end
+	local filler = address('filler_code')
+	local zeros, nops = string.rep('\0', 4096), string.rep('\144', 4096)
+	for chunk = 0, 9 do
+		mr.patch(mr.add(filler, chunk * 4096), zeros, nops)
+	end
+	check(log_has(FULL_LINE), 'ten raw patches of 4096 bytes fill the saved original table')
+	local p = mr.patcher('hold_mod')
+	local site = address('patch_target')
+	check(mr.read(site, 0, 5) == '\184\1\0\0\0', 'patch_target holds mov eax, 1')
+	check(p:patch('hold', site, '\184\1\0\0\0', '\184\2\0\0\0') == true, 'an owned patch works with the table full')
+	check(mr.read_original(site, 0, 5) == '\184\2\0\0\0', 'read_original no longer has the original bytes')
+	check(mr.tonumber(mr.call(site, 'int32()')) == 2, 'the function returns 2 while patched')
+	check(p:remove('hold') == true, 'remove works')
+	check(mr.read(site, 0, 5) == '\184\1\0\0\0' and mr.tonumber(mr.call(site, 'int32()')) == 1, 'and puts the held bytes back, not the lost originals')
+	check(#mr.patch_list('hold_mod') == 0, 'the item is gone')
+
+	local made = 0
+	local function big(index)
+		return p:patch('big_' .. index, mr.add(filler, index * 4096), nops, zeros)
+	end
+	for index = 0, 7 do
+		if big(index) == true then made = made + 1 end
+	end
+	check(made == 8, 'eight patches of 4096 bytes fill the 64 KB of held bytes: ' .. made)
+	local ok, why = big(8)
+	check(ok == nil and why == 'full', 'the ninth is refused as full: ' .. tostring(why))
+	check(mr.read(mr.add(filler, 8 * 4096), 0, 4096) == nops, 'and writes nothing')
+	check(p:remove('big_0') == true and mr.read(filler, 0, 4096) == nops, 'removing the first one frees its bytes and restores it')
+	for index = 1, 7 do
+		check(mr.read(mr.add(filler, index * 4096), 0, 4096) == zeros, 'chunk ' .. index .. ' keeps its patch after the held bytes moved down')
+	end
+	check(big(8) == true, 'the freed bytes take the ninth patch')
+	check(p:remove('big_4') == true and mr.read(mr.add(filler, 4 * 4096), 0, 4096) == nops, 'a middle one is restored from its own held bytes')
+	local fields = p:set('field', mr.add(filler, 9 * 4096 + 100), 1, 3, 0, 255)
+	check(fields == true and mr.read(mr.add(filler, 9 * 4096 + 100), 0, 1) == '\3', 'a value fits in the freed bytes')
+	check(p:relocate('moved', { { mr.add(filler, 9 * 4096 + 200), '\144\144\144\144', '\1\1\1\1' } }) == true, 'so does a relocation')
+	local info = { p:remove_all() }
+	check(
+		info[1] == true and info[2] == 8 and info[3] == 1,
+		'remove_all restores every patch and value and counts the relocation: ' .. tostring(info[2]) .. ', ' .. tostring(info[3])
+	)
+	for index = 0, 8 do
+		check(mr.read(mr.add(filler, index * 4096), 0, 4096) == nops, 'chunk ' .. index .. ' is back to its original bytes')
+	end
+	check(
+		mr.read(mr.add(filler, 9 * 4096 + 100), 0, 1) == '\144' and mr.read(mr.add(filler, 9 * 4096 + 200), 0, 4) == '\1\1\1\1',
+		'the value is back and the relocation stays'
+	)
+elseif SCENARIO == 'batch' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local function contains(text, part)
+		return type(text) == 'string' and string.find(text, part, 1, true) ~= nil
+	end
+	local cell = mr.alloc(8)
+	local function raw(pointer)
+		mr.write(cell, 0, pointer)
+		return mr.read(cell, 0, 8)
+	end
+	local filler = address('filler_code')
+	check(mr.tostring(filler):sub(-3) == '000', 'the filler starts on a page, so a failing protect call hits the page a test names: ' .. mr.tostring(filler))
+	local function at(offset)
+		return mr.add(filler, offset)
+	end
+	local Z4, ONE4, TWO4 = '\0\0\0\0', '\1\0\0\0', '\2\0\0\0'
+	local function bytes_at(offset, size)
+		return mr.read(at(offset), 0, size)
+	end
+	local function number_at(offset)
+		return mr.read_int32(at(offset), 0)
+	end
+	local function rows(owner)
+		local found = {}
+		for _, row in ipairs(mr.patch_list(owner)) do
+			found[row.name] = row
+		end
+		return found
+	end
+	local function microseconds()
+		return test_microseconds()
+	end
+	local function elapsed(since)
+		return (test_microseconds() - since) % 1e7
+	end
+	local p, q = mr.patcher('batch_mod'), mr.patcher('batch_other')
+	check(type(p.batch) == 'function', 'a handle has batch')
+	check(p:owner() == 'batch_mod' and q:owner() == 'batch_other', 'a handle names its owner')
+
+	local nops, zeros = string.rep('\144', 4096), string.rep('\0', 4096)
+	local big = {}
+	for chunk = 0, 8 do
+		big[#big + 1] = { 'patch', 'big_' .. chunk, at(chunk * 4096), zeros, nops }
+	end
+	local ok, why, stays = p:batch(big)
+	check(ok == nil and why == 'full' and stays == nil, 'nine patches of 4096 bytes need more held bytes than the registry has: ' .. tostring(why))
+	check(bytes_at(0, 4096) == zeros and bytes_at(8 * 4096, 4096) == zeros and #mr.patch_list('batch_mod') == 0, 'and nothing is written or registered')
+	big[9] = nil
+	check(p:batch(big) == true and bytes_at(7 * 4096, 4096) == nops, 'eight of them fit')
+	check(p:remove_all() == true and bytes_at(0, 4096) == zeros and bytes_at(7 * 4096, 4096) == zeros, 'and remove_all puts every chunk back')
+
+	local good = {
+		{ 'patch', 'first', at(0x100), Z4, ONE4 },
+		{ 'set', 'cap', at(0x200), 4, 7, 0, 100 },
+		{ 'relocate', 'moved', { { at(0x300), Z4, ONE4 }, { at(0x310), Z4, TWO4 } } },
+		{ 'frame', 'plan', address('frame_target'), 0x360 },
+	}
+	ok, why, stays = p:batch(good)
+	check(ok == true and stays == nil, 'a batch of a patch, a value, a relocation and a frame succeeds')
+	check(type(why) == 'number' and why > 0 and why < 1000000, 'and reports how long the other threads were stopped: ' .. tostring(why) .. ' us')
+	check(
+		bytes_at(0x100, 4) == ONE4 and number_at(0x200) == 7 and bytes_at(0x300, 4) == ONE4 and bytes_at(0x310, 4) == TWO4,
+		'every patch, value and relocation is written'
+	)
+	local listed = rows('batch_mod')
+	check(
+		listed.first.kind == 'patch' and listed.cap.kind == 'value' and listed.moved.kind == 'relocate' and listed.plan.kind == 'frame',
+		'every step is owned under its kind'
+	)
+	check(listed.first.state == 'ours' and listed.cap.state == 'ours' and listed.moved.state == 'stays' and listed.plan.state == 'stays', 'with its state')
+	check(mr.read_original(at(0x100), 0, 4) == Z4, 'read_original has the old bytes')
+	check(p:batch(good) == true and #mr.patch_list('batch_mod') == 4, 'the same batch again is a no-op')
+	check(p:batch({ { 'set', 'cap', at(0x200), 4, 9, 0, 100 } }) == true and number_at(0x200) == 9, 'a value in a batch can take another number')
+	check(p:remove('first') == true and bytes_at(0x100, 4) == Z4, 'remove puts back the held bytes of a batch patch')
+	check(p:remove('cap') == true and number_at(0x200) == 0, 'and of a batch value')
+	check(p:batch({ good[1] }) == true and bytes_at(0x100, 4) == ONE4 and p:remove('first') == true, 'a removed patch can be batched again')
+
+	q:patch('theirs', at(0x700), Z4, ONE4)
+	local xmm = address('frame_xmm_target')
+	local xmm_head = mr.read(xmm, 0, 16)
+	q:patch('xmm_head', xmm, xmm_head, xmm_head)
+	local pointer = address('frame_pointer_target')
+	local pointer_head = mr.read(pointer, 0, 16)
+	local before = #mr.patch_list()
+	local head = { { 'patch', 'r_patch', at(0x400), Z4, ONE4 }, { 'set', 'r_set', at(0x500), 4, 5, 0, 100 } }
+	local function with(step)
+		return { head[1], head[2], step }
+	end
+	local function refused(list, part, label)
+		local failed, reason, left = p:batch(list)
+		check(failed == nil and contains(reason, part) and left == nil, label .. ': ' .. tostring(reason))
+		check(bytes_at(0x400, 4) == Z4 and number_at(0x500) == 0 and bytes_at(0x600, 4) == Z4, label .. ': nothing is written')
+		check(#mr.patch_list() == before, label .. ': nothing is registered')
+	end
+	refused(
+		with({ 'relocate', 'r_sites', { { at(0x600), Z4, ONE4 }, { at(0x610), ONE4, TWO4 } } }),
+		'r_sites: site 2: does not hold the expected bytes',
+		'a wrong expected byte in the last step'
+	)
+	refused(with({ 'patch', 'r_claimed', at(0x702), Z4, TWO4 }), 'r_claimed: held by batch_other/theirs', 'a range held by another owner')
+	refused(with({ 'patch', 'r_wrong', at(0x600), ONE4, TWO4 }), 'r_wrong: unexpected bytes', 'wrong expected bytes')
+	refused(with({ 'set', 'r_range', at(0x600), 4, 500, 0, 100 }), 'r_range: number must lie between low and high', 'a number outside its range')
+	refused(with({ 'patch', 'r_twin', at(0x402), Z4, TWO4 }), 'r_twin: overlaps r_patch in this batch', 'two steps over the same bytes')
+	refused(
+		with({ 'relocate', 'r_sites', { { at(0x502), Z4, ONE4 }, { at(0x600), Z4, ONE4 } } }),
+		'r_sites: site 1: overlaps r_set in this batch',
+		'a relocation site over another step'
+	)
+	refused(with({ 'frame', 'blocked', xmm, 0x360 }), 'blocked: held by batch_other/xmm_head', 'a frame over a claim')
+	check(mr.read(xmm, 0, 16) == xmm_head, 'the function of the refused frame is untouched')
+	refused(
+		{ head[1], { 'patch', 'p_head', pointer, pointer_head, pointer_head }, { 'frame', 'p_frame', pointer, 0x100 } },
+		'p_frame: overlaps p_head in this batch',
+		'a frame over a patch of the same batch'
+	)
+	check(p:frame('later', pointer, 0x100) == true, 'the function was not grown by the refused batch')
+	before = #mr.patch_list()
+	refused(with({ 'cave', 'bad_cave', address('site_ret_here'), '\144' }), 'refused: a return or jump', 'a cave the site rules refuse')
+	check(mr.hook_info(address('site_ret_here')) == nil, 'and no hook is left')
+	refused(with({ 'patch', 'r_patch', at(0x600), Z4, ONE4 }), 'step 3: the name is used twice in this batch', 'the same name twice')
+	refused({ { 'poke', 'x' } }, 'step 1: unknown kind', 'an unknown kind')
+	refused({ 5 }, 'step 1: needs a table', 'a step that is not a table')
+	refused({ { 'patch', 'long', 1, 2, 3, 4, 5, 6 } }, 'step 1: has too many fields', 'a step with too many fields')
+	refused({ { 'patch', 'bad name', at(0x600), Z4, ONE4 } }, 'step 1: name must be 1 to 47 letters, digits or underscores', 'a bad name')
+	refused({}, 'no steps', 'an empty list')
+	local many = {}
+	for i = 1, 129 do
+		many[i] = { 'set', 'many_' .. i, at(0x600), 4, 1, 0, 9 }
+	end
+	refused(many, 'at most 128 steps', 'too many steps')
+	check(
+		not pcall(p.batch, p, 'steps') and not pcall(p.batch, p, { { 'patch', 'short' } }) and not pcall(p.batch, { { 'patch', 'x' } }),
+		'a wrong argument type raises'
+	)
+
+	local function write_list(prefix)
+		return {
+			{ 'patch', prefix .. 'a', at(0x1000), Z4, ONE4 },
+			{ 'set', prefix .. 'b', at(0x2000), 4, 9, 0, 100 },
+			{ 'patch', prefix .. 'c', at(0x3000), Z4, TWO4 },
+			{ 'relocate', prefix .. 'd', { { at(0x4000), Z4, ONE4 }, { at(0x4010), Z4, ONE4 } } },
+		}
+	end
+	local function untouched(label)
+		check(
+			bytes_at(0x1000, 4) == Z4 and number_at(0x2000) == 0 and bytes_at(0x3000, 4) == Z4 and bytes_at(0x4000, 4) == Z4 and bytes_at(0x4010, 4) == Z4,
+			label .. ': no patch, value or relocation of the batch is left'
+		)
+		check(#mr.patch_list() == before, label .. ': nothing is registered')
+	end
+	test_fail_protect(raw(at(0x3000)), 1, mr.hop_slots)
+	ok, why, stays = p:batch(write_list('w_'))
+	check(
+		ok == nil and why == 'w_c: failed to patch memory, nothing of the batch was written' and stays == nil,
+		'a write that fails in the third step: ' .. tostring(why)
+	)
+	untouched('the third write fails')
+	test_fail_protect(raw(at(0x1000)), 1, mr.hop_slots)
+	ok, why = p:batch(write_list('w_'))
+	check(ok == nil and why == 'w_a: failed to patch memory, nothing of the batch was written', 'a write that fails first: ' .. tostring(why))
+	untouched('the first write fails')
+	test_fail_protect(raw(at(0x4010)), 1, mr.hop_slots)
+	ok, why = p:batch(write_list('w_'))
+	check(ok == nil and why == 'w_d: failed to patch memory, nothing of the batch was written', 'a write that fails last: ' .. tostring(why))
+	untouched('the last write fails')
+	local pair = { { 'patch', 'pb_a', at(0x9000), Z4, ONE4 }, { 'patch', 'pb_b', at(0x9100), Z4, TWO4 } }
+	local listed_before = #mr.patch_list()
+	test_fail_protect(raw(at(0x9000)), 2, mr.hop_slots, 1)
+	ok, why, stays = p:batch(pair)
+	check(
+		ok == nil and why == 'pb_b: failed to patch memory, and 1 write could not be put back' and stays == nil,
+		'a write that cannot be put back is counted, and one that never changed is not: ' .. tostring(why)
+	)
+	check(bytes_at(0x9000, 4) == ONE4 and bytes_at(0x9100, 4) == Z4, 'the first write is still in the code, the second was refused')
+	listed = rows('batch_mod')
+	check(
+		listed.pb_a ~= nil and listed.pb_a.state == 'stays' and listed.pb_b == nil and #mr.patch_list() == listed_before + 1,
+		'the write that stays is registered as staying, so a report names it'
+	)
+	check(listed.pb_a.kind == 'patch', 'and under the kind of its step')
+	local value_pair = { { 'set', 'pv_a', at(0x9040), 4, 5, 0, 100 }, { 'patch', 'pv_b', at(0x9140), Z4, TWO4 } }
+	test_fail_protect(raw(at(0x9040)), 2, mr.hop_slots, 1)
+	ok, why = p:batch(value_pair)
+	check(ok == nil and why == 'pv_b: failed to patch memory, and 1 write could not be put back', 'the same with a value first: ' .. tostring(why))
+	listed = rows('batch_mod')
+	check(listed.pv_a ~= nil and listed.pv_a.kind == 'value' and listed.pv_a.state == 'stays', 'a value that stays is listed as a value')
+	check(p:batch(write_list('w_')) == true and bytes_at(0x3000, 4) == TWO4 and bytes_at(0x4010, 4) == ONE4, 'after the failures the same batch goes through')
+	check(rows('batch_mod').w_a.state == 'ours' and rows('batch_mod').w_d.state == 'stays', 'and is owned')
+
+	local kind_mod = mr.patcher('kind_mod')
+	test_fail_protect(raw(at(0x7800)), 2, mr.hop_slots, 1)
+	ok, why = kind_mod:batch({ { 'patch', 'kp_a', at(0x7800), Z4, ONE4 }, { 'patch', 'kp_b', at(0x7900), Z4, TWO4 } })
+	check(ok == nil and contains(why, 'could not be put back'), 'a patch that stays after a failed put back: ' .. tostring(why))
+	test_fail_protect(raw(at(0x7A00)), 2, mr.hop_slots, 1)
+	ok, why = kind_mod:batch({ { 'set', 'kv_a', at(0x7A00), 4, 5, 0, 100 }, { 'patch', 'kp_c', at(0x7B00), Z4, TWO4 } })
+	check(ok == nil and contains(why, 'could not be put back'), 'and a value that stays: ' .. tostring(why))
+	ok, why = kind_mod:relocate('kp_a', { { at(0x7800), Z4, ONE4 } })
+	check(
+		ok == nil and why == 'the name is already used for a different change',
+		'asking for a leftover patch as a relocation is a different change, not a read of the held bytes: ' .. tostring(why)
+	)
+	local report_name = mr.write_runtime_report()
+	local report_text = type(report_name) == 'string' and read_all(report_name) or ''
+	check(has(report_text, '  kind_mod: 1 value, 1 patch (kp_a '), 'the owner block counts a leftover patch and value under their kinds')
+	local kind_line = report_text:match('  kind_mod:[^\n]*') or ''
+	check(kind_line ~= '' and not has(kind_line, 'relocation'), 'and not as a relocation: ' .. kind_line)
+
+	local caves = {
+		{ 'patch', 'c_pre', at(0x5000), Z4, ONE4 },
+		{ 'cave', 'cave_one', address('cave_target'), '\144' },
+		{ 'cave', 'cave_two', address('hook_target'), '\144\144' },
+		{ 'cave', 'cave_three', address('site_target_here'), '\144\144\144' },
+		{ 'set', 'c_post', at(0x5100), 4, 3, 0, 100 },
+	}
+	test_fail_alloc(3 + 14, mr.hop_slots)
+	ok, why, stays = p:batch(caves)
+	check(ok == nil and contains(why, 'cave_three: no free memory for a cave at'), 'a cave that fails in the second phase: ' .. tostring(why))
+	check(type(stays) == 'table' and #stays == 2 and stays[1] == 'cave_one' and stays[2] == 'cave_two', 'the caves it left are named')
+	listed = rows('batch_mod')
+	check(listed.cave_one.kind == 'cave' and listed.cave_one.state == 'stays' and listed.cave_one.owner == 'batch_mod', 'the first cave stays, owned and named')
+	check(listed.cave_two.kind == 'cave' and listed.cave_two.state == 'stays' and listed.cave_three == nil, 'so does the second, the third was never made')
+	check(mr.hook_info(address('cave_target')).kind == 'cave' and mr.hook_info(address('site_target_here')) == nil, 'the hooks agree')
+	check(bytes_at(0x5000, 4) == Z4 and number_at(0x5100) == 0 and listed.c_pre == nil and listed.c_post == nil, 'no patch or value of the batch was written')
+	ok, why, stays = p:batch(caves)
+	check(ok == true and type(why) == 'number' and stays == nil, 'the same batch goes through: the made caves are kept, the third is made: ' .. tostring(why))
+	check(bytes_at(0x5000, 4) == ONE4 and number_at(0x5100) == 3 and rows('batch_mod').cave_three.state == 'stays', 'and writes its patch and value')
+	check(select(2, p:remove('cave_one')) == 'stays for the session', 'a cave of a batch stays for the session')
+
+	local VALUE = 66051
+	local function unit_list(prefix, origin, value, count)
+		local list = {}
+		for i = 0, count - 1 do
+			list[#list + 1] = { 'set', prefix .. i, at(origin + 4 * i), 4, value, 0, 1000000 }
+		end
+		return list
+	end
+	local function median(values)
+		table.sort(values)
+		return values[math.ceil(#values / 2)]
+	end
+	local unit = 0x6000 + test_aligned_offset(raw(at(0x6000)), 64)
+	local up, down = unit_list('fz', unit, VALUE, 4), unit_list('fz', unit, 0, 4)
+	test_reader_start(raw(at(unit)))
+	test_sleep(100)
+	local idle_reads, idle_torn, idle_gap = test_reader_counts()
+	check(
+		idle_reads > 1000 and idle_torn == 0,
+		'the reader thread reads the range with one 16 byte load: ' .. idle_reads .. ' reads while idle, longest gap ' .. idle_gap .. ' us'
+	)
+	local durations, going_up, loops, all_done = {}, true, 0, true
+	local reads, torn, gap = 0, 0, 0
+	repeat
+		local started = microseconds()
+		all_done = all_done and p:batch(going_up and up or down) == true
+		durations[#durations + 1] = elapsed(started)
+		going_up = not going_up
+		loops = loops + 1
+		reads, torn, gap = test_reader_counts()
+	until (reads >= 1000000 and loops >= 100) or loops >= 3000
+	reads, torn, gap = test_reader_stop()
+	check(all_done, 'every batch of four values goes through')
+	check(reads >= 1000000, 'the reader made ' .. reads .. ' reads while ' .. loops .. ' batches wrote four values each')
+	check(torn == 0, 'no read saw a mix of old and new values: ' .. torn .. ' of ' .. reads)
+	check(number_at(unit) == (going_up and 0 or VALUE) and number_at(unit + 12) == (going_up and 0 or VALUE), 'the values hold the last number')
+	print(
+		('  batch of four values: median %d us; the reader thread: %d reads, longest gap %d us (idle: %d us)'):format(median(durations), reads, gap, idle_gap)
+	)
+
+	local control = 0x6100 + test_aligned_offset(raw(at(0x6100)), 64)
+	test_reader_start(raw(at(control)))
+	local control_up, control_loops = true, 0
+	repeat
+		for i = 0, 3 do
+			p:set('uf' .. i, at(control + 4 * i), 4, control_up and VALUE or 0, 0, 1000000)
+		end
+		control_up = not control_up
+		control_loops = control_loops + 1
+		reads, torn = test_reader_counts()
+	until torn > 0 or control_loops >= 500
+	reads, torn = test_reader_stop()
+	check(
+		torn > 0,
+		'the same four writes one by one are seen half done ('
+			.. torn
+			.. ' of '
+			.. reads
+			.. ' reads in '
+			.. control_loops
+			.. ' rounds), so the test can see a mix'
+	)
+
+	local many_up, many_down = unit_list('bulk', 0x6400, VALUE, 128), unit_list('bulk', 0x6400, 0, 128)
+	test_reader_start(raw(at(unit)))
+	local bulk_times, bulk_windows, bulk_up, bulk_ok = {}, {}, true, true
+	for round = 1, 60 do
+		local started = microseconds()
+		local done, window = p:batch(bulk_up and many_up or many_down)
+		bulk_ok = bulk_ok and done == true
+		bulk_times[#bulk_times + 1] = elapsed(started)
+		bulk_windows[#bulk_windows + 1] = window
+		bulk_up = not bulk_up
+	end
+	table.sort(bulk_windows)
+	reads, torn, gap = test_reader_stop()
+	check(bulk_ok and number_at(0x6400 + 4 * 127) == (bulk_up and 0 or VALUE), 'batches of 128 values go through')
+	print(
+		('  batch of 128 values: median %d us, max %d us; threads stopped: median %d us, max %d us; the reader thread: longest gap %d us'):format(
+			median(bulk_times),
+			bulk_times[#bulk_times],
+			median(bulk_windows),
+			bulk_windows[#bulk_windows],
+			gap
+		)
+	)
+
+	local small = { { 'set', 'small', at(0x7000), 4, 1, 0, 100 } }
+	local small_other = { { 'set', 'small', at(0x7000), 4, 2, 0, 100 } }
+	local small_times, small_windows = {}, {}
+	for i = 1, 200 do
+		local started = microseconds()
+		local _, window = p:batch(i % 2 == 0 and small or small_other)
+		small_times[#small_times + 1] = elapsed(started)
+		small_windows[#small_windows + 1] = window
+	end
+	table.sort(small_times)
+	table.sort(small_windows)
+	local sites = {}
+	for i = 1, 74 do
+		sites[i] = { at(0x7100 + 8 * i), Z4, ONE4 }
+	end
+	local started = microseconds()
+	check(p:batch({ { 'relocate', 'seventy_four', sites } }) == true, 'a relocation of 74 sites is one batch')
+	print(
+		('  batch of one value: median %d us, max %d us; threads stopped: median %d us, max %d us; batch of 74 relocation sites: %d us'):format(
+			small_times[100],
+			small_times[200],
+			small_windows[100],
+			small_windows[200],
+			elapsed(started)
+		)
+	)
+
+	local parked = address('parked_target')
+	local PARK_BYTES = '\83\131\57\0\116\251\91\184'
+	local park_list = { { 'patch', 'park', parked, PARK_BYTES, PARK_BYTES } }
+	check(test_park_start(test_function('parked_target')), 'a thread spins inside parked_target')
+	started = microseconds()
+	ok, why, stays = p:batch(park_list)
+	local waited = elapsed(started)
+	check(ok == nil and why == 'a thread is inside batch_mod/park' and stays == nil, 'a thread inside the range refuses the batch: ' .. tostring(why))
+	check(waited >= 5000, 'after retrying with a pause each time: ' .. waited .. ' us')
+	check(mr.read(parked, 0, #PARK_BYTES) == PARK_BYTES and rows('batch_mod').park == nil, 'nothing is written or registered')
+	test_park_leave_on_retry(mr.hop_slots)
+	check(p:batch(park_list) == true and test_park_left(), 'the batch goes through when the thread leaves while it retries')
+	check(test_park_finish() == 77, 'and the thread finished its function')
+	check(rows('batch_mod').park.state == 'ours', 'the batch patch is owned')
+	print(('  batch refused by a thread inside the range: %d us'):format(waited))
+
+	local function bytes_of(text)
+		return (text:gsub('%x%x', function(pair)
+			return string.char(tonumber(pair, 16))
+		end))
+	end
+	local frame_park = address('park_frame')
+	check(mr.read(frame_park, 0, 11) == bytes_of('53B801000000BA03000000'), 'park_frame holds the expected bytes')
+	local first_site = { { 'relocate', 'pf_first', { { mr.add(frame_park, 2), '\1\0\0\0', '\2\0\0\0' } } } }
+	local second_site = { { 'relocate', 'pf_second', { { mr.add(frame_park, 7), '\3\0\0\0', '\4\0\0\0' } } } }
+	check(test_park_start(test_function('parked_target')), 'a thread spins in another function')
+	check(p:batch(second_site) == true and mr.read(frame_park, 7, 4) == '\4\0\0\0', 'a relocation in a function with no thread in it goes through')
+	check(test_park_finish() == 77, 'and the thread finished')
+	check(test_park_start(test_function('park_frame')), 'a thread spins in park_frame, outside the bytes of the relocation')
+	started = microseconds()
+	ok, why, stays = p:batch(first_site)
+	waited = elapsed(started)
+	check(
+		ok == nil and why == 'a thread is inside batch_mod/pf_first' and stays == nil,
+		'a thread elsewhere in the function refuses the relocation: ' .. tostring(why)
+	)
+	check(
+		waited >= 5000 and mr.read(frame_park, 2, 4) == '\1\0\0\0' and rows('batch_mod').pf_first == nil,
+		'after the retries, with nothing written or registered: ' .. waited .. ' us'
+	)
+	ok, why = p:relocate('pf_single', first_site[1][3])
+	check(
+		ok == nil and why == 'a thread is inside batch_mod/pf_single' and mr.read(frame_park, 2, 4) == '\1\0\0\0' and rows('batch_mod').pf_single == nil,
+		'a single p:relocate is frozen too: ' .. tostring(why)
+	)
+	check(p:batch({ { 'patch', 'pf_patch', frame_park, '\83', '\83' } }) == true, 'a patch with a narrow range lets the same thread through')
+	test_park_leave_on_retry(mr.hop_slots)
+	check(
+		p:batch(first_site) == true and mr.read(frame_park, 2, 4) == '\2\0\0\0' and test_park_left(),
+		'the relocation goes through when the thread leaves while it retries'
+	)
+	check(test_park_finish() == 78, 'and the thread finished its function')
+
+	local parked_raw = test_function('parked_target')
+	local grow = address('park_grow')
+	local grow_before = mr.read(grow, 0, 32)
+	check(test_park_start(test_function('park_grow')), 'a thread spins inside park_grow, a function with a frame')
+	ok, why = mr.grow_frame(grow, 0x100)
+	check(ok == nil and why == 'a thread is inside the function', 'grow_frame refuses to grow a frame with a thread inside: ' .. tostring(why))
+	ok, why = p:frame('pg', grow, 0x100)
+	check(ok == nil and why == 'a thread is inside the function', 'p:frame refuses it too: ' .. tostring(why))
+	ok, why, stays = p:batch({ { 'patch', 'pg_other', at(0x9400), Z4, ONE4 }, { 'frame', 'pg', grow, 0x100 } })
+	check(ok == nil and why == 'pg: a thread is inside the function' and stays == nil, 'a frame step of a batch refuses it: ' .. tostring(why))
+	check(
+		mr.read(grow, 0, 32) == grow_before and bytes_at(0x9400, 4) == Z4 and rows('batch_mod').pg == nil,
+		'the function is not changed and nothing is written or registered'
+	)
+	test_park_leave_on_retry(mr.hop_slots)
+	ok = p:frame('pg', grow, 0x100)
+	check(ok == true and test_park_left(), 'p:frame grows the frame when the thread leaves while it retries')
+	check(test_park_finish() == 79, 'and the thread finished its function')
+	check(mr.read(grow, 4, 4) == '\192\1\0\0' and rows('batch_mod').pg.state == 'stays', 'the frame is grown and owned')
+	check(test_park_start(test_function('park_grow')), 'a thread spins in the grown function')
+	check(test_park_finish() == 79, 'and it returns through the grown epilogue')
+
+	local outer = address('park_outer')
+	check(mr.read(outer, 0, 9) == bytes_of('4883EC28B801000000'), 'park_outer holds the expected bytes')
+	local outer_site = { { 'relocate', 'po', { { mr.add(outer, 5), '\1\0\0\0', '\2\0\0\0' } } } }
+	check(test_park_start(test_function('park_outer'), 64), 'a thread runs park_outer')
+	test_sleep(50)
+	local inner_offset = tonumber(mr.tostring(mr.sub(mr.pointer(test_park_rip()), outer)), 16)
+	check(inner_offset >= 19, 'and spins in park_inner, called from park_outer, outside its bytes: +' .. inner_offset)
+	ok, why, stays = p:batch(outer_site)
+	check(
+		ok == nil and why == 'a thread is inside batch_mod/po' and stays == nil,
+		'a return address on a thread stack refuses the relocation: ' .. tostring(why)
+	)
+	check(mr.read(outer, 5, 4) == '\1\0\0\0' and rows('batch_mod').po == nil, 'nothing is written or registered')
+	test_park_leave_on_retry(mr.hop_slots)
+	check(
+		p:batch(outer_site) == true and mr.read(outer, 5, 4) == '\2\0\0\0' and test_park_left(),
+		'the relocation goes through when the thread leaves while it retries'
+	)
+	check(test_park_finish() == 80, 'and the thread finished')
+
+	local callback = address('callback')
+	local inside = {}
+	local function from_callback()
+		local site = mr.read(callback, 8, 4)
+		inside.stack = { p:batch({ { 'relocate', 'own_stack', { { mr.add(callback, 8), site, site } } } }) }
+		inside.clean = { p:batch({ { 'relocate', 'own_stack', { { at(0x9500), Z4, ONE4 } } } }) }
+		return 1
+	end
+	mr.call(callback, 'int64(pointer, int32)', mr.pointer(test_state()), test_ref(from_callback))
+	check(
+		inside.stack[1] == nil and inside.stack[2] == 'a thread is inside batch_mod/own_stack',
+		'a return address on the stack of the script thread itself refuses the relocation: ' .. tostring(inside.stack[2])
+	)
+	check(inside.clean[1] == true and bytes_at(0x9500, 4) == ONE4, 'a relocation elsewhere from the same call goes through')
+
+	local SINGLE = 'int64(int64)'
+	local single = address('hook_single')
+	local function from_hook(a)
+		inside.frame = { p:frame('hook_frame', address('frame_twin'), 0x40) }
+		inside.relocate = { p:relocate('hook_reloc', { { at(0x9600), Z4, ONE4 } }) }
+		inside.batch = { p:batch({ { 'relocate', 'hook_batch', { { at(0x9600), Z4, ONE4 } } } }) }
+		inside.patch = { p:batch({ { 'patch', 'hook_patch', at(0x9700), Z4, ONE4 } }) }
+		return a
+	end
+	mr.hook(single, SINGLE, from_hook)
+	mr.call(single, SINGLE, 1)
+	mr.unhook(single)
+	check(
+		inside.frame[1] == nil and inside.frame[2] == 'not from inside a hooked call',
+		'a frame is refused inside a hooked call: ' .. tostring(inside.frame[2])
+	)
+	check(
+		inside.relocate[1] == nil and inside.relocate[2] == 'not from inside a hooked call',
+		'a relocation is refused inside a hooked call: ' .. tostring(inside.relocate[2])
+	)
+	check(
+		inside.batch[1] == nil and inside.batch[2] == 'not from inside a hooked call',
+		'a batch with a relocation is refused inside a hooked call: ' .. tostring(inside.batch[2])
+	)
+	check(bytes_at(0x9600, 4) == Z4 and rows('batch_mod').hook_frame == nil, 'and nothing is written or registered')
+	check(inside.patch[1] == true and bytes_at(0x9700, 4) == ONE4, 'a batch of patches only is allowed inside a hooked call')
+
+	local twin = address('frame_twin')
+	ok, why = p:batch({ { 'frame', 'tw', twin, 0x40 }, { 'cave', 'tw_cave', mr.add(twin, 24), '\144' } })
+	check(
+		ok == nil and why == 'tw_cave: inside the function of tw in this batch',
+		'a cave inside the function of a frame of the same batch is refused in the first step: ' .. tostring(why)
+	)
+	check(rows('batch_mod').tw == nil and rows('batch_mod').tw_cave == nil, 'and neither is made')
+
+	check(test_park_start(parked_raw), 'a thread spins so that there is someone to stop')
+	test_watch_suspend(mr.hop_slots)
+	test_change_on_suspend(raw(at(0x9200)), TWO4)
+	ok, why, stays = p:batch({ { 'patch', 'cas', at(0x9200), Z4, ONE4 } })
+	check(
+		ok == nil and why == 'cas: unexpected bytes' and stays == nil,
+		'bytes changed by someone else after the planning stop the batch inside the window: ' .. tostring(why)
+	)
+	check(bytes_at(0x9200, 4) == TWO4 and rows('batch_mod').cas == nil, 'their bytes stay and nothing is registered')
+
+	local counted = { { 'set', 'sp', at(0x9300), 4, 1, 0, 100 } }
+	local function stops(value)
+		counted[1][5] = value
+		test_watch_suspend(mr.hop_slots)
+		ok, why = p:batch(counted)
+		return ok == true and test_suspend_calls() or ok
+	end
+	local baseline = stops(1)
+	check(type(baseline) == 'number' and baseline >= 1, 'a batch stops every other thread: ' .. tostring(baseline) .. ' stops')
+	test_spawn_on_suspend(1)
+	local with_new = stops(2)
+	test_end_spawned()
+	check(with_new == baseline + 1, 'and a thread created while the others are being stopped is stopped too: ' .. tostring(with_new) .. ' stops')
+
+	test_deny_next_thread(true, mr.hop_slots)
+	check(p:remove('park') == true, 'the first parked patch is removed')
+	ok, why = p:batch(park_list)
+	check(
+		ok == nil and why == 'a thread is inside batch_mod/park',
+		'without the thread enumeration of ntdll a thread inside the range still refuses: ' .. tostring(why)
+	)
+	check(test_park_finish() == 77, 'the thread finished')
+	started = microseconds()
+	check(stops(3) ~= nil and number_at(0x9300) == 3, 'and a clean batch goes through')
+	print(('  batch through the system thread snapshot: %d us'):format(elapsed(started)))
+	test_deny_next_thread(false, mr.hop_slots)
+
+	check(test_park_start(parked_raw), 'a thread spins again')
+	test_fail_context(1, mr.hop_slots)
+	check(stops(5) ~= nil and number_at(0x9300) == 5, 'a thread whose context cannot be read is retried and the batch goes through')
+	test_fail_context(1000, mr.hop_slots)
+	counted[1][5] = 6
+	ok, why = p:batch(counted)
+	check(
+		ok == nil and why == 'a thread could not be checked' and number_at(0x9300) == 5,
+		'a thread that can never be checked refuses the batch: ' .. tostring(why)
+	)
+	test_fail_context(0, mr.hop_slots)
+	check(test_park_finish() == 77, 'the thread finished')
+elseif SCENARIO == 'sites' then
+	local logged = {}
+	ModLog = function(message)
+		logged[#logged + 1] = message
+		print('  log: ' .. message)
+	end
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local MIXED = 'double(int64, double, float, int32, int8, double)'
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local function contains(text, part)
+		return type(text) == 'string' and string.find(text, part, 1, true) ~= nil
+	end
+	local cell = mr.alloc(8)
+	local function raw(pointer)
+		mr.write(cell, 0, pointer)
+		return mr.read(cell, 0, 8)
+	end
+	local function hex_of(at, size)
+		local bytes, parts = mr.read(at, 0, size), {}
+		for i = 1, size do
+			parts[i] = string.format('%02X', bytes:byte(i))
+		end
+		return table.concat(parts, ' ')
+	end
+	local function unique(pattern)
+		local _, count = mr.find_pattern(pattern)
+		return count == 1
+	end
+	local function page_of(at)
+		return math.floor(tonumber(mr.tostring(at):sub(-8), 16) / 4096)
+	end
+	local function rows(owner)
+		local found = {}
+		for _, row in ipairs(mr.patch_list(owner)) do
+			found[row.name] = row
+		end
+		return found
+	end
+	local lines = {}
+	local function log(line)
+		lines[#lines + 1] = line
+	end
+	local function said(part)
+		for _, line in ipairs(lines) do
+			if contains(line, part) then return true end
+		end
+		return false
+	end
+	local function pick(names, size, avoid)
+		for _, name in ipairs(names) do
+			local at = address(name)
+			if unique(hex_of(at, size)) and page_of(at) ~= avoid then return name, at end
+		end
+	end
+	local function flipped(at, offset, size)
+		local first = string.format('%02X', mr.read(at, offset, 1):byte() % 255 + 1)
+		return size > 1 and first .. ' ' .. hex_of(mr.add(at, offset + 1), size - 1) or first
+	end
+
+	for _, line in ipairs(logged) do
+		check(not contains(line, 'sites module'), 'the loader logged no failure to load the sites module')
+	end
+	check(type(mr.patcher) == 'function' and _G.memreader.patcher == mr.patcher, 'the loader leaves one patcher function')
+	local p, q = mr.patcher('sites_mod'), mr.patcher('sites_other')
+	check(type(p.sites) == 'function' and p:owner() == 'sites_mod', 'a handle has sites, and still names its owner')
+	check(q.sites == p.sites, 'one sites method serves every handle')
+	local nothing, problem = mr.patcher('two words')
+	check(nothing == nil and problem ~= nil, 'a bad owner is refused as before: ' .. tostring(problem))
+	local empty = p:sites({}, log)
+	check(
+		empty.report() == '' and empty.feature_ok('anything') == false and empty.found('anything') == false,
+		'an empty table gives an object with the whole API'
+	)
+	local missing_api = {}
+	for name in ('found why feature_ok address value install install_feature set remove disable cave_value log_missing report'):gmatch('%S+') do
+		if type(empty[name]) ~= 'function' then missing_api[#missing_api + 1] = name end
+	end
+	check(#missing_api == 0 and empty.heal == nil, 'the API is the old one without heal: ' .. table.concat(missing_api, ' '))
+	local bad = p:sites({ 5, { name = 'x' }, { name = 'ok', feature = 'f', kind = 'anchor', pattern = 'zz' } }, log)
+	bad.log_missing()
+	check(
+		bad.report() == 'entry 1=missing,x=missing,ok=missing'
+			and said('ok not found (bad entry: bad pattern): f off')
+			and said('x not found (bad entry: no feature)'),
+		'bad entries switch themselves off with a log line'
+	)
+	check(p:sites(nil, log).report() == '', 'no table at all is an empty table')
+
+	local prologue = address('prologue_target')
+	local cave_at = address('cave_target')
+	local patch_name, patch_at = pick({ 'leaf_add_one', 'site_single', 'leaf_add_floats' }, 32, page_of(cave_at))
+	local value_name, value_at, value_offset = nil, nil, 0
+	for _, name in ipairs({
+		'all_bits',
+		'is_positive',
+		'multiply_floats',
+		'add_integers',
+		'mix',
+		'eight_digits',
+		'sixteen',
+		'divide',
+		'recurse',
+		'callback',
+		'store',
+	}) do
+		local at = address(name)
+		for offset = 4, 24 do
+			if not value_name and unique(hex_of(at, 32)) and math.abs(mr.read_int32(at, offset)) < 100000 then
+				value_name, value_at, value_offset = name, at, offset
+			end
+		end
+	end
+	local reloc_name, reloc_at = pick({ 'hook_store' }, 32, nil)
+	local mixed, here, xmm = address('hook_mixed'), address('site_single_here'), address('frame_xmm_target')
+	local park_frame, park_grow, left_at = address('park_frame'), address('park_grow'), address('hook_target')
+	check(
+		patch_name and value_name and reloc_name,
+		'unused host functions with unique code serve as targets: ' .. tostring(patch_name) .. ' ' .. tostring(value_name) .. ' ' .. tostring(reloc_name)
+	)
+	check(
+		unique(hex_of(prologue, 32)) and unique(hex_of(cave_at, 24)) and unique(hex_of(mixed, 40)) and unique(hex_of(here, 24)) and unique(hex_of(xmm, 24)),
+		'and so do the function the code runs and the cave, link, site and frame targets'
+	)
+
+	local first_number = mr.read_int32(value_at, value_offset)
+	local entries = {
+		{ name = 'ptch', feature = 'f_patch', kind = 'patch', pattern = hex_of(prologue, 32), at = 5, expect = '01 00 00 00', bytes = '02 00 00 00' },
+		{
+			name = 'pair_patch',
+			feature = 'f_pair',
+			kind = 'patch',
+			pattern = hex_of(patch_at, 32),
+			at = 12,
+			expect = hex_of(mr.add(patch_at, 12), 1),
+			bytes = flipped(patch_at, 12, 1),
+		},
+		{ name = 'pair_cave', feature = 'f_pair', kind = 'cave', pattern = hex_of(cave_at, 24), at = 0, expect = hex_of(cave_at, 5), bytes = '90 {extra:1}' },
+		{
+			name = 'cap',
+			feature = 'f_cap',
+			kind = 'value',
+			pattern = hex_of(value_at, 32),
+			at = value_offset,
+			before = 2,
+			expect = hex_of(mr.add(value_at, value_offset - 2), 2),
+			size = 4,
+			low = first_number - 1000,
+			high = first_number + 1000,
+		},
+		{ name = 'twin_frame', feature = 'f_planner', kind = 'frame', pattern = hex_of(xmm, 24), at = 0, grow = 0x360 },
+		{
+			name = 'target_sites',
+			feature = 'f_planner',
+			kind = 'relocate',
+			pattern = hex_of(reloc_at, 32),
+			sites = {
+				{ at = 8, expect = hex_of(mr.add(reloc_at, 8), 4), bytes = flipped(reloc_at, 8, 4) },
+				{ at = 16, expect = hex_of(mr.add(reloc_at, 16), 4), bytes = flipped(reloc_at, 16, 4) },
+			},
+		},
+		{
+			name = 'link_pre',
+			feature = 'f_links',
+			kind = 'prefix',
+			pattern = hex_of(mixed, 40),
+			at = 0,
+			expect = hex_of(mixed, 6),
+			signature = MIXED,
+			priority = 10,
+		},
+		{ name = 'link_post', feature = 'f_links', kind = 'postfix', pattern = hex_of(mixed, 40), at = 0, expect = hex_of(mixed, 6), signature = MIXED },
+		{
+			name = 'link_around',
+			feature = 'f_links',
+			kind = 'around',
+			pattern = hex_of(mixed, 40),
+			at = 0,
+			expect = hex_of(mixed, 6),
+			signature = MIXED,
+			priority = 5,
+		},
+		{ name = 'link_hook', feature = 'f_links', kind = 'hook', pattern = hex_of(mixed, 40), at = 0, expect = hex_of(mixed, 6), signature = MIXED },
+		{
+			name = 'late_sites',
+			feature = 'f_late',
+			kind = 'relocate',
+			pattern = hex_of(reloc_at, 32),
+			sites = { { at = 24, expect = hex_of(mr.add(reloc_at, 24), 4), bytes = flipped(reloc_at, 24, 4) } },
+		},
+		{
+			name = 'busy_reloc',
+			feature = 'f_busy',
+			kind = 'relocate',
+			pattern = hex_of(park_frame, 24),
+			sites = { { at = 2, expect = '01 00 00 00', bytes = '02 00 00 00' } },
+		},
+		{ name = 'busy_frame', feature = 'f_busy_frame', kind = 'frame', pattern = hex_of(park_grow, 24), at = 0, grow = 0x100 },
+		{ name = 'left_cave', feature = 'f_left_busy', kind = 'cave', pattern = hex_of(left_at, 24), at = 0, expect = hex_of(left_at, 5), bytes = '90' },
+		{ name = 'left_frame', feature = 'f_left_busy', kind = 'frame', pattern = hex_of(park_grow, 24), at = 0, grow = 0x200 },
+		{
+			name = 'put_a',
+			feature = 'f_put',
+			kind = 'patch',
+			pattern = hex_of(patch_at, 32),
+			at = 16,
+			expect = hex_of(mr.add(patch_at, 16), 1),
+			bytes = flipped(patch_at, 16, 1),
+		},
+		{
+			name = 'put_b',
+			feature = 'f_put',
+			kind = 'patch',
+			pattern = hex_of(patch_at, 32),
+			at = 18,
+			expect = hex_of(mr.add(patch_at, 18), 1),
+			bytes = flipped(patch_at, 18, 1),
+		},
+		{ name = 'site_one', feature = 'f_site', kind = 'site', pattern = hex_of(here, 24), at = 0, expect = hex_of(here, 5) },
+	}
+
+	local native = p:sites(entries, log)
+	for _, entry in ipairs(entries) do
+		check(native.found(entry.name), entry.name .. ' is found: ' .. tostring(native.why(entry.name)))
+	end
+	check(native.feature_ok('f_pair') and native.feature_ok('f_links') and not native.feature_ok('f_nothing'), 'features are ok when every entry is found')
+	check(mr.eq(native.address('ptch'), mr.add(prologue, 5)), 'an address is match plus at')
+
+	local WRONG = '\255\255\255\255'
+	local ok, why = p:batch({ { 'patch', 'pin_a', mr.add(prologue, 5), WRONG, WRONG } })
+	check(ok == nil and why == 'pin_a: unexpected bytes', 'a batch refusal reads <name>: <reason>, which the installer parses: ' .. tostring(why))
+	ok, why = p:batch({ { 'patch', 'pin_a', mr.add(prologue, 5), '\1\0\0\0', '\2\0\0\0' }, { 'patch', 'pin_b', mr.add(prologue, 6), WRONG, WRONG } })
+	check(ok == nil and why == 'pin_b: unexpected bytes', 'and names the failing step in a longer batch: ' .. tostring(why))
+	check(#mr.patch_list('sites_mod') == 0 and mr.read_int32(prologue, 5) == 1, 'and writes and registers nothing')
+
+	check(native.install('ptch') == true, 'a patch entry installs')
+	check(mr.tonumber(mr.call(prologue, 'int32()')) == 2, 'the code runs the new bytes')
+	local listed = rows('sites_mod')
+	check(
+		listed.ptch and listed.ptch.kind == 'patch' and listed.ptch.owner == 'sites_mod' and listed.ptch.state == 'ours',
+		'and is listed under its name, owner and kind'
+	)
+	check(native.report():find('ptch=ours', 1, true) ~= nil, 'the report says ours')
+	check(native.install('ptch') == true and #mr.patch_list('sites_mod') == 1, 'installing again changes nothing')
+	check(native.remove('ptch') == true and mr.tonumber(mr.call(prologue, 'int32()')) == 1, 'remove puts the old bytes back')
+	check(native.install('ptch') == true, 'and the patch can be made again')
+
+	local patched_old = mr.read(patch_at, 12, 1)
+	q:patch('theirs', mr.add(patch_at, 12), patched_old, patched_old)
+	local refuser = p:sites(entries, log)
+	ok, why = refuser.install_feature('f_pair', { pair_cave = { extra = 144 } })
+	check(ok == false and mr.hook_info(cave_at) == nil, 'a batch that Plus refuses while checking writes nothing, not even the cave: ' .. tostring(why))
+	check(
+		contains(refuser.why('pair_patch'), 'held by sites_other/theirs') and not refuser.feature_ok('f_pair'),
+		'the failing entry is named and the feature is off: ' .. tostring(refuser.why('pair_patch'))
+	)
+	check(rows('sites_mod').pair_cave == nil and rows('sites_mod').pair_patch == nil, 'and no row exists for either')
+	check(not said('left in place'), 'a refusal leaves nothing to report')
+	check(q:remove('theirs') == true, 'the other owner lets go')
+
+	local failing = p:sites(entries, log)
+	test_fail_protect(raw(mr.add(patch_at, 12)), 1, mr.hop_slots)
+	ok, why = failing.install_feature('f_pair', { pair_cave = { extra = 144 } })
+	check(ok == false and not failing.feature_ok('f_pair'), 'a write that fails after the cave was made turns the feature off: ' .. tostring(why))
+	check(mr.read(patch_at, 12, 1) == patched_old, 'and the patch is not written')
+	check(
+		mr.hook_info(cave_at) and mr.hook_info(cave_at).kind == 'cave' and rows('sites_mod').pair_cave and rows('sites_mod').pair_cave.state == 'stays',
+		'the cave stays, owned and named'
+	)
+	check(said('left in place: pair_cave'), 'one line says what was left in place')
+	check(
+		failing.report():find('pair_patch=missing', 1, true) ~= nil and failing.report():find('pair_cave=ours', 1, true) ~= nil,
+		'the report says missing and ours: ' .. failing.report()
+	)
+	local before_retry, line_count = #mr.patch_list('sites_mod'), #lines
+	check(
+		failing.install_feature('f_pair', { pair_cave = { extra = 144 } }) == false and #mr.patch_list('sites_mod') == before_retry,
+		'the failed feature is not tried again'
+	)
+	check(mr.read(patch_at, 12, 1) == patched_old and #lines == line_count, 'and nothing is written or said by the retry')
+
+	local again = p:sites(entries, log)
+	check(
+		again.found('pair_cave') and again.install_feature('f_pair', { pair_cave = { extra = 144 } }) == true,
+		'a later object takes the left cave as its own and finishes the feature'
+	)
+	check(mr.read(patch_at, 12, 1) ~= patched_old and rows('sites_mod').pair_patch.state == 'ours', 'the patch goes in')
+	check(again.cave_value('pair_cave', 'extra') == 144, 'cave_value reads the argument back')
+
+	check(again.install_feature('f_planner') == true, 'a frame and a relocation install as one batch')
+	listed = rows('sites_mod')
+	check(
+		listed.twin_frame
+			and listed.twin_frame.kind == 'frame'
+			and listed.target_sites
+			and listed.target_sites.kind == 'relocate'
+			and listed.target_sites.state == 'stays',
+		'both are listed under their kinds'
+	)
+	check(
+		mr.read(reloc_at, 8, 4) ~= mr.read_original(reloc_at, 8, 4) and mr.read(reloc_at, 16, 4) ~= mr.read_original(reloc_at, 16, 4),
+		'the relocation bytes are written'
+	)
+	check(
+		again.remove('twin_frame') == false and select(2, again.remove('target_sites')) == 'stays for the session',
+		'frames and relocations stay for the session'
+	)
+
+	local function number()
+		return mr.read_int32(value_at, value_offset)
+	end
+	check(again.set('cap', first_number + 10) == true and number() == first_number + 10, 'a value entry writes its number')
+	check(again.set('cap', first_number + 20) == true and number() == first_number + 20, 'and takes another')
+	check(again.set('cap', first_number + 100000) == false and number() == first_number + 20, 'a number outside low and high is refused')
+	check(rows('sites_mod').cap and rows('sites_mod').cap.kind == 'value' and rows('sites_mod').cap.state == 'ours', 'the value is listed')
+	check(again.remove('cap') == true and number() == first_number, 'remove puts the old number back')
+
+	local trace = {}
+	local inside, late = nil, nil
+	local callbacks = {
+		link_pre = function(call)
+			trace[#trace + 1] = 'pre'
+			call:set(6, 10)
+			call:set(3, 4)
+			inside = { again.install('site_one', function() end) }
+			late = { again.install_feature('f_late') }
+		end,
+		link_around = function(game, ...)
+			trace[#trace + 1] = 'around<'
+			local result = game(...)
+			trace[#trace + 1] = 'around>'
+			return result
+		end,
+		link_hook = function(game, ...)
+			trace[#trace + 1] = 'hook<'
+			local result = game(...)
+			trace[#trace + 1] = 'hook>'
+			return result
+		end,
+		link_post = function()
+			trace[#trace + 1] = 'post'
+		end,
+	}
+	check(again.install_feature('f_links', callbacks) == true, 'five link kinds install as one feature')
+	check(mr.call(mixed, MIXED, 1, 2, 3, 4, -5, 6) == 124360, 'the function answers through the links')
+	check(table.concat(trace, ' ') == 'pre around< hook< hook> around> post', 'links run by priority, then registration: ' .. table.concat(trace, ' '))
+	check(
+		inside ~= nil and inside[1] == false and inside[2] == 'not from inside a hooked call',
+		'an install from inside a hooked call is refused: ' .. tostring(inside and inside[2])
+	)
+	check(again.found('site_one') and again.report():find('site_one=vanilla', 1, true) ~= nil, 'and the entry is not marked by it')
+	check(
+		late ~= nil and late[1] == false and late[2] == 'not from inside a hooked call',
+		'a relocation install from inside a hooked call is refused too: ' .. tostring(late and late[2])
+	)
+	check(again.found('late_sites') and again.report():find('late_sites=vanilla', 1, true) ~= nil, 'and its entry is not marked missing by it')
+	listed = rows('sites_mod')
+	check(
+		listed.link_pre
+			and listed.link_pre.kind == 'prefix'
+			and listed.link_post.kind == 'postfix'
+			and listed.link_around.kind == 'around'
+			and listed.link_hook.kind == 'around',
+		'links are listed under their kinds, hook as around'
+	)
+	check(again.install_feature('f_late') == true and rows('sites_mod').late_sites ~= nil, 'the same relocation installs outside a call')
+	check(again.install('site_one', function() end) == true and mr.hook_info(here) ~= nil, 'a site entry installs outside a call')
+
+	trace = {}
+	local rest = p:sites(entries, log)
+	check(rest.install_feature('f_links', callbacks) == true, 'a second object over installed links installs without error')
+	mr.call(mixed, MIXED, 1, 2, 3, 4, -5, 6)
+	check(table.concat(trace, ' ') == 'pre around< hook< hook> around> post', 'and the links do not run twice: ' .. table.concat(trace, ' '))
+	check(rest.remove('link_hook') == true and rows('sites_mod').link_hook == nil, 'remove detaches one link')
+
+	local other = p:sites(
+		{ { name = 'lone', feature = 'f_lone', kind = 'prefix', pattern = entries[7].pattern, at = 0, expect = entries[7].expect, signature = 'int32(int32)' } },
+		log
+	)
+	ok, why = other.install('lone', function() end)
+	check(ok == false and why ~= nil and other.why('lone') == why, 'a link with another signature is refused and the entry is off: ' .. tostring(why))
+	other.log_missing()
+	check(said('lone not found'), 'and logged once')
+	check(not said('heal'), 'nothing mentions heal any more')
+
+	local put = p:sites(entries, log)
+	local put_old = mr.read(patch_at, 16, 1)
+	test_fail_protect(raw(mr.add(patch_at, 16)), 2, mr.hop_slots, 1)
+	ok, why = put.install_feature('f_put')
+	check(
+		ok == false and contains(why, 'put_b: failed to patch memory, and 1 write could not be put back'),
+		'a write that cannot be put back fails the feature: ' .. tostring(why)
+	)
+	check(
+		mr.read(patch_at, 16, 1) ~= put_old and rows('sites_mod').put_a and rows('sites_mod').put_a.state == 'stays',
+		'the first write stays in the code and Plus lists it'
+	)
+	check(
+		put.report():find('put_a=missing', 1, true) ~= nil and put.report():find('put_b=missing', 1, true) ~= nil,
+		'and the report names both entries missing, not vanilla: ' .. put.report()
+	)
+
+	local busy = p:sites(entries, log)
+	local park_before = mr.read(park_frame, 2, 4)
+	check(test_park_start(test_function('park_frame')), 'a thread spins in park_frame, outside the bytes of a relocation')
+	ok, why = busy.install_feature('f_busy')
+	check(ok == false and why == 'a thread is inside sites_mod/busy_reloc', 'a parked thread refuses the feature batch: ' .. tostring(why))
+	check(busy.found('busy_reloc') and busy.feature_ok('f_busy') and busy.why('busy_reloc') == nil, 'the entry stays found, with no reason')
+	check(busy.report():find('busy_reloc=vanilla', 1, true) ~= nil, 'and the report says vanilla, not missing')
+	busy.log_missing()
+	check(
+		not said('busy_reloc not found') and mr.read(park_frame, 2, 4) == park_before and rows('sites_mod').busy_reloc == nil,
+		'nothing is logged as missing, written or registered'
+	)
+	test_park_leave_on_retry(mr.hop_slots)
+	check(busy.install_feature('f_busy') == true and test_park_left(), 'the same install succeeds once the thread leaves')
+	check(
+		test_park_finish() == 78 and mr.read(park_frame, 2, 4) == '\2\0\0\0' and rows('sites_mod').busy_reloc.state == 'stays',
+		'the relocation is written and owned'
+	)
+
+	check(test_park_start(test_function('park_grow')), 'a thread spins in park_grow, a function with a frame')
+	ok, why = busy.install_feature('f_busy_frame')
+	check(ok == false and why == 'a thread is inside the function', 'a parked thread refuses a lone frame step too: ' .. tostring(why))
+	check(
+		busy.found('busy_frame') and busy.feature_ok('f_busy_frame') and busy.report():find('busy_frame=vanilla', 1, true) ~= nil,
+		'and the frame entry stays found'
+	)
+	ok, why = busy.install_feature('f_left_busy')
+	check(
+		ok == false and why == 'left_frame: a thread is inside the function',
+		'a feature with a cave and a frame is refused in the frame step: ' .. tostring(why)
+	)
+	check(said('left in place: left_cave') and mr.hook_info(left_at) and mr.hook_info(left_at).kind == 'cave', 'the cave it made stays and is logged')
+	check(not busy.found('left_frame') and not busy.feature_ok('f_left_busy'), 'a feature with a cave left behind keeps the rule: it is off')
+	check(busy.install_feature('f_left_busy') == false, 'and it is not tried again')
+	test_park_leave_on_retry(mr.hop_slots)
+	check(busy.install_feature('f_busy_frame') == true and test_park_left(), 'the lone frame installs once the thread leaves')
+	check(test_park_finish() == 79 and rows('sites_mod').busy_frame.state == 'stays', 'and is owned')
+
+	assert(loadfile(ROOT .. '/tests/mp_agree_mock.lua'))()
+	check(type(memreader_plus_agree) == 'function' and mr.agree == memreader_plus_agree, 'the loader exposes the agreement function on both names')
+	H.configure({ mp = true, me = 'fac_a', cqi = 1, humans = { 'fac_a' }, names = { 'fac_a' }, host = false, synced = true, values = {} })
+	local agree_owner = mr.patcher('agree_mod')
+	local agree_entry = {
+		name = 'cap',
+		feature = 'caps',
+		kind = 'value',
+		pattern = hex_of(value_at, 32),
+		at = value_offset,
+		before = 2,
+		expect = hex_of(mr.add(value_at, value_offset - 2), 2),
+		size = 4,
+		low = first_number - 1000,
+		high = first_number + 1000,
+	}
+	local earlier = agree_owner:sites({ agree_entry }, log)
+	check(earlier.set('cap', first_number + 7) == true and number() == first_number + 7, 'an earlier campaign wrote a value')
+	local agreed = agree_owner:sites({ agree_entry }, log)
+	local spec = { sites = agreed, features = { caps = 'same' }, options = { limit = 5 }, format = 1, title = 'Agree Mod', apply = H.apply_for('agree_mod') }
+	check(memreader_plus_agree('agree_mod', spec) == true, 'agree takes a spec over the real sites object')
+	check(number() == first_number and rows('agree_mod').cap == nil, 'the leftover of the earlier campaign is removed before the report')
+	local refused, refusal = agreed.set('cap', first_number + 5)
+	check(refused == false and refusal == 'waiting for the multiplayer agreement' and number() == first_number, 'a write before the agreement is refused')
+	check(agreed.found('cap') and agreed.why('cap') == nil, 'and the entry stays found')
+	local report = H.take_out()
+	check(#report == 1 and #report[1][2] <= 255, 'one report message of at most 255 characters')
+	H.deliver(report[1][1], report[1][2], 1)
+	check(#H.applies == 1 and H.applies[1].on.caps == true and H.applies[1].values.limit == 5, 'the report completes the round and apply runs')
+	check(agreed.set('cap', first_number + 5) == true and number() == first_number + 5, 'a write after the agreement goes through')
+	check(agreed.ready('caps') == true and agreed.ready('caps', true) == true, 'ready sees an installed value')
+	check(agreed.remove_feature('caps') == true and number() == first_number, 'remove_feature puts the held number back')
+	check(agreed.found('cap') and rows('agree_mod').cap == nil, 'and the entry stays found')
+	local ran = 0
+	local function original_hex(at, size)
+		local bytes, parts = mr.read_original(at, 0, size), {}
+		for i = 1, size do
+			parts[i] = string.format('%02X', bytes:byte(i))
+		end
+		return table.concat(parts, ' ')
+	end
+	local inert_sites = mr.patcher('inert_mod'):sites({
+		{ name = 'inert_pre', feature = 'lk', kind = 'prefix', pattern = original_hex(mixed, 40), at = 0, expect = original_hex(mixed, 6), signature = MIXED },
+		{
+			name = 'inert_around',
+			feature = 'lk',
+			kind = 'around',
+			pattern = original_hex(mixed, 40),
+			at = 0,
+			expect = original_hex(mixed, 6),
+			signature = MIXED,
+		},
+	}, log)
+	local function attach_links()
+		local callbacks = {
+			inert_pre = function()
+				ran = ran + 1
+			end,
+			inert_around = function(game, ...)
+				ran = ran + 100
+				return game(...)
+			end,
+		}
+		local attached, reason = inert_sites.install_feature('lk', callbacks)
+		check(attached == true, 'prepare attaches the links of a shared feature: ' .. tostring(reason))
+	end
+	local inert_spec = {
+		sites = inert_sites,
+		features = { lk = 'same' },
+		options = {},
+		format = 1,
+		title = 'Inert Mod',
+		apply = H.apply_for('inert_mod'),
+		prepare = attach_links,
+	}
+	check(memreader_plus_agree('inert_mod', inert_spec) == true, 'agree runs prepare')
+	check(mr.call(mixed, MIXED, 1, 2, 3, 4, -5, 6) == 124360 and ran == 0, 'links attached by prepare are inert before the decision')
+	local inert_report = H.take_out()
+	H.deliver(inert_report[1][1], inert_report[1][2], 2)
+	check(mr.call(mixed, MIXED, 1, 2, 3, 4, -5, 6) == 124360 and ran == 101, 'and run once the feature is on')
+	H, cm, core, CampaignUI, common, UIComponent, find_uicomponent, uicomponent_descended_from, out, get_mct = nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
+
+	print('  sites: ' .. #mr.patch_list('sites_mod') .. ' rows for sites_mod, ' .. #lines .. ' installer log lines')
 elseif SCENARIO == 'bench' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus

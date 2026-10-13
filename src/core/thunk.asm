@@ -14,6 +14,7 @@ FRAME_ORIGINAL equ FRAME_FLOAT_RESULT + SLOT_SIZE
 FRAME_END equ FRAME_ORIGINAL + SLOT_SIZE
 HOOK_STACK equ FRAME_END + ALIGNMENT_PADDING
 RETURN_ADDRESS equ SLOT_SIZE
+FLOATS_ARGUMENT equ ALIGNMENT_PADDING + 4 * SLOT_SIZE + RETURN_ADDRESS + SHADOW_SPACE
 RUN_ORIGINAL equ 0
 RETURN_FLOAT_RESULT equ 2
 SITE_FLOATS equ 0
@@ -71,10 +72,11 @@ load_registers:
 	mov rdx, [rsi + SLOT_SIZE]
 	mov r8, [rsi + 2 * SLOT_SIZE]
 	mov r9, [rsi + 3 * SLOT_SIZE]
-	movq xmm0, rcx
-	movq xmm1, rdx
-	movq xmm2, r8
-	movq xmm3, r9
+	mov r10, [rbp + FLOATS_ARGUMENT]
+	movq xmm0, QWORD PTR [r10]
+	movq xmm1, QWORD PTR [r10 + SLOT_SIZE]
+	movq xmm2, QWORD PTR [r10 + 2 * SLOT_SIZE]
+	movq xmm3, QWORD PTR [r10 + 3 * SLOT_SIZE]
 	call rbx
 	movsd QWORD PTR [rdi], xmm0
 

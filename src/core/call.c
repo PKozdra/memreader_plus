@@ -8,7 +8,7 @@ static const char *const more_call_type_names[CALL_TYPE_COUNT - VALUE_TYPE_COUNT
 static const char allocations_key = 0;
 static LONG guarded_calls;
 
-UINT64 call_function(INT_PTR function, const UINT64 *arguments, UINT64 count, UINT64 *float_result);
+UINT64 call_function(INT_PTR function, const UINT64 *arguments, UINT64 count, UINT64 *float_result, const UINT64 *floats);
 
 const char *call_type_name(int type)
 {
@@ -240,15 +240,15 @@ static const char *fault_name(DWORD code)
 	}
 }
 
-static BOOL guarded_call(INT_PTR function, const UINT64 *arguments, int count, UINT64 *result, UINT64 *float_result,
-	Fault *fault)
+static BOOL guarded_call(INT_PTR function, const UINT64 *arguments, const UINT64 *floats, int count, UINT64 *result,
+	UINT64 *float_result, Fault *fault)
 {
 	BOOL done = FALSE;
 
 	begin_guarded_call();
 	__try {
 		__try {
-			*result = call_function(function, arguments, (UINT64)count, float_result);
+			*result = call_function(function, arguments, (UINT64)count, float_result, floats);
 			done = TRUE;
 		} __except (catch_call_fault(GetExceptionInformation()->ExceptionRecord, fault)) {
 			if (fault->code == STATUS_GUARD_PAGE_VIOLATION)
@@ -260,7 +260,7 @@ static BOOL guarded_call(INT_PTR function, const UINT64 *arguments, int count, U
 	return done;
 }
 
-static int call_crash_error(lua_State *L, const Fault *fault)
+int call_crash_error(lua_State *L, const Fault *fault)
 {
 	if (is_memory_fault(fault->code))
 		return luaL_error(L, "the called function crashed at %p (%s at %p); the game may be unstable now",
@@ -269,11 +269,21 @@ static int call_crash_error(lua_State *L, const Fault *fault)
 		fault_name(fault->code));
 }
 
+UINT64 call_unguarded(INT_PTR function, const CallBlock *block, UINT64 *float_result)
+{
+	return call_function(function, block->slots, CALL_BLOCK_SLOTS, float_result, block->floats);
+}
+
+BOOL call_block_guarded(INT_PTR function, const CallBlock *block, UINT64 *result, UINT64 *float_result, Fault *fault)
+{
+	return guarded_call(function, block->slots, block->floats, CALL_BLOCK_SLOTS, result, float_result, fault);
+}
+
 BOOL call_native(INT_PTR function, const UINT64 *arguments, int count, UINT64 *result, Fault *fault)
 {
 	UINT64 float_result = 0;
 
-	return guarded_call(function, arguments, count, result, &float_result, fault);
+	return guarded_call(function, arguments, arguments, count, result, &float_result, fault);
 }
 
 UINT64 call_game(lua_State *L, INT_PTR function, const UINT64 *arguments, int count)
@@ -327,7 +337,7 @@ int call_with_signature(lua_State *L, INT_PTR function, const Signature *signatu
 		arguments[i] = argument_bits(L, i + first, signature->arguments[i]);
 	if (!function)
 		return luaL_argerror(L, 1, "function address is NULL");
-	if (!guarded_call(function, arguments, signature->count, &result, &float_result, &fault))
+	if (!guarded_call(function, arguments, arguments, signature->count, &result, &float_result, &fault))
 		return call_crash_error(L, &fault);
 	if (signature->result == CALL_VOID)
 		return 0;

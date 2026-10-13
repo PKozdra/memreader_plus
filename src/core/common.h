@@ -31,6 +31,49 @@ enum { SAVED_BYTES = 16, DEBUG_RECORD_SIZE = 0x400, MAX_HOOKS = 1000, JUMP_BACK_
 
 enum HookKind { KIND_FUNCTION, KIND_SITE, KIND_CAVE };
 
+enum { OWNER_SIZE = 64, ITEM_NAME_SIZE = 48, TAG_SIZE = OWNER_SIZE + ITEM_NAME_SIZE, CALLER_SIZE = 160, MAX_PATCH_SIZE = 4096, MAX_FRAME_GROWTH = 0x100000 };
+
+enum OwnerText { OWNER_NONE, OWNER_NAMED, OWNER_CALLER };
+
+enum ItemKind { ITEM_SITE, ITEM_VALUE, ITEM_CAVE, ITEM_PATCH, ITEM_FRAME, ITEM_RELOCATE, ROW_KIND_COUNT, ITEM_PREFIX = ROW_KIND_COUNT, ITEM_POSTFIX, ITEM_AROUND, ITEM_KIND_COUNT };
+
+enum { LINK_ERROR_SIZE = 256 };
+
+enum FrameResult { FRAME_OK, FRAME_BAD_AMOUNT, FRAME_OUTSIDE, FRAME_NO_FUNCTION, FRAME_REFUSED };
+
+enum FreezeResult { FREEZE_OK, FREEZE_BUSY, FREEZE_FAILED, FREEZE_UNCHECKED };
+
+enum { MAX_FRAME_SITES = 128, MAX_FUNCTION_PARTS = 32, MAX_WHOLE_RANGES = 256 };
+
+typedef struct {
+	INT_PTR at;
+	size_t size;
+	BOOL whole;
+} Range;
+
+typedef struct {
+	BYTE used;
+	BYTE kind;
+	BYTE listed;
+	BYTE owner;
+	int priority;
+	int attached;
+	INT_PTR at;
+	UINT32 calls;
+	UINT32 skips;
+	UINT32 errors;
+	BYTE unlogged;
+	char name[ITEM_NAME_SIZE];
+	char error[LINK_ERROR_SIZE];
+} Item;
+
+typedef struct {
+	INT_PTR from;
+	int size;
+	int item;
+	int hold;
+} Claim;
+
 typedef struct {
 	BYTE type;
 	union {
@@ -136,6 +179,13 @@ typedef struct {
 	int count;
 } Signature;
 
+enum { CALL_BLOCK_STACK = 16, CALL_BLOCK_SLOTS = REGISTER_ARGUMENTS + CALL_BLOCK_STACK };
+
+typedef struct {
+	UINT64 slots[CALL_BLOCK_SLOTS];
+	UINT64 floats[REGISTER_ARGUMENTS];
+} CallBlock;
+
 enum {
 	LIST_SIZE = offsetof(CaList, size),
 	LIST_END = offsetof(CaList, last),
@@ -161,6 +211,7 @@ extern const luaL_Reg hook_functions[];
 extern const luaL_Reg farhook_functions[];
 extern const luaL_Reg cave_functions[];
 extern const luaL_Reg frame_functions[];
+extern const luaL_Reg patcher_functions[];
 
 TypedValue *push_value(lua_State *L, int type, INT64 number);
 TypedValue *to_value(lua_State *L, int index);
@@ -194,6 +245,9 @@ int find_code_all(const char *pattern, const BYTE **found, int max);
 INT_PTR find_unique(const char *pattern);
 INT_PTR call_destination(INT_PTR call);
 PRUNTIME_FUNCTION primary_function_entry(PRUNTIME_FUNCTION entry, ULONG64 base);
+UINT64 call_unguarded(INT_PTR function, const CallBlock *block, UINT64 *float_result);
+BOOL call_block_guarded(INT_PTR function, const CallBlock *block, UINT64 *result, UINT64 *float_result, Fault *fault);
+int call_crash_error(lua_State *L, const Fault *fault);
 UINT64 call_game(lua_State *L, INT_PTR function, const UINT64 *arguments, int count);
 BOOL call_native(INT_PTR function, const UINT64 *arguments, int count, UINT64 *result, Fault *fault);
 BOOL write_memory(INT_PTR address, const void *source, size_t size);
@@ -205,6 +259,8 @@ BOOL in_exe_code(INT_PTR address);
 BOOL is_executable(INT_PTR address);
 BOOL in_own_module(INT_PTR address);
 BOOL in_hooked_prologue(INT_PTR address, size_t size);
+int find_pattern_count(const char *text, INT_PTR *first);
+int original_matches(INT_PTR address, const char *text);
 void note_line(const char *line);
 void note_refusal(lua_State *L, const char *what, INT_PTR address);
 void check_write(lua_State *L, int argument, const char *what, INT_PTR address, size_t size);
@@ -216,11 +272,46 @@ UINT64 argument_bits(lua_State *L, int index, int type);
 BOOL is_float_type(int type);
 void push_bits(lua_State *L, int type, UINT64 bits);
 void prepare_hooks(void);
+enum { FAR_HOOK_NO_FREEZE = 100 };
 typedef void (*FinishHook)(void *context, void *original);
 int install_far_hook(INT_PTR target, void *detour, void **original, FinishHook finish, void *context);
 void write_jump_back(BYTE *at, void *destination);
 BOOL hook_native(INT_PTR target, void *detour, const char *name, void **next);
 void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t size, FinishHook finish, void *context);
+int copied_length(INT_PTR target);
+void *cave_start(INT_PTR target);
+int l_hook_site(lua_State *L);
+int l_unhook(lua_State *L);
+enum CaveResult { CAVE_OK, CAVE_NO_MEMORY, CAVE_REFUSED };
+int try_cave(lua_State *L, INT_PTR address, const char *bytes, size_t size, BYTE **start);
+int callback_generation(void);
+void mark_callback(INT_PTR target, int item);
+int l_function_hook(lua_State *L);
+const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, int kind, int priority, int item, int function_index);
+BOOL link_is_current(lua_State *L, const Signature *signature, int item, int priority, int function_index);
+void remove_link(int item);
+void flush_link_log(lua_State *L);
+int l_flush_log(lua_State *L);
+int l_set_log(lua_State *L);
+int l_patch_info(lua_State *L);
+int check_frame(INT_PTR address, int by, INT_PTR *function, const char **why);
+int grown_amount(INT_PTR function);
+int grow_frame_by(lua_State *L, INT_PTR address, int by, const char *tag, int item, const void *entry, const char **why);
+int function_extents(INT_PTR address, Range *parts, int max);
+int check_growth(INT_PTR address, int by, Range *sites, int *count, const char **why);
+BOOL check_cave(lua_State *L, INT_PTR target);
+typedef void (*ThreadVisit)(HANDLE thread, void *context);
+typedef struct {
+	const Range *ranges;
+	int count;
+	ThreadVisit visit;
+	void *context;
+	const void *entry;
+} FreezeJob;
+int freeze_threads(const FreezeJob *job, int *busy);
+void thaw_threads(void);
+const char *freeze_text(int result);
+UINT64 freeze_microseconds(void);
 BOOL prepare_site_stubs(void);
 void *site_stub(int index);
 void finish_site(void *context, void *original);
@@ -231,10 +322,41 @@ void push_registers(lua_State *L);
 SiteFrame *swap_active_site(SiteFrame *frame);
 void site_entry(void);
 extern BYTE site_avx;
+void caller_position(lua_State *L, char *where, size_t size);
 void note_change(lua_State *L, const char *what, INT_PTR address, size_t size);
+void note_owned_change(lua_State *L, const char *what, INT_PTR address, size_t size, const char *tag);
 void add_changes(Text *report);
 BOOL describe_hook_code(ULONG_PTR address, char *out, size_t size);
 void add_hooks(Text *report, lua_State *live);
+void add_running_links(Text *report);
+int find_owner(const char *name);
+int add_owner(const char *name);
+const char *owner_name(int owner);
+int find_item(int owner, const char *name);
+int add_item(int owner, const char *name, int kind, INT_PTR at);
+Item *item_at(int index);
+int item_total(void);
+void remove_item(int index);
+void make_tag(char *out, size_t size, int owner, const char *name);
+BOOL claim_room(int claims, size_t bytes);
+BOOL registry_room(int claims, size_t bytes);
+BOOL item_room(int needed);
+BOOL add_claim(int item, INT_PTR from, size_t size, const BYTE *held, const BYTE *wrote);
+BOOL claim_holder(INT_PTR from, size_t size, int except, char *holder, size_t holder_size);
+BOOL frame_holder(INT_PTR function, int except, char *holder, size_t holder_size);
+Claim *claim_at(int index);
+int claim_total(void);
+int first_claim(int item);
+int count_claims(int item);
+BYTE *held_bytes(const Claim *claim);
+BYTE *wrote_bytes(const Claim *claim);
+const char *item_state(int index);
+BOOL is_link_kind(int kind);
+const char *item_kind_name(int kind);
+int shown_kind(const Item *item);
+void note_anonymous_cave(lua_State *L, INT_PTR address);
+int describe_owner(INT_PTR address, char *out, size_t size);
+void add_owners(Text *report);
 void prepare_native_report(void);
 void load_modules(void);
 void set_crash_stack(ULONG_PTR rsp);

@@ -2,8 +2,18 @@ local mod_log = ...
 
 if _G.memreader_plus then return _G.memreader_plus end
 
+local entry_info = debug.getinfo(2, 'f')
+local entry_env = entry_info and entry_info.func and getfenv(entry_info.func) or nil
+
 local function log(message)
 	if type(mod_log) == 'function' then mod_log('[memreader_plus] ' .. message) end
+end
+
+local function load_agree()
+	local chunk = assert(loadfile('/script/memreader_plus/agree'))
+	local agree, internals = chunk()
+	_G.memreader_plus_agree = agree
+	return internals
 end
 
 local function load_dll()
@@ -27,12 +37,27 @@ local function load_dll()
 	return result
 end
 
+local function install_locale_guard()
+	local chunk = assert(loadfile('/script/memreader_plus/locale_guard'))
+	return chunk().install(entry_env and entry_env.cm or nil)
+end
+
+local guard_ok, guard_problem = pcall(install_locale_guard)
+if not guard_ok then log('number format guard not installed: ' .. tostring(guard_problem)) end
+
+local agree_ok, agree_internals = pcall(load_agree)
+if not agree_ok then log('agreement module not loaded: ' .. tostring(agree_internals)) end
+if agree_ok then pcall(agree_internals.listen, entry_env) end
+
 local memreader, load_error = load_dll()
 if not memreader then
 	_G.memreader_plus_load_error = load_error
 	log('not loaded: ' .. load_error)
+	if agree_ok then pcall(agree_internals.warn_blocked, entry_env) end
 	return nil
 end
+
+if type(mod_log) == 'function' then memreader.set_log(mod_log) end
 
 local function field(spec, key)
 	return type(spec) == 'table' and tostring(spec[key]) or '?'
@@ -82,6 +107,11 @@ local function load_twui(plus)
 	plus.twui = chunk(plus)
 end
 
+local function load_sites(plus, agree)
+	local chunk = assert(loadfile('/script/memreader_plus/sites'))
+	chunk(plus, agree).attach()
+end
+
 local function register_spec(plus, owner, spec)
 	if type(spec) ~= 'table' then error('the entry is not a table', 0) end
 	spec.owner = owner
@@ -118,6 +148,8 @@ end
 
 local twui_ok, twui_problem = pcall(load_twui, memreader)
 if not twui_ok then log('TWUI module not loaded: ' .. tostring(twui_problem)) end
+local sites_ok, sites_problem = pcall(load_sites, memreader, agree_ok and agree_internals or nil)
+if not sites_ok then log('sites module not loaded: ' .. tostring(sites_problem)) end
 log_file_edit_notes(memreader)
 local edits_ok, edits_problem = pcall(function()
 	load_file_edit_specs(memreader, '/script/memreader_plus/file_edits/')
@@ -129,6 +161,7 @@ package.loaded['twwh3-memreader'] = memreader
 package.loaded['twwh2-memreader'] = memreader
 _G.memreader = memreader
 _G.memreader_plus = memreader
+memreader.agree = _G.memreader_plus_agree
 
 if replaced then
 	log('loaded ' .. memreader.plus_version .. ', replaced another memreader in _G.memreader')

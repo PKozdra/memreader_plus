@@ -3,7 +3,7 @@
 
 #include "common.h"
 
-enum { MAX_LOGGED = 32, WHERE_SIZE = 160, LINE_SIZE = 320, MAX_CALLER_LEVELS = 8 };
+enum { MAX_LOGGED = 32, LINE_SIZE = 320, MAX_CALLER_LEVELS = 8 };
 
 enum { MAX_WRITES = 24, MAX_PATCHES = 32, WHAT_SIZE = 24 };
 
@@ -15,20 +15,28 @@ static const char log_name[] = "memreader_plus_refused.txt";
 typedef struct {
 	INT_PTR low;
 	INT_PTR high;
+	INT_PTR end;
 	size_t size;
+	BOOL spread;
 	UINT32 count;
 	ULONGLONG tick;
 	char what[WHAT_SIZE];
-	char where[WHERE_SIZE];
+	char where[CALLER_SIZE];
+	char tag[TAG_SIZE];
 } Change;
 
 static char logged[MAX_LOGGED][LINE_SIZE];
 static int logged_count;
 static Change writes[MAX_WRITES];
 static int write_next;
-static Change patches[MAX_PATCHES];
-static int patch_count;
-static UINT32 patches_not_listed;
+typedef struct {
+	Change rows[MAX_PATCHES];
+	int count;
+	UINT32 not_listed;
+} PatchTable;
+
+static PatchTable raw_patches;
+static PatchTable owned_patches;
 
 BOOL is_executable(INT_PTR address)
 {
@@ -69,7 +77,7 @@ static const char *function_name(lua_State *L, const char *what)
 	return "a Plus function";
 }
 
-static void caller_position(lua_State *L, char *where, size_t size)
+void caller_position(lua_State *L, char *where, size_t size)
 {
 	DebugRecord frame;
 	int level;
@@ -133,7 +141,7 @@ void note_line(const char *line)
 
 void note_refusal(lua_State *L, const char *what, INT_PTR address)
 {
-	char where[WHERE_SIZE], line[LINE_SIZE];
+	char where[CALLER_SIZE], line[LINE_SIZE];
 	char *at;
 
 	if (logged_count == MAX_LOGGED)
@@ -147,21 +155,30 @@ void note_refusal(lua_State *L, const char *what, INT_PTR address)
 	note_line(line);
 }
 
-static void start_change(Change *change, const char *what, const char *where, INT_PTR address, size_t size)
+static void start_change(Change *change, const char *what, const char *where, const char *tag, INT_PTR address, size_t size)
 {
 	strncpy_s(change->what, sizeof change->what, what, _TRUNCATE);
 	strncpy_s(change->where, sizeof change->where, where, _TRUNCATE);
+	strncpy_s(change->tag, sizeof change->tag, tag, _TRUNCATE);
 	change->low = address;
 	change->high = address;
+	change->end = address + (INT_PTR)size;
 	change->size = size;
+	change->spread = FALSE;
 	change->count = 1;
 	change->tick = GetTickCount64();
 }
 
 static void repeat_change(Change *change, INT_PTR address, size_t size)
 {
+	INT_PTR end = address + (INT_PTR)size;
+
 	if (size != change->size)
 		change->size = 0;
+	if (address > change->end || end < change->low)
+		change->spread = TRUE;
+	if (end > change->end)
+		change->end = end;
 	if (address < change->low)
 		change->low = address;
 	if (address > change->high)
@@ -170,51 +187,57 @@ static void repeat_change(Change *change, INT_PTR address, size_t size)
 	change->tick = GetTickCount64();
 }
 
-static BOOL same_caller(const Change *change, const char *what, const char *where)
+static BOOL same_caller(const Change *change, const char *what, const char *where, const char *tag)
 {
-	return change->count && strcmp(change->what, what) == 0 && strcmp(change->where, where) == 0;
+	return change->count && strcmp(change->what, what) == 0 && strcmp(change->where, where) == 0 && strcmp(change->tag, tag) == 0;
 }
 
-static void note_patch(const char *what, const char *where, INT_PTR address, size_t size)
+static void note_patch(const char *what, const char *where, const char *tag, INT_PTR address, size_t size)
 {
-	Change *last = &patches[MAX_PATCHES - 1];
+	PatchTable *table = tag[0] ? &owned_patches : &raw_patches;
+	Change *last = &table->rows[MAX_PATCHES - 1];
 	int i;
 
-	for (i = 0; i < patch_count; i++) {
-		if (same_caller(&patches[i], what, where)) {
-			repeat_change(&patches[i], address, size);
+	for (i = 0; i < table->count; i++) {
+		if (same_caller(&table->rows[i], what, where, tag)) {
+			repeat_change(&table->rows[i], address, size);
 			return;
 		}
 	}
-	if (patch_count < MAX_PATCHES) {
-		start_change(&patches[patch_count++], what, where, address, size);
+	if (table->count < MAX_PATCHES) {
+		start_change(&table->rows[table->count++], what, where, tag, address, size);
 		return;
 	}
-	patches_not_listed += last->count;
-	start_change(last, what, where, address, size);
+	table->not_listed += last->count;
+	start_change(last, what, where, tag, address, size);
 }
 
-static void note_write(const char *what, const char *where, INT_PTR address, size_t size)
+static void note_write(const char *what, const char *where, const char *tag, INT_PTR address, size_t size)
 {
 	Change *last = &writes[(write_next + MAX_WRITES - 1) % MAX_WRITES];
 
-	if (same_caller(last, what, where)) {
+	if (same_caller(last, what, where, tag)) {
 		repeat_change(last, address, size);
 		return;
 	}
-	start_change(&writes[write_next], what, where, address, size);
+	start_change(&writes[write_next], what, where, tag, address, size);
 	write_next = (write_next + 1) % MAX_WRITES;
+}
+
+void note_owned_change(lua_State *L, const char *what, INT_PTR address, size_t size, const char *tag)
+{
+	char where[CALLER_SIZE];
+
+	caller_position(L, where, sizeof where);
+	if (in_exe_code(address))
+		note_patch(what, where, tag, address, size);
+	else
+		note_write(what, where, tag, address, size);
 }
 
 void note_change(lua_State *L, const char *what, INT_PTR address, size_t size)
 {
-	char where[WHERE_SIZE];
-
-	caller_position(L, where, sizeof where);
-	if (in_exe_code(address))
-		note_patch(what, where, address, size);
-	else
-		note_write(what, where, address, size);
+	note_owned_change(L, what, address, size, "");
 }
 
 static void add_change(Text *report, const Change *change, ULONGLONG now)
@@ -224,15 +247,31 @@ static void add_change(Text *report, const Change *change, ULONGLONG now)
 	add_text(report, "  %s", change->what);
 	if (change->count > 1)
 		add_text(report, " x%u", change->count);
-	add_text(report, " at ");
+	add_text(report, change->spread ? " spread between " : " at ");
 	add_address(report, (ULONG_PTR)change->low);
 	if (change->high != change->low) {
-		add_text(report, " to ");
+		add_text(report, change->spread ? " and " : " to ");
 		add_address(report, (ULONG_PTR)change->high);
 	}
+	if (change->spread)
+		add_text(report, " (not one block)");
 	if (change->size)
 		add_text(report, ", %llu bytes", (unsigned long long)change->size);
-	add_text(report, ", from %s, last %llu.%llu s before\n", change->where, ago / 1000, ago % 1000 / 100);
+	add_text(report, ", from %s, last %llu.%llu s before", change->where, ago / 1000, ago % 1000 / 100);
+	if (change->tag[0])
+		add_text(report, ", by %s", change->tag);
+	add_text(report, "\n");
+}
+
+static void add_patch_table(Text *report, const PatchTable *table, const char *not_listed, ULONGLONG now)
+{
+	int i;
+
+	for (i = 0; i < table->count; i++) {
+		if (i == MAX_PATCHES - 1 && table->not_listed)
+			add_text(report, not_listed, table->not_listed);
+		add_change(report, &table->rows[i], now);
+	}
 }
 
 void add_changes(Text *report)
@@ -241,13 +280,10 @@ void add_changes(Text *report)
 	const Change *change;
 	int i;
 
-	if (patch_count)
+	if (raw_patches.count || owned_patches.count)
 		add_text(report, "Game code patched by mods this session:\n");
-	for (i = 0; i < patch_count; i++) {
-		if (i == MAX_PATCHES - 1 && patches_not_listed)
-			add_text(report, "  ... %u more patches not listed\n", patches_not_listed);
-		add_change(report, &patches[i], now);
-	}
+	add_patch_table(report, &raw_patches, "  ... %u more patches not listed\n", now);
+	add_patch_table(report, &owned_patches, "  ... %u more owned patches not listed\n", now);
 	if (writes[(write_next + MAX_WRITES - 1) % MAX_WRITES].count)
 		add_text(report, "Recent memory writes by mods, newest first:\n");
 	for (i = 1; i <= MAX_WRITES; i++) {

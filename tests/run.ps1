@@ -1,3 +1,4 @@
+param([switch]$Perf, [string[]]$Only)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $hostBuild = Join-Path $root 'build\host'
@@ -8,16 +9,18 @@ $exe = Join-Path $hostBuild 'Release\Warhammer3.exe'
 $crash = -1073741819
 $reportPrefix = 'memreader_crash_report_'
 
+$Only = if ($Perf) { @('links') } else { @($Only -split ',') }
+$env:PLUS_PERF = if ($Perf) { '1' } else { '' }
 $failed = @()
 $skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
-    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; far_hook = 0; cave = 0; cave_session = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
+    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; links = 0; far_hook = 0; cave = 0; cave_session = 0; owner_report = 0; change_rows = 0; claims = 0; held_bytes = 0; batch = 0; sites = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
     file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
-    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash; fault_report_in_site = $crash
+    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash; fault_report_in_site = $crash; fault_report_in_cave = $crash; fault_report_in_link = $crash; fault_report_in_original = $crash; fault_report_in_around = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
     fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash
-    fault_report_two_threads = $crash; fault_report_worker_stuck = $crash; fault_report_worker_waits = $crash
+    fault_report_two_threads = $crash; fault_report_overlap = $crash; fault_report_worker_stuck = $crash; fault_report_worker_waits = $crash
     fault_report_worker_blocked = $crash; fault_report_worker_dead = $crash; fault_report_move_retry = $crash; fault_report_move_fails = $crash
     exit_report = 7; exit_report_terminate = 8; exit_report_crt = 9; exit_report_quiet = 0; exit_report_off = 7
     runtime_report = 0; runtime_report_reports_off = 0; runtime_report_no_folder = 0; runtime_report_write_fails = 0
@@ -25,25 +28,25 @@ $expect = [ordered]@{
     report_snapshot = 0; report_native = 0; report_lua_only = 0; report_loader = 0
 }
 $reports = @{
-    fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'; fault_report_in_site = 'started'
+    fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'; fault_report_in_site = 'started'; fault_report_in_cave = 'started'; fault_report_in_link = 'started'; fault_report_in_original = 'started'; fault_report_in_around = 'started'
     fault_report_stale = 'started'; fault_report_thread = 'started'; fault_report_native_thread = 'started'; fault_report_overflow = 'started'
     fault_report_cpp = 'started'; fault_report_fallback = 'started'; fault_report_clues = 'started'
-    fault_report_two_threads = 'started'; fault_report_worker_stuck = 'none'; fault_report_worker_waits = 'started'
+    fault_report_two_threads = 'started'; fault_report_overlap = 'started'; fault_report_worker_stuck = 'none'; fault_report_worker_waits = 'started'
     fault_report_worker_blocked = 'none'; fault_report_worker_dead = 'none'; fault_report_move_retry = 'started'; fault_report_move_fails = 'started'
     exit_report = 'started'; exit_report_terminate = 'started'; exit_report_crt = 'started'; exit_report_quiet = 'none'; exit_report_off = 'none'
     runtime_report = 'none'; runtime_report_reports_off = 'none'; runtime_report_no_folder = 'none'; runtime_report_write_fails = 'none'
-    runtime_report_then_crash = 'started'; settings_cut = 'started'; settings_none = 'started'; report_native = 'none'
+    runtime_report_then_crash = 'started'; settings_cut = 'started'; settings_none = 'started'; report_native = 'none'; owner_report = 'none'
 }
 $runtimeCounts = @{
-    runtime_report = 1; runtime_report_reports_off = 1; runtime_report_no_folder = 0; runtime_report_write_fails = 0; runtime_report_then_crash = 1; report_native = 1
+    runtime_report = 1; runtime_report_reports_off = 1; runtime_report_no_folder = 0; runtime_report_write_fails = 0; runtime_report_then_crash = 1; report_native = 1; owner_report = 2
 }
 $readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
-    fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull; fault_report_in_site = $readOfNull
+    fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull; fault_report_in_site = $readOfNull; fault_report_in_cave = $readOfNull; fault_report_in_link = $readOfNull; fault_report_in_original = $readOfNull; fault_report_in_around = $readOfNull
     fault_report_stale = $readOfNull; fault_report_thread = $readOfNull; fault_report_native_thread = $readOfNull
     fault_report_overflow = @('exception 0xc00000fd (stack overflow)'); fault_report_cpp = @('exception 0xe06d7363 (C++ exception, type .H)')
     fault_report_fallback = $readOfNull; fault_report_clues = @('exception 0xc0000005 (access violation)')
-    fault_report_two_threads = $readOfNull; fault_report_worker_waits = $readOfNull; fault_report_move_retry = $readOfNull
+    fault_report_two_threads = $readOfNull; fault_report_overlap = $readOfNull; fault_report_worker_waits = $readOfNull; fault_report_move_retry = $readOfNull
     fault_report_move_fails = $readOfNull; runtime_report_then_crash = $readOfNull; settings_cut = $readOfNull; settings_none = $readOfNull
 }
 $nativeNeedles = @(
@@ -59,7 +62,7 @@ $exitNeedles = @(
     'Warhammer3.exe+0x', 'memreader Plus hooks: '
 )
 $exitAbsent = @('report_me', "The game's crash handler caught it", 'Lua stack', '  #0 memreader_plus', 'Registers of the crashing thread:')
-$offScriptThread = @('fault_report_native_thread', 'fault_report_two_threads', 'fault_report_worker_waits')
+$offScriptThread = @('fault_report_native_thread', 'fault_report_two_threads', 'fault_report_overlap', 'fault_report_worker_waits')
 $timeLimits = @{
     fault_report_worker_stuck = 4, 9; fault_report_worker_waits = 4, 9; fault_report_worker_blocked = 9, 15; fault_report_worker_dead = 0, 3
 }
@@ -77,13 +80,24 @@ $eventNeedles = @(
 )
 $scenarioNeedles = @{
     fault_report = @(
-        '  relocate_field x40 at ', ', 4 bytes, from ', '  patch at ', '[string "later_patch"]:1', '[string "filler_patch_29"]:1',
+        '  relocate_field x40 spread between ', ' (not one block), 4 bytes, from ', '  patch at ', '[string "later_patch"]:1', '[string "filler_patch_29"]:1',
         '  ... 6 more patches not listed', '[string "newest_patch"]:1'
     )
     fault_report_in_callback = @('RUNNING (on the stack)', ', callback ')
     fault_report_in_site = @(', site hook, RUNNING (on the stack)', ', callback ')
+    fault_report_in_cave = @(
+        'Plus code cave for Warhammer3.exe+0x', ', by crash_owner/crash_cave)', 'memreader Plus changes by owner:', '  crash_owner: 1 cave (crash_cave Warhammer3.exe+0x',
+        ', code cave, by crash_owner/crash_cave'
+    )
+    fault_report_in_link = @(
+        'RUNNING (on the stack)', ', callback ', 'memreader Plus link running: crash_owner/crash_link (prefix) on Warhammer3.exe+0x', ', by crash_owner/crash_link',
+        'memreader Plus changes by owner:', '  crash_owner: 1 link'
+    )
+    fault_report_in_original = @('RUNNING (on the stack)', ', by crash_owner/crash_post', 'memreader Plus changes by owner:', '  crash_owner: 1 link')
+    fault_report_in_around = @('RUNNING (on the stack)', 'memreader Plus link running: crash_owner/crash_around (around) on Warhammer3.exe+0x', ', by crash_owner/crash_around', '  crash_owner: 1 link')
     fault_report_native_thread = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
     fault_report_two_threads = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
+    fault_report_overlap = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
     fault_report_worker_waits = @('not the script thread', 'paused while the other thread crashed', 'Native stack of the script thread at the time')
     exit_report = @('the game ended itself with exit code 7 (0x00000007) through ExitProcess', 'Thread: the script thread')
     exit_report_terminate = @('the game ended itself with exit code 8 (0x00000008) through TerminateProcess', 'not the script thread')
@@ -96,6 +110,9 @@ $scenarioNeedles = @{
         "  $hookerDll hooks timeGetTime"
     )
 }
+$scenarioAbsent = @{ fault_report_in_original = @('memreader Plus link running') }
+$ownerHeader = 'memreader Plus changes by owner:'
+$ownerScenarios = @('owner_report', 'fault_report_in_cave', 'fault_report_in_link', 'fault_report_in_original', 'fault_report_in_around')
 $scenarioPatterns = @{ fault_report_in_site = 'Warhammer3\.exe\+0x[0-9a-f]+  function \+0x[0-9a-f]+, offset \+0x128\r?\n' }
 $contextNeedles = @(
     'Game context set by script at safe moments:', '  mode: campaign', '  campaign: main_warhammer', '  campaign type: sp', '  difficulty: hard',
@@ -146,6 +163,7 @@ $modNeedles = @(
 )
 
 foreach ($scenario in $expect.Keys) {
+    if ($Only -and $Only -notcontains $scenario) { continue }
     if ($needsCpecific -contains $scenario -and -not (Test-Path $cpecificDir)) {
         "== $scenario"
         "skipped: Cpecific's files not found at $cpecificDir"
@@ -213,6 +231,7 @@ foreach ($scenario in $expect.Keys) {
                 if ($missing) { $text }
                 foreach ($absent in $runtimeAbsent) { if ($text -and $text.Contains($absent)) { $failed += "$scenario (runtime report shows $absent)" } }
                 if ($text -and $text.Contains($env:USERPROFILE)) { $failed += "$scenario (runtime report shows the user profile path)" }
+                if ($text -and $ownerScenarios -notcontains $scenario -and $text.Contains($ownerHeader)) { $failed += "$scenario (runtime report shows an owner block without owners)" }
                 if ($text -and $text.Contains($otherDll)) { $failed += "$scenario (runtime report names another program's DLL)" }
             }
         }
@@ -244,6 +263,7 @@ foreach ($scenario in $expect.Keys) {
             if ($offScriptThread -notcontains $scenario -and -not $isExit) { $needles += 'Thread: the script thread'; $needles += 'Code at rip:' }
             if ($scenario -eq 'fault_report_thread') { $needles += 'Lua thread ' }
             if ($scenarioNeedles.Contains($scenario)) { $needles += $scenarioNeedles[$scenario] }
+            if ($scenarioAbsent.Contains($scenario)) { foreach ($absent in $scenarioAbsent[$scenario]) { if ($text -and $text.Contains($absent)) { $failed += "$scenario (report shows $absent)" } } }
             if ($scenario -ne 'fault_report_clues') { $needles += $noTimingHooks }
             $missing = @($needles | Where-Object { -not $text -or -not $text.Contains($_) })
             foreach ($needle in $missing) { $failed += "$scenario (report lacks: $needle)" }
@@ -264,6 +284,7 @@ foreach ($scenario in $expect.Keys) {
                 foreach ($early in @('this part stopped early', 'the report was cut here')) { if ($text -and $text.Contains($early)) { $failed += "$scenario (report shows: $early)" } }
             }
             if ($text -and $text.Contains($env:USERPROFILE)) { $failed += "$scenario (report shows the user profile path)" }
+            if ($text -and $ownerScenarios -notcontains $scenario -and $text.Contains($ownerHeader)) { $failed += "$scenario (report shows an owner block without owners)" }
             if ($text -and $text.Contains($otherDll)) { $failed += "$scenario (report names another program's DLL)" }
             if ($text -and $text.Contains($otherDllCountLine)) { $failed += "$scenario (report shows the count of other programs' DLLs)" }
             if ($scenario -eq $steamScenario) {

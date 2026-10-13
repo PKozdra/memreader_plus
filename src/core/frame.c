@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "common.h"
+#include <intrin.h>
 #include "hde/hde64.h"
 
 enum {
@@ -21,11 +22,11 @@ enum {
 	OPCODE_LEA = 0x8D,
 	GROUP1_ADD = 0,
 	GROUP1_SUB = 5,
-	MAX_SITES = 128,
-	MAX_PARTS = 32,
 	MAX_GROWN = 64,
 	MAX_UNWIND = 4 + 2 * 256
 };
+
+_Static_assert(MAX_GROWN == 64, "the grow_frame limit message says 64");
 
 typedef struct {
 	INT_PTR address;
@@ -46,14 +47,15 @@ typedef struct {
 	BYTE *info;
 	int pushes;
 	DWORD frame;
-	Site sites[MAX_SITES];
+	Site sites[MAX_FRAME_SITES];
 	int count;
-	PRUNTIME_FUNCTION parts[MAX_PARTS];
+	PRUNTIME_FUNCTION parts[MAX_FUNCTION_PARTS];
 	int part_count;
 	const char *error;
 } Plan;
 
 static DWORD grown[MAX_GROWN];
+static int grown_by[MAX_GROWN];
 static int grown_count;
 static DWORD copy_next;
 
@@ -67,19 +69,26 @@ static FunctionTable function_table(void)
 	return table;
 }
 
-static BOOL was_grown(DWORD begin)
+static int grown_index(DWORD begin)
 {
 	int i;
 
 	for (i = 0; i < grown_count; i++)
 		if (grown[i] == begin)
-			return TRUE;
-	return FALSE;
+			return i;
+	return -1;
+}
+
+int grown_amount(INT_PTR function)
+{
+	int i = grown_index((DWORD)(function - (INT_PTR)GetModuleHandleA(NULL)));
+
+	return i < 0 ? 0 : grown_by[i];
 }
 
 static BOOL add_site(Plan *plan, INT_PTR address, int size, INT64 value)
 {
-	if (plan->count == MAX_SITES) {
+	if (plan->count == MAX_FRAME_SITES) {
 		plan->error = "more sites than grow_frame can hold";
 		return FALSE;
 	}
@@ -187,7 +196,7 @@ static void find_parts(Plan *plan, const FunctionTable *table)
 	DWORD i;
 
 	plan->parts[plan->part_count++] = plan->entry;
-	for (i = 0; i < table->count && plan->part_count < MAX_PARTS; i++) {
+	for (i = 0; i < table->count && plan->part_count < MAX_FUNCTION_PARTS; i++) {
 		PRUNTIME_FUNCTION part = &table->table[i];
 
 		if (part != plan->entry && primary_function_entry(part, (ULONG64)table->base) == plan->entry)
@@ -375,9 +384,25 @@ static void restore_code(const Plan *plan, int written, size_t length)
 			patch_memory(plan->sites[i].address, (const char *)&plan->sites[i].old, (size_t)plan->sites[i].size);
 }
 
+static size_t unwind_length(const Plan *plan)
+{
+	return 4 + 2 * (((size_t)plan->info[2] + 1) & ~(size_t)1);
+}
+
+static void remember_sites(const Plan *plan)
+{
+	size_t length = unwind_length(plan);
+	int i;
+
+	for (i = 0; i < plan->count; i++) {
+		if (!in_unwind(plan, &plan->sites[i], length))
+			remember_original(plan->sites[i].address, (size_t)plan->sites[i].size);
+	}
+}
+
 static BOOL apply(Plan *plan, const FunctionTable *table, BOOL copy)
 {
-	size_t length = 4 + 2 * (((size_t)plan->info[2] + 1) & ~(size_t)1);
+	size_t length = unwind_length(plan);
 	BYTE unwind[MAX_UNWIND];
 	BYTE *target = plan->info;
 	int i;
@@ -400,7 +425,6 @@ static BOOL apply(Plan *plan, const FunctionTable *table, BOOL copy)
 
 		if (in_unwind(plan, site, length))
 			continue;
-		remember_original(site->address, (size_t)site->size);
 		if (!patch_memory(site->address, (const char *)&site->value, (size_t)site->size)) {
 			restore_code(plan, i, length);
 			plan->error = "failed to write the code";
@@ -427,42 +451,193 @@ static BOOL apply(Plan *plan, const FunctionTable *table, BOOL copy)
 	return TRUE;
 }
 
+static int find_frame(INT_PTR address, int by, const FunctionTable *table, Plan *plan, const char **why)
+{
+	ULONG64 image = 0;
+	PRUNTIME_FUNCTION part;
+
+	if (by <= 0 || by % 16 || by > MAX_FRAME_GROWTH) {
+		*why = "must be a positive multiple of 16, at most 1 MiB";
+		return FRAME_BAD_AMOUNT;
+	}
+	if (!in_game_image(address, 1)) {
+		*why = "address is outside the game's exe";
+		return FRAME_OUTSIDE;
+	}
+	part = RtlLookupFunctionEntry((DWORD64)address, &image, NULL);
+	if (!part || (const BYTE *)image != table->base) {
+		*why = "not inside a function of the exe's function table";
+		return FRAME_NO_FUNCTION;
+	}
+	plan->entry = primary_function_entry(part, image);
+	return FRAME_OK;
+}
+
+int check_frame(INT_PTR address, int by, INT_PTR *function, const char **why)
+{
+	FunctionTable table = function_table();
+	Plan plan = { 0 };
+	int result = find_frame(address, by, &table, &plan, why);
+
+	if (result == FRAME_OK)
+		*function = (INT_PTR)table.base + plan.entry->BeginAddress;
+	return result;
+}
+
+static BOOL sites_free(const Plan *plan, int item, const char **why)
+{
+	static char held[TAG_SIZE + 16];
+	char holder[TAG_SIZE];
+	int i;
+
+	for (i = 0; i < plan->count; i++) {
+		if (claim_holder(plan->sites[i].address, (size_t)plan->sites[i].size, item, holder, sizeof holder)) {
+			_snprintf_s(held, sizeof held, _TRUNCATE, "held by %s", holder);
+			*why = held;
+			return FALSE;
+		}
+	}
+	if (!claim_room(plan->count, 0)) {
+		*why = "full";
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static void claim_sites(const Plan *plan, int item)
+{
+	int i;
+
+	for (i = 0; i < plan->count; i++)
+		add_claim(item, plan->sites[i].address, (size_t)plan->sites[i].size, NULL, NULL);
+}
+
+static int plan_growth(INT_PTR address, int by, const FunctionTable *table, Plan *plan, const char **why)
+{
+	int result = find_frame(address, by, table, plan, why);
+
+	if (result != FRAME_OK || grown_index(plan->entry->BeginAddress) >= 0)
+		return result;
+	if (grown_count == MAX_GROWN) {
+		*why = "grow_frame grows at most 64 functions";
+		return FRAME_REFUSED;
+	}
+	find_parts(plan, table);
+	if (!(not_hooked(plan, table) && read_unwind(plan, table, by) && plan_code(plan, table, by))) {
+		*why = plan->error;
+		return FRAME_REFUSED;
+	}
+	return FRAME_OK;
+}
+
+static int plan_parts(const Plan *plan, const FunctionTable *table, Range *parts, int max)
+{
+	int i, count = 0;
+
+	for (i = 0; i < plan->part_count && count < max; i++) {
+		parts[count].at = (INT_PTR)table->base + plan->parts[i]->BeginAddress;
+		parts[count].size = plan->parts[i]->EndAddress - plan->parts[i]->BeginAddress;
+		parts[count++].whole = TRUE;
+	}
+	return count;
+}
+
+int function_extents(INT_PTR address, Range *parts, int max)
+{
+	FunctionTable table = function_table();
+	Plan plan = { 0 };
+	ULONG64 image = 0;
+	PRUNTIME_FUNCTION part = RtlLookupFunctionEntry((DWORD64)address, &image, NULL);
+
+	if (!part || (const BYTE *)image != table.base)
+		return 0;
+	plan.entry = primary_function_entry(part, image);
+	find_parts(&plan, &table);
+	return plan_parts(&plan, &table, parts, max);
+}
+
+int check_growth(INT_PTR address, int by, Range *sites, int *count, const char **why)
+{
+	FunctionTable table = function_table();
+	Plan plan = { 0 };
+	int result = plan_growth(address, by, &table, &plan, why);
+	int i;
+
+	*count = 0;
+	if (result != FRAME_OK || grown_index(plan.entry->BeginAddress) >= 0)
+		return result;
+	if (!sites_free(&plan, -1, why))
+		return FRAME_REFUSED;
+	for (i = 0; i < plan.count; i++) {
+		sites[i].at = plan.sites[i].address;
+		sites[i].size = (size_t)plan.sites[i].size;
+		sites[i].whole = FALSE;
+	}
+	*count = plan.count;
+	return FRAME_OK;
+}
+
+static const char *freeze_function(const Plan *plan, const FunctionTable *table, const void *entry)
+{
+	Range parts[MAX_FUNCTION_PARTS];
+	FreezeJob job = { parts, 0, NULL, NULL, entry };
+	int busy, result;
+
+	job.count = plan_parts(plan, table, parts, MAX_FUNCTION_PARTS);
+	result = freeze_threads(&job, &busy);
+	return result == FREEZE_OK ? NULL : freeze_text(result);
+}
+
+int grow_frame_by(lua_State *L, INT_PTR address, int by, const char *tag, int item, const void *entry, const char **why)
+{
+	FunctionTable table = function_table();
+	Plan plan = { 0 };
+	int result = plan_growth(address, by, &table, &plan, why);
+	BOOL copy, written;
+
+	if (result != FRAME_OK || grown_index(plan.entry->BeginAddress) >= 0)
+		return result;
+	if (item >= 0 && !sites_free(&plan, item, why))
+		return FRAME_REFUSED;
+	copy = shares_unwind(&plan, &table);
+	remember_sites(&plan);
+	*why = freeze_function(&plan, &table, entry);
+	if (*why)
+		return FRAME_REFUSED;
+	written = apply(&plan, &table, copy);
+	thaw_threads();
+	if (!written) {
+		*why = plan.error;
+		return FRAME_REFUSED;
+	}
+	grown[grown_count] = plan.entry->BeginAddress;
+	grown_by[grown_count++] = by;
+	if (item >= 0)
+		claim_sites(&plan, item);
+	note_owned_change(L, "grow_frame", (INT_PTR)table.base + plan.entry->BeginAddress, 0, tag);
+	return FRAME_OK;
+}
+
 static int l_grow_frame(lua_State *L)
 {
 	INT_PTR address = pointer_argument(L, 1);
 	int by = (int)luaL_checknumber(L, 2);
-	FunctionTable table = function_table();
-	ULONG64 image = 0;
-	PRUNTIME_FUNCTION part;
-	Plan plan = { 0 };
+	const char *why = NULL;
+	int result;
 
-	if (by <= 0 || by % 16 || by > 0x100000)
-		return luaL_argerror(L, 2, "must be a positive multiple of 16, at most 1 MiB");
-	if (!in_game_image(address, 1))
-		return luaL_argerror(L, 1, "address is outside the game's exe");
-	part = RtlLookupFunctionEntry((DWORD64)address, &image, NULL);
-	if (!part || (const BYTE *)image != table.base)
-		return luaL_argerror(L, 1, "not inside a function of the exe's function table");
-	plan.entry = primary_function_entry(part, image);
-	if (was_grown(plan.entry->BeginAddress)) {
-		lua_pushboolean(L, 1);
-		return 1;
-	}
-	if (grown_count == MAX_GROWN) {
+	result = grow_frame_by(L, address, by, "", -1, _AddressOfReturnAddress(), &why);
+
+	if (result == FRAME_BAD_AMOUNT)
+		return luaL_argerror(L, 2, why);
+	if (result == FRAME_OUTSIDE || result == FRAME_NO_FUNCTION)
+		return luaL_argerror(L, 1, why);
+	if (result == FRAME_REFUSED) {
 		lua_pushnil(L);
-		lua_pushfstring(L, "grow_frame grows at most %d functions", MAX_GROWN);
+		lua_pushstring(L, why);
 		return 2;
 	}
-	find_parts(&plan, &table);
-	if (not_hooked(&plan, &table) && read_unwind(&plan, &table, by) && plan_code(&plan, &table, by) && apply(&plan, &table, shares_unwind(&plan, &table))) {
-		grown[grown_count++] = plan.entry->BeginAddress;
-		note_change(L, "grow_frame", (INT_PTR)image + plan.entry->BeginAddress, 0);
-		lua_pushboolean(L, 1);
-		return 1;
-	}
-	lua_pushnil(L);
-	lua_pushstring(L, plan.error);
-	return 2;
+	lua_pushboolean(L, 1);
+	return 1;
 }
 
 const luaL_Reg frame_functions[] = {

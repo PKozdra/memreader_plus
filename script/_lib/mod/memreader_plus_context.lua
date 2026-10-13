@@ -1,9 +1,11 @@
 local CAMPAIGN_FIELDS = { 'campaign', 'campaign type', 'multiplayer', 'difficulty', 'turn', 'player', 'humans', 'faction turn' }
 local BATTLE_FIELDS = { 'battle type' }
 local QUIT_BUTTONS = { button_quit = 'quitting', button_windows = 'quitting to Windows' }
+local FLUSH_LOG_MS = 5000
 
 local phase = nil
 local phase_before_quit = nil
+local flushing = false
 
 local function try(fn, ...)
 	local ok, result = pcall(fn, ...)
@@ -93,6 +95,19 @@ local function is_quit_click(context)
 	return QUIT_BUTTONS[context.string] ~= nil or (context.string == 'button_cancel' and phase_before_quit ~= nil)
 end
 
+local function flush_log()
+	local plus = _G.memreader_plus
+	if plus and plus.flush_log then pcall(plus.flush_log) end
+end
+
+local function watch_link_log()
+	local timers = nil
+	if flushing then return end
+	timers = try(core.get_tm, core)
+	if not timers then return end
+	flushing = pcall(timers.repeat_real_callback, timers, flush_log, FLUSH_LOG_MS, 'memreader_plus_flush_log')
+end
+
 local function watch_quit()
 	core:add_listener('memreader_plus_context_quit', 'ComponentLClickUp', is_quit_click, safely(on_click), true)
 end
@@ -116,7 +131,9 @@ end
 
 watch_events()
 watch_quit()
+watch_link_log()
 try(core.add_ui_created_callback, core, safely(watch_events))
+try(core.add_ui_created_callback, core, safely(watch_link_log))
 
 if core:is_campaign() then
 	clear(BATTLE_FIELDS)

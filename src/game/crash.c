@@ -74,6 +74,7 @@ static HANDLE script_thread_handle;
 static ULONG_PTR own_start;
 static ULONG_PTR own_end;
 static volatile LONG reporting_thread;
+static volatile LONG handling_thread;
 static volatile LONG script_paused;
 static HANDLE worker;
 static HANDLE wake_event;
@@ -282,12 +283,12 @@ static BOOL make_report_now(const PendingReport *job)
 	return written[0] != '\0';
 }
 
-static void wait_for_other_report(LONG me)
+static void wait_for_owner(const volatile LONG *slot, LONG me)
 {
 	ULONGLONG give_up = GetTickCount64() + OTHER_REPORT_WAIT_MS;
 	LONG owner;
 
-	while ((owner = reporting_thread) != 0 && owner != me && GetTickCount64() < give_up)
+	while ((owner = *slot) != 0 && owner != me && GetTickCount64() < give_up)
 		Sleep(POLL_MS);
 }
 
@@ -306,7 +307,7 @@ static BOOL run_report(const PendingReport *job)
 	if (!may_report(job))
 		return FALSE;
 	if (InterlockedCompareExchange(&reporting_thread, me, 0)) {
-		wait_for_other_report(me);
+		wait_for_owner(&reporting_thread, me);
 		return FALSE;
 	}
 	wrote = make_report_now(job);
@@ -590,11 +591,18 @@ static void note_game_files(void)
 
 static int after_game_handler(DWORD code, EXCEPTION_POINTERS *info)
 {
+	LONG me = (LONG)GetCurrentThreadId();
+	BOOL first = InterlockedCompareExchange(&handling_thread, me, 0) == 0;
 	BOOL wrote = report_fault(info, TRUE);
-	int result = game_handler(code, info);
+	int result;
 
+	if (!first)
+		wait_for_owner(&handling_thread, me);
+	result = game_handler(code, info);
 	if (wrote)
 		note_game_files();
+	if (first)
+		InterlockedExchange(&handling_thread, 0);
 	return result;
 }
 
@@ -652,6 +660,7 @@ static int l_set_crash_context(lua_State *L)
 	const char *value = lua_isnoneornil(L, 2) ? NULL : luaL_checkstring(L, 2);
 
 	set_crash_context(name, value);
+	flush_link_log(L);
 	return 0;
 }
 

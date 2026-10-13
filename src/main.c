@@ -27,6 +27,7 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 	luaL_register(L, NULL, map_functions);
 	luaL_register(L, NULL, list_functions);
 	luaL_register(L, NULL, frame_functions);
+	luaL_register(L, NULL, patcher_functions);
 
 	push_value(L, VALUE_POINTER, (INT_PTR)GetModuleHandleA(NULL));
 	lua_setfield(L, -2, "base");

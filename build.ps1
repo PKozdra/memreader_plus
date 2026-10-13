@@ -15,6 +15,10 @@ $dll = Join-Path $build 'Release\memreader_plus.dll'
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory $stage | Out-Null
 Copy-Item -Recurse (Join-Path $root 'script') $stage
+$required = 'memreader_plus\loader.lua', 'memreader_plus\agree.lua', 'memreader_plus\sites.lua', 'memreader_plus\twui.lua', 'memreader_plus\file_edit_switch.lua', 'memreader_plus\locale_guard.lua'
+foreach ($name in $required) {
+    if (-not (Test-Path (Join-Path $stage "script\$name"))) { throw "$name is missing from the pack folder" }
+}
 $licenses = @(Get-Content -Raw (Join-Path $root 'LICENSE.md'); Get-Content -Raw (Join-Path $root 'vendor\minhook\LICENSE.txt'))
 Set-Content -Encoding utf8 (Join-Path $stage 'script\memreader_plus\third_party_licenses.txt') ($licenses -join "`r`n`r`n")
 Copy-Item $dll $dist

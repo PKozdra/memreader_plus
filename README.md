@@ -22,6 +22,8 @@ Mods written for memreader will keep working when memreader Plus is installed: `
 
 - When the game crashes while a script is running, memreader Plus writes a text file with the Lua call stack and the list of loaded mods.
 
+- `patcher` gives your mod a handle for links, patches, caves, frames and relocations that are recorded under the mod's name. Links can run before or after a game function, with a priority, and a callback that fails stays attached. `batch` writes several patches as one unit, and `sites` describes them as a table. Crash reports list every change by mod and name. See [Patching with owners](#patching-with-owners).
+
 - `game_alloc`, `patch`, `vector_insert` and `string_set` change game data in place: memory from the game's own heap, code patches that check the old bytes first, CA vectors that grow and shrink, and CA strings set to new text. `map_add_key` and `list_insert` add entries to the game's hash maps and lists. See [Changing game data](#changing-game-data).
 
 - `read_pack_file` reads any file from the loaded packs, text or binary, the same way the game reads its own files. See [Reading files from packs](#reading-files-from-packs).
@@ -48,6 +50,7 @@ Every difference, with before and after values, is in [Differences from memreade
 - [Calling game functions](#calling-game-functions)
 - [Hooking game functions](#hooking-game-functions)
 - [Changing game data](#changing-game-data)
+- [Patching with owners](#patching-with-owners)
 - [Reading files from packs](#reading-files-from-packs)
 - [Editing game files as they load](#editing-game-files-as-they-load)
 - [Understanding userdata](#understanding-userdata)
@@ -422,7 +425,7 @@ mr.unhook(murmur)
 
 A callback can run code before or after the original, change the arguments, replace the result, or skip the original. An integer result follows the rules for integer arguments of `call`: a typed value, raw bytes, or a whole number that fits the type.
 
-Several mods can hook the same address. The newest callback runs first. Each callback calls `hook_next` to pass the call down, or returns its own result without it.
+Several mods can hook the same address. The newest callback runs first. Each callback calls `hook_next` to pass the call down, or returns its own result without it. For new code, `patcher` links (prefix, postfix and around, with a priority and a name) do the same job and keep a failing callback attached. See [Patching with owners](#patching-with-owners).
 
 #### `hook(address: pointer, signature: string, callback: function)`
 Adds `callback` on top of the address's chain. The first hook of an address also patches the game's code. An address takes at most 16 callbacks, all with the same signature. A different signature, or the same function twice, is an error.
@@ -539,6 +542,282 @@ Removes `count` nodes (default 1) from `position` on. Each node's memory is free
 - Any of these changes desyncs multiplayer unless every client makes the same change at the same time.
 
 - A key added to a DB key map exists only until the game exits. A save that refers to that key loads only when the key exists again before the load, so add keys in the frontend, before any campaign loads.
+
+## Patching with owners
+
+`memreader_plus.patcher(owner)` gives your mod a handle. Everything you hook, patch or write through the handle is recorded under your mod's name and the name you give each change. Crash reports list the changes by mod and by name, and two mods can't write over each other's bytes. A callback that raises an error stays attached instead of being detached. Several mods can stack callbacks on one function in an order you control with a priority. A group of byte writes goes in as one batch that leaves no patch half applied.
+
+`hook`, `hook_site`, `patch` and the other plain functions keep working as before, and this section is the way to write new mod code.
+
+```lua
+local mr = _G.memreader_plus
+local p = assert(mr.patcher('my_army_mod')) -- one handle per mod, the same one in every file
+
+-- a target table finds the address for you: the pattern must match exactly once
+-- and the bytes at the match must start with 'expect', or you get nil and the reason
+local limit = {
+	pattern = '80 B9 ?? ?? ?? ?? ?? 73 ?? 48 8B 81 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ?? 48 8B 81 ?? ?? ?? ?? B9 ?? ?? ?? ?? 8B 80 ?? ?? ?? ?? 3B C1 0F 47 C1 C3 B8 ?? ?? ?? ?? C3',
+	expect = '80 B9',
+}
+
+-- postfix: runs after the game function, sees the result and may replace it
+-- 'raise_limit' is the name of this link, and priority 0 is the default
+assert(p:postfix(limit, 'uint32(pointer)', 'raise_limit', function(call, result, faction)
+	return math.max(mr.tonumber(result), 30)
+end, 0))
+
+-- prefix: runs before the game function and may change an argument or skip the function
+-- p:prefix(limit, 'uint32(pointer)', 'watch_limit', function(call, faction) call:set(1, faction) end)
+
+-- around: you call the game function yourself with game(...)
+-- p:around(limit, 'uint32(pointer)', 'wrap_limit', function(game, faction) return game(faction) end)
+
+-- an owned patch: the second name is yours, the bytes must be the expected ones
+local ok, why = p:patch('stronger_start', { pattern = '48 83 EC 28 B8 01 00 00 00', at = 4, expect = 'B8 01' }, '\184\1\0\0\0', '\184\2\0\0\0')
+if not ok then out('stronger_start: ' .. tostring(why)) end
+
+-- take a link back out, or everything the handle can take back
+p:remove('raise_limit')
+p:remove_all()
+```
+
+The patterns above are examples. Real ones come from your own search for code that matches once, as in [Calling game functions](#calling-game-functions).
+
+### Handles, names and limits
+
+An owner is the key of your mod, 1 to 63 letters, digits or underscores. A name identifies one change of that owner, 1 to 47 letters, digits or underscores. It is unique per owner across links, patches, caves and every other change. Asking for the same name again with the same arguments does nothing and answers `true`, so a script can run its install code again in every game mode, while the same name with arguments that describe a different change answers `nil, 'the name is already used for a different change'`.
+
+Every method returns `true`, a value, or `nil` and the reason. A wrong argument type, or a signature text that can't be parsed, raises a Lua error.
+
+The registry behind the handles lives for the whole game session and survives mode switches. It has room for 64 owners, 2048 named changes, 4096 claimed byte ranges and 64 KB of saved original bytes, and a change that doesn't fit answers `nil, 'full'`.
+
+Links (prefix, postfix, around and site callbacks) are Lua functions, so they last one game mode, as `hook` callbacks do. Attach them again in each mode. Patches, caves, frames and relocations stay in the game's code for the session, and calling their method again in a later mode finds them and does nothing.
+
+#### `patcher(owner: string): handle | nil, string`
+Returns the handle of `owner`. The same owner gives the same handle in a game mode. A bad owner name gives `nil` and the reason, and so does a 65th owner (`at most 64 owners per game session`). On a memreader Plus too old to have the function, `patcher` is `nil`, so a mod can test for it before it uses the handle.
+#### `handle:owner(): string`
+Returns the owner name that `patch_list` and the crash reports show.
+
+### Prefix, postfix and around
+
+```lua
+p:prefix(at, signature, name, fn, [priority])   -- fn(call, a1, ..., an)
+p:postfix(at, signature, name, fn, [priority])  -- fn(call, result, a1, ..., an) -> nil keeps the result
+p:around(at, signature, name, fn, [priority])   -- fn(game, a1, ..., an) -> result
+```
+
+All three put a link on the function at `at`. `at` is a pointer, or a target table (below). The signature is the one `call` and `hook` use, and arguments reach `fn` converted the same way. `priority` is a whole number from -1000 to 1000, 0 when left out.
+
+The links of one call run in three steps, on the script thread:
+
+1. The prefixes run. A prefix may change an argument with `call:set` or skip the game function with `call:skip`.
+2. The arounds run, and the game function at the bottom, unless a prefix skipped them. An around calls the next one down with `game(...)`, and the last one calls the game function.
+3. The postfixes run. Every postfix runs on every call, also when a prefix or an around skipped the game function. Each one sees the result so far and the arguments as the prefixes left them.
+
+#### The order of links
+
+If you know the C# library Harmony, the order is the same as its. In each of the three lists the link with the highest `priority` runs first. Links with the same priority run in the order they were added. The outermost around is the one with the highest priority, so it sees the arguments first and the result last. The postfixes run highest first too, so the postfix with the lowest priority has the last word on the result. Replacing a link (the same name with another function, priority or signature) counts as adding a new one, so it moves behind the links of the same priority that were added before.
+
+The callbacks you added with `hook` count as one group of arounds with priority 0. They run newest first among themselves, as they always did, and `hook_next` and `game(...)` walk the same list.
+
+#### The `call` object
+The first argument of a prefix and a postfix, and the `game` argument of an around, are all the same object. It is reused for every call, so keep nothing from it. A method or field used outside a link of its own call, for example a `call` stored in a variable, raises `call object used after its call returned`.
+
+- `call:set(i, value)` sets argument `i` (1 to the number of arguments) for the links below and for the game function. It works only in a prefix, and it takes effect when that prefix returns without an error.
+- `call:skip([result])` skips the arounds and the game function. It works only in a prefix, and the result is required when the signature has one. No lower prefix runs after a skip.
+- `call:original(...)` calls the game function directly with the arguments you give it, without any link. It is guarded like `call`.
+- `call.skipped` is `nil`, or `owner/name` of the link that skipped the function (`hook` for a `hook` callback).
+- `call.site` is the name of the running link, and `call.depth` is the same number as `hook_depth()`.
+- `game(...)` in an around passes the call down with the arguments you give, which must be all of the signature's arguments. `game()` with none passes the arguments this around received. An around may call `game` several times. An around that returns without calling `game` skips the function, and its link counts the skip.
+
+A postfix returns `nil` to keep the result, or a value to replace it. The value of a prefix is ignored. An around returns the result, and returning nothing where the signature has a result is an error. Numbers that go through `game(a, b)` or a returned value are Lua numbers, so a `double` there keeps only 24 bits of precision. `game()` and a prefix that changes nothing keep the exact bits.
+
+Plus calls the game function itself from a copy of the registers and stack the game passed, with only the arguments named in the signature replaced. Name every argument that your links read or change. Name the others too when you can (`this`, a hidden result buffer), because a link can't read or set an argument that is not in the signature, although an argument left out still reaches the game function unchanged.
+
+An address takes one signature. The first link, or `hook` callback, sets it, and a link with another signature answers `nil, 'signature differs from <owner>/<name>'` (`hook` for a `hook` callback). An address holds at most 32 links and `hook` callbacks together, of which at most 16 are `hook` callbacks. Over that it answers `nil, 'at most 32 links on this address'`. A link added during a call first runs in the next call, and a removed link still finishes the call it is in.
+
+#### Errors in links
+A link that raises an error stays attached. The call goes on without what that link would have done:
+
+| Link that raised | What happens |
+|---|---|
+| Prefix | Its `call:set` and `call:skip` are dropped, and the next prefix runs |
+| Around that raised before `game` | The call goes on into the arounds below, as if the link was not there |
+| Around that raised after `game` | The result of its last `game` call stands |
+| Postfix | The result stays as it was |
+
+Each link counts its calls, skips and errors, and keeps the text of its first error (`p:info` and `patch_info` show them). The first error of each link in a game mode is written once to the script log as `[memreader Plus] my_mod/raise_limit (postfix): <error>`. The line is written when your script next calls a patcher method, `patch_list` or `patch_info`, or within about 5 seconds, never from inside a callback. `p:remove(name)` takes a link that keeps failing out.
+
+A link that has failed may have done half of its work before the error, and it runs again on the next call. If it changes state, restore the state with `pcall` the way you would in any callback.
+
+#### Target tables
+Wherever a method takes an address `at`, it also takes `{ pattern = '...', at = offset, expect = '...' }`. The pattern, in the `find_pattern` format, must match exactly once. `at` is a whole offset from the start of the match, 0 when left out. `expect` is hex bytes and `??` separated by spaces. It is compared with the bytes at the address as they were before any hook or patch, and it may be shorter than the change. The result is the same as with `find_pattern` and a check of your own, and the search uses the cache of `find_patterns`. A failure answers `nil` and one of these texts:
+
+- `pattern found 0 times` or `pattern found 2 times` (any count other than 1)
+- `bad pattern: hex bytes and ?? separated by spaces, starting with a byte`
+- `unexpected bytes`
+- `a target table needs a pattern string`, `at must be a whole number`, `expect must be hex bytes and ?? separated by spaces`
+
+Other threads never reach links. A call that comes on a thread other than the script thread runs the game function with no prefix, around or postfix, and `patch_info(at).other_thread_calls` counts it. When the fix must hold on every thread, use `p:patch`, `p:set` or `p:cave`.
+
+Do not call the game's script functions inside a link, for the reasons given under [Rules for hooks](#rules-for-hooks). A skip also skips whatever else the game function does, so run the function with `game` or `call:original` when you can, and change the one value that is wrong.
+
+### Changing code under an owner
+
+```lua
+p:patch(name, at, expected, bytes)             -- true | nil, why [, bytes found]
+p:set(name, at, size, number, low, high)       -- true | nil, why
+p:cave(name, at, bytes)                        -- the cave's pointer | nil, why
+p:frame(name, at, grow)                        -- true | nil, why
+p:relocate(name, sites)                        -- true | nil, why
+p:site(name, at, fn, [priority])               -- true | nil, why
+```
+
+#### `handle:patch(name: string, at, expected: string, bytes: string): true | nil, string [, string]`
+Like `patch`, with a name and an owner. It writes `bytes` when the bytes at `at` equal `expected`, and keeps the old bytes so that `remove` can put them back. When the bytes already equal the new ones and not the expected ones, it answers `nil, 'unexpected bytes'`, because those bytes are not yours to take back. The third result is the bytes found. The limits of `patch` apply: 1 to 4096 bytes inside `Warhammer3.exe`.
+#### `handle:set(name: string, at, size: float, number: float, low: float, high: float): true | nil, string`
+Writes a whole number into a field of 1 byte (0 to 255) or 4 bytes (-16777215 to 16777215). The first call needs the current value to lie between `low` and `high`. Later calls write a new number as long as the bytes are the ones you wrote last. If something else changed them the answer is `nil, 'the bytes were changed by something else'`.
+#### `handle:cave(name: string, at, bytes: string): pointer | nil, string`
+Like `code_cave`, with a name and an owner. It returns the cave's address. A repeated call with the same bytes returns the same address.
+#### `handle:frame(name: string, at, grow: float): true | nil, string`
+Like `grow_frame`. A function that a plain `grow_frame` call already grew answers `nil, 'grown by <n> already'`, and one that another change holds answers `nil, 'held by <owner>/<name>'`.
+#### `handle:relocate(name: string, sites: table): true | nil, string`
+Like `relocate_field`: the sites are `{ address, expected, bytes }`, where the address may be a target table. A relocation takes 1 to 1024 sites and checks all of them before it writes the first. An error says which site failed, as `site 3: ...`. The other threads are stopped while the sites are written, and if one write fails the earlier ones are put back.
+#### `handle:site(name: string, at, fn: function, [priority: float]): true | nil, string`
+Like `hook_site`, with a name and an owner: `fn(regs)` runs at the instruction at `at`. `priority` is stored and shown by `p:info`, and it does not change the order, because every callback of a site runs, newest first.
+
+Two things hold for all of these. A byte range that one change replaced is claimed. Another change over the same range, from the same owner or another, answers `nil, 'held by <owner>/<name>'` and writes nothing. A site only collides with a claim on the bytes it replaces, and sites can share an address. The first instructions of a function that is hooked run from the hook's copy, so a change there answers `nil` and `refused: the first bytes of a hooked function run from the hook's copy, so a change there would never run`.
+
+#### Removing
+
+#### `handle:remove(name: string): true | nil, string`
+Takes one change back. A patch or a set puts the saved bytes back, if the bytes there are still the ones you wrote. A link or a site is detached. A cave, a frame and a relocation can't be taken back, and the answer is `nil, 'stays for the session'`. An unknown name answers `nil, 'unknown name'`.
+#### `handle:remove_all(): true | nil, string, removed: float, stays: float`
+Removes everything of the handle's owner that can be taken back. It returns `true`, the number removed and the number that stay. When a change could not be put back it returns `nil`, the reason and the two numbers.
+
+### Batches
+
+```lua
+local ok, why, left = p:batch({
+	{ 'patch', 'mark_a', { pattern = PATTERN_A, at = 3, expect = '01 00' }, '\1\0', '\2\0' },
+	{ 'set', 'limit', { pattern = PATTERN_B, at = 9, expect = '?? 00' }, 1, 20, 1, 200 },
+	{ 'cave', 'bar_cave', { pattern = PATTERN_C }, CAVE_BYTES },
+	{ 'frame', 'planner', { pattern = PATTERN_D }, 0x360 },
+	{ 'relocate', 'fields', SITES },
+})
+if not ok then out('install failed: ' .. why) end
+```
+
+#### `handle:batch(steps: table): true, microseconds | nil, string [, table]`
+Each step is `{ kind, name, ... }` with the arguments of the method of the same name. The kinds are `patch`, `set`, `cave`, `frame` and `relocate`. A batch takes at most 128 steps, with at most 5 arguments after the name, 2048 writes and 64 KB of bytes. A step with a wrong argument type raises an error.
+
+On success it returns `true` and the number of microseconds the game's other threads were stopped for the writes (0 when nothing was written). On failure it returns `nil` and a reason. The reason of a failing step starts with its name, as `limit: unexpected bytes`. A bad list gives `step 3: unknown kind`, `no steps`, `at most 128 steps` or a similar text. Other reasons are `full`, `a thread is inside <owner>/<name>` and `not from inside a hooked call`. The third result is a table with the names of the caves and frames that this call made before it failed.
+
+The batch works in three steps:
+
+1. It checks every step the way its method would, and the steps against each other. Two steps over the same bytes give `<name>: overlaps <other> in this batch`. A refusal here writes nothing.
+2. It makes the caves and frames, in list order. If one of them fails, the ones made before it stay in the game. They are owned, they are named in the third result, and `patch_list` shows them with the state `stays`.
+3. It stops the game's other threads, checks the bytes once more, and writes all patches, sets and relocations together. If one write fails, every write of the batch is put back and the threads run again.
+
+A failed batch leaves none of its patches, sets or relocations written. It can leave caves and frames, and it names them. It does not promise that no byte changed.
+
+A cave goes live in step 2, before the batch's patches exist, and stays live if they fail. Write a cave of a batch so that it is safe with none of the batch's patches written. A batch does not return the cave's pointer. Call `p:cave` with the same arguments afterwards to get it.
+
+A single `p:relocate` runs as a batch of one.
+
+If a thread is inside a range that is about to be written, the batch lets the thread go, waits 1 ms and checks again, up to 8 times, and then answers `a thread is inside <owner>/<name>` with nothing written. For `frame` and `relocate` the check covers the whole function that holds the site, including any function above it on the stack of a stopped thread. A function the game runs all the time may refuse every time. Install frames and relocations at load, before the code runs. They can't be installed from inside a link, site or `hook` callback (`not from inside a hooked call`), because that thread can't be stopped and its stack may hold a return into the function.
+
+### Declared sites
+
+A table of sites describes the patterns, the bytes that must be there and the change in plain data, so a mod keeps its game addresses in one file. It survives game patches the way patterns do, and a site that is not found turns off only the feature that needs it.
+
+```lua
+local native = p:sites({
+	{ name = 'cap_site', feature = 'cap', kind = 'postfix', pattern = '80 B9 ?? ?? ?? ?? ?? 73 ?? 48 8B 81 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ??',
+		expect = '80 B9', signature = 'uint32(pointer)' },
+	{ name = 'start_bonus', feature = 'start', kind = 'patch', pattern = '48 83 EC 28 B8 01 00 00 00', at = 4, expect = 'B8 01 00 00 00', bytes = 'B8 02 00 00 00' },
+}, ModLog)
+if native.feature_ok('cap') then
+	native.install('cap_site', function(call, result, faction)
+		return math.max(mr.tonumber(result), 30)
+	end)
+end
+native.log_missing()
+```
+
+#### `handle:sites(entries: table, [log: function]): table`
+Searches the patterns of all entries in one pass and checks the bytes. Nothing is written yet. `log` takes finished lines of text and defaults to nothing. It returns an object with the functions below. A table that isn't a list of entries counts as an empty one, and an entry that isn't valid is marked missing with `bad entry: <reason>`. The entry names are the names of the changes, so they follow the rules for names, and two tables of one owner must not share a name.
+
+The fields of an entry:
+
+| Field | Used by | Meaning |
+|---|---|---|
+| `name`, `feature`, `kind` | all | `kind` is `anchor`, `patch`, `value`, `cave`, `frame`, `relocate`, `site`, `prefix`, `postfix`, `around` or `hook` (the same as `around`). `feature` groups the entries that work or fail together |
+| `pattern` or `variants` | all | the hex pattern, which must match once. `variants` is a list of tables that can each override `pattern`, `at`, `expect` and `bytes`, tried in order, and the first that matches once and verifies wins |
+| `at` | all but `anchor` | offset from the match to the site, 0 when left out |
+| `expect` | all but `anchor`, `frame`, `relocate` | the bytes that must be at the site, hex with `??` |
+| `bytes` | `patch`, `cave` | `patch`: the new bytes, as long as `expect`. `cave`: the code, where `{name:4}` is a 4-byte value (`{name:1}`, `{name:8}`) that comes from a read of the same name or from the table given to `install` |
+| `reads` | all | values read out of the match, `uint8`, `int32`, `call`, `rip` or `chain`, with optional `equals`, `low` and `high` checks. `from = 'other_entry'` takes a read from another entry |
+| `size`, `low`, `high`, `before` | `value` | the field the mod sets later with `native.set`, and how many bytes before the site the checked opcode starts |
+| `signature` | `prefix`, `postfix`, `around`, `hook` | as for the methods |
+| `priority` | links and `site` | as for the methods |
+| `target`, `expect_target` | links | hook the target of the `E8` call at the site (`'call'`), the start of the function (`'start'`) or a pointer from a read, and check its first bytes |
+| `grow` | `frame` | bytes for `p:frame` |
+| `sites` | `relocate` | a list of `{ at, expect, bytes }` relative to the match |
+
+The object it returns:
+
+- `found(name)`, `why(name)` tell whether an entry is usable and the reason when it is not: `pattern found 0 times`, `pattern found 2 times`, `unexpected bytes`, `held by another hook`, `bad entry: ...` or `disabled: ...`.
+- `feature_ok(feature)` is true when every entry of the feature is usable.
+- `address(name)` and `value(name, read)` give an entry's address and a value it read.
+- `install(name, [callback or arguments])` and `install_feature(feature, [table of callbacks or arguments by entry name])` write the entries. They return `true`, or `false` and the reason. Every entry is checked first, so a refusal writes nothing. Patches, values, caves, frames and relocations then go in as one batch, and links are attached last. A call from inside a hooked call answers `false, 'not from inside a hooked call'` and marks nothing.
+- `set(name, number)` writes a `value` entry. `remove(name)` takes back a patch, value or link, and answers `false, 'stays for the session'` for a cave, frame or relocation.
+- `disable(name, why)` marks an entry missing from your own checks. `cave_value(name, placeholder)` reads a placeholder's value back out of an installed cave, also in a later game mode.
+- `log_missing()` writes one line per missing entry through `log`, once per mode, as `[my_army_mod] cap_site not found (pattern found 0 times): cap off`. `report()` returns `name=ours|vanilla|missing` joined by commas, for the crash context and a multiplayer handshake.
+
+If Plus can't stop the other threads or one of them is inside the code to be written (`a thread is inside <owner>/<name>`, `a thread could not be checked`, `the other threads could not be suspended`), nothing is written and no entry is marked missing. The call answers `false` and the reason, `found` and `feature_ok` stay true and `report()` says `vanilla`, so the mod can try again later, for example on the first tick. Any other failure marks the entry missing with its reason and the feature is not tried again in that session. A write that could not be put back marks every patch and value of the call missing. Caves and frames that a failed batch left are marked installed, one line `install failed (<reason>), left in place: <names>` is logged, and that feature is not tried again either. A link that can't be attached takes back the links and patches of that call.
+
+### Looking at what is installed
+
+#### `handle:info(name: string): table | nil, string`
+Returns `{ owner, name, kind, at, state }` for one change, or `nil, 'unknown name'`. `kind` is `site`, `value`, `cave`, `patch`, `frame`, `relocate`, `prefix`, `postfix` or `around`. A prefix, postfix or around row also has `priority`, `calls`, `skips`, `errors` and, once it failed, `error`. `state` is one of these:
+
+- `ours`: the bytes there are the ones you wrote.
+- `held`: the saved original bytes are back.
+- `missing`: something else changed the bytes.
+- `copied`: a hook that came later copied those bytes, so taking them back would change dead code.
+- `detached`: a link or site whose callback died with the last game mode.
+- `stays`: a cave, frame or relocation, or a link or site that is attached.
+#### `patch_list([owner: string]): table`
+Returns the rows of `info` for every change, or for one owner.
+#### `patch_info(address: pointer): table | nil`
+Returns `nil` when nothing hooks or claims the address. Otherwise it returns `{ kind, other_thread_calls, links, claims }`. `kind` is `function`, `site` or `cave`. `links` lists the links in the order they run, as `{ owner, name, link, priority, calls, skips, errors, error }`, where `link` is `prefix`, `postfix`, `around` or `site`. A `hook` callback has the owner and name `''` and no counters. `claims` lists the byte ranges claimed over the hook's copied bytes, or the address, as `{ owner, name, from, to }`.
+
+Counts are plain Lua numbers, exact up to 16,777,216.
+#### `flush_log()`
+Writes the link errors that wait in the log now. It does nothing inside a callback or when nothing waits. memreader Plus's own script calls it every 5 seconds.
+
+### Crash reports
+
+A crash or runtime report starts its list of mod changes with a block that names every owner:
+
+```
+memreader Plus changes by owner:
+  my_army_mod: 2 links, 1 value, 2 caves (strength_bar Warhammer3.exe+0x2970be7, strength_icon Warhammer3.exe+0x239c3f6), 1 patch (start_bonus Warhammer3.exe+0x1a2b3c), 1 frame, 74 relocations
+  other_mod: 1 link not attached
+  ?: 1 code cave at Warhammer3.exe+0x2496cb4 from [string "x"]:12
+memreader Plus link running: my_army_mod/raise_limit (postfix) on Warhammer3.exe+0x1c4d0
+```
+
+The counts come in the order links, values, caves, patches, frames and relocations (each site of a relocation counts). Caves and patches list up to 8 names with their addresses. `link not attached` counts links whose callback died with the last game mode. A row `?:` is a plain `code_cave` call, with the script line that made it. The `link running` line names the link that was running when the game crashed. The hook lines, patch and write lines and the frames inside a cave end with `, by <owner>/<name>`, and a plain cave with `, from <script line>`.
+
+### Rules
+
+- Links run on the script thread only. Install links again in every game mode.
+- Install frames and relocations at load, not from a callback and not while the code runs often.
+- A link that fails stays attached and is logged once. Take it out with `p:remove(name)`.
+- Name a change once and keep the name. Crash reports and `patch_list` show it.
+- A change that alters the game model desyncs multiplayer unless every client makes it, as with `hook`.
 
 ## Reading files from packs
 
@@ -741,7 +1020,7 @@ For the crashing thread, the report shows up to 32 frames of the native call sta
 
 When the crash is inside the game's memory allocator, a line under the stack says that memory was damaged earlier and the code on the stack only found it. Something else wrote over the game's memory before the crash, so the function names on that stack don't point to the cause. When a register holds a bad value that sits in memory next to another register, the report shows the 128 bytes around that spot, as bytes and as text. The text often names what wrote over the memory, for example a mod's text. If that text holds a file path or your Windows user name, the report leaves the bytes out.
 
-After that the report lists what mods did through memreader Plus. Hooks come first, the ones running when the game crashed at the top, each with the file and line of its callbacks. Then every piece of game code patched in this session, and the last 24 memory writes, newest first. Each patch and write names the script line that made it, and repeated patches or writes from one line are counted in one entry with their address range.
+After that the report lists what mods did through memreader Plus. Hooks come first, the ones running when the game crashed at the top, each with the file and line of its callbacks. Then every piece of game code patched in this session, and the last 24 memory writes, newest first. Each patch and write names the script line that made it, and repeated patches or writes from one line are counted in one entry. An entry shows the lowest and highest address of its changes. When the changes do not touch each other, it says `spread between` and `(not one block)`. Most of the code between those two addresses was not changed, so a crash there does not point at the mod. Changes made through `patcher` also name the owner and the change, and a block at the start of this list shows every owner's changes (see [Patching with owners](#patching-with-owners)).
 
 Near the end, the report names a DLL that another program loaded into the game only where the DLL is part of the crash: as the module the fault happened in, or in a frame of the native or Lua stack. It also names a DLL that changes how the game measures time, as speed hacks and trainers do, together with each timing function it hooks, such as `QueryPerformanceCounter`. The report doesn't list the other DLLs, because people post these reports in public and the names would show what else runs on their PC. After that come the game version, the command line and the crash folder. It lists every mod in load order with its file size, date, Workshop id and folder. Last, it names the game's own crash files for the same crash (`.mdmp` and `.stack.txt`).
 

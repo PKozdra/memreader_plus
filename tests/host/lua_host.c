@@ -281,7 +281,12 @@ INT64 frame_call(void *function, UINT64 *probe);
 INT64 frame_hooked(UINT64 *probe);
 INT32 prologue_target(void);
 INT32 parked_target(volatile LONG *flag);
+INT32 park_frame(volatile LONG *flag);
+INT32 park_grow(volatile LONG *flag);
+INT32 park_outer(volatile LONG *flag);
 void filler_code(void);
+void hop_leaf_here(void);
+void hop_leaf_pad(void);
 void site_target(void);
 void site_target_here(void);
 void site_far(void);
@@ -362,11 +367,18 @@ __declspec(noinline) void host_unwind_probe(UINT64 *probe)
 }
 int game_crash_handler(DWORD code, EXCEPTION_POINTERS *info);
 
+static HANDLE first_crash_file;
+static volatile LONG slow_crash_file;
+
 void write_game_crash_file(void)
 {
 	SYSTEMTIME now;
 	char name[64];
 	HANDLE file;
+	if (InterlockedExchange(&slow_crash_file, 0)) {
+		SetEvent(first_crash_file);
+		Sleep(300);
+	}
 	GetLocalTime(&now);
 	snprintf(name, sizeof name, "crash_report\\D%04d-%02d-%02d_T%02d-%02d-%02d.mdmp", now.wYear, now.wMonth, now.wDay,
 		now.wHour, now.wMinute, now.wSecond);
@@ -456,7 +468,12 @@ static const struct {
 	{ "frame_hooked", frame_hooked },
 	{ "prologue_target", prologue_target },
 	{ "parked_target", parked_target },
+	{ "park_frame", park_frame },
+	{ "park_grow", park_grow },
+	{ "park_outer", park_outer },
 	{ "filler_code", filler_code },
+	{ "hop_leaf_here", hop_leaf_here },
+	{ "hop_leaf_pad", hop_leaf_pad },
 	{ "cave_target", cave_target },
 	{ "site_target", site_target },
 	{ "site_target_here", site_target_here },
@@ -547,6 +564,15 @@ static int l_test_execute_crash(lua_State *L)
 	page[0] = 0xC3;
 	((void (*)(void))page)();
 	return 0;
+}
+
+static int l_test_run(lua_State *L)
+{
+	INT32 (*function)(INT32, INT32);
+
+	memcpy(&function, luaL_checkstring(L, 1), sizeof function);
+	lua_pushinteger(L, function((INT32)luaL_checkinteger(L, 2), (INT32)luaL_checkinteger(L, 3)));
+	return 1;
 }
 
 void fake_dlfree(void *chunk);
@@ -736,6 +762,12 @@ static void fault_worker_stuck(void)
 
 static HANDLE start_both;
 
+static DWORD WINAPI wait_then_fault_now(LPVOID unused)
+{
+	(void)unused;
+	return (DWORD)read_null();
+}
+
 static DWORD WINAPI wait_then_fault(LPVOID unused)
 {
 	(void)unused;
@@ -752,6 +784,24 @@ static void fault_two_threads(void)
 	threads[1] = CreateThread(NULL, 0, wait_then_fault, NULL, 0, NULL);
 	Sleep(200);
 	SetEvent(start_both);
+	WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+}
+
+static DWORD WINAPI fault_after_first_crash_file(LPVOID unused)
+{
+	(void)unused;
+	WaitForSingleObject(first_crash_file, INFINITE);
+	return (DWORD)read_null();
+}
+
+static void fault_overlap(void)
+{
+	HANDLE threads[2];
+
+	first_crash_file = CreateEventW(NULL, TRUE, FALSE, NULL);
+	slow_crash_file = 1;
+	threads[0] = CreateThread(NULL, 0, wait_then_fault_now, NULL, 0, NULL);
+	threads[1] = CreateThread(NULL, 0, fault_after_first_crash_file, NULL, 0, NULL);
 	WaitForMultipleObjects(2, threads, TRUE, INFINITE);
 }
 
@@ -953,13 +1003,14 @@ static int l_test_park_start(lua_State *L)
 {
 	DWORD64 function, rip = 0;
 	int tries;
+	DWORD64 span = (DWORD64)luaL_optinteger(L, 2, 16);
 
 	memcpy(&function, luaL_checkstring(L, 1), sizeof function);
 	park_flag = 0;
 	park_thread = CreateThread(NULL, 0, run_parked, (void *)function, 0, NULL);
 	for (tries = 0; tries < 200; tries++) {
 		Sleep(10);
-		if (park_rip(&rip) && rip >= function && rip < function + 16) {
+		if (park_rip(&rip) && rip >= function && rip < function + span) {
 			lua_pushboolean(L, 1);
 			return 1;
 		}
@@ -1002,6 +1053,307 @@ static int l_test_park_finish(lua_State *L)
 		return 0;
 	lua_pushinteger(L, result);
 	return 1;
+}
+
+static void (WINAPI *real_sleep)(DWORD milliseconds);
+static volatile LONG leave_thread;
+static volatile LONG left_in_retry;
+
+static void WINAPI leaving_sleep(DWORD milliseconds)
+{
+	if (leave_thread && GetCurrentThreadId() == (DWORD)leave_thread) {
+		leave_thread = 0;
+		park_flag = 1;
+		left_in_retry = WaitForSingleObject(park_thread, 5000) == WAIT_OBJECT_0;
+	}
+	real_sleep(milliseconds);
+}
+
+static int l_test_park_leave_on_retry(lua_State *L)
+{
+	find_plus(L, 1);
+	if (!real_sleep)
+		replace_plus_import("Sleep", (void *)leaving_sleep, (void **)&real_sleep);
+	left_in_retry = 0;
+	leave_thread = (LONG)GetCurrentThreadId();
+	return 0;
+}
+
+static int l_test_park_left(lua_State *L)
+{
+	lua_pushboolean(L, left_in_retry);
+	left_in_retry = 0;
+	return 1;
+}
+
+static BOOL (WINAPI *real_protect)(LPVOID address, SIZE_T size, DWORD protection, PDWORD old);
+static LPVOID (WINAPI *real_alloc)(LPVOID address, SIZE_T size, DWORD type, DWORD protection);
+static volatile ULONG_PTR refused_page;
+static volatile LONG protect_refusals;
+static volatile LONG protect_skips;
+static volatile SIZE_T refused_size;
+
+static BOOL WINAPI refusing_protect(LPVOID address, SIZE_T size, DWORD protection, PDWORD old)
+{
+	if ((ULONG_PTR)address == refused_page && (protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+		if (protect_skips > 0)
+			InterlockedDecrement(&protect_skips);
+		else if (InterlockedDecrement(&protect_refusals) >= 0) {
+			SetLastError(ERROR_ACCESS_DENIED);
+			return FALSE;
+		}
+	}
+	return real_protect(address, size, protection, old);
+}
+
+static LPVOID WINAPI refusing_alloc(LPVOID address, SIZE_T size, DWORD type, DWORD protection)
+{
+	if (refused_size && size == refused_size && protection == PAGE_EXECUTE_READWRITE) {
+		refused_size = 0;
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return NULL;
+	}
+	return real_alloc(address, size, type, protection);
+}
+
+static int l_test_fail_protect(lua_State *L)
+{
+	void *address;
+
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	find_plus(L, 3);
+	if (!real_protect)
+		replace_plus_import("VirtualProtect", (void *)refusing_protect, (void **)&real_protect);
+	refused_page = (ULONG_PTR)address & ~(ULONG_PTR)0xFFF;
+	protect_refusals = (LONG)luaL_checkinteger(L, 2);
+	protect_skips = (LONG)luaL_optinteger(L, 4, 0);
+	return 0;
+}
+
+static DWORD (WINAPI *real_suspend)(HANDLE thread);
+static FARPROC (WINAPI *real_get_proc)(HMODULE module, LPCSTR name);
+static volatile LONG suspend_calls;
+static volatile LONG spawn_at;
+static volatile LONG next_thread_denied;
+static void *change_address;
+static BYTE change_bytes[16];
+static size_t change_size;
+static HANDLE spawn_event;
+
+static DWORD WINAPI wait_for_spawn_event(void *unused)
+{
+	(void)unused;
+	WaitForSingleObject(spawn_event, INFINITE);
+	return 0;
+}
+
+static void change_code_now(void)
+{
+	DWORD old, unused;
+
+	VirtualProtect(change_address, change_size, PAGE_EXECUTE_READWRITE, &old);
+	memcpy(change_address, change_bytes, change_size);
+	VirtualProtect(change_address, change_size, old, &unused);
+	change_size = 0;
+}
+
+static DWORD WINAPI watching_suspend(HANDLE thread)
+{
+	LONG number = InterlockedIncrement(&suspend_calls);
+
+	if (change_size)
+		change_code_now();
+	if (spawn_at && number == spawn_at) {
+		spawn_at = 0;
+		CloseHandle(CreateThread(NULL, 0, wait_for_spawn_event, NULL, 0, NULL));
+	}
+	return real_suspend(thread);
+}
+
+static FARPROC WINAPI denying_get_proc(HMODULE module, LPCSTR name)
+{
+	if (next_thread_denied && (ULONG_PTR)name > 0xFFFF && strcmp(name, "NtGetNextThread") == 0)
+		return NULL;
+	return real_get_proc(module, name);
+}
+
+static int l_test_watch_suspend(lua_State *L)
+{
+	find_plus(L, 1);
+	if (!real_suspend)
+		replace_plus_import("SuspendThread", (void *)watching_suspend, (void **)&real_suspend);
+	if (!spawn_event)
+		spawn_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+	suspend_calls = 0;
+	return 0;
+}
+
+static int l_test_suspend_calls(lua_State *L)
+{
+	lua_pushnumber(L, (lua_Number)suspend_calls);
+	return 1;
+}
+
+static int l_test_spawn_on_suspend(lua_State *L)
+{
+	ResetEvent(spawn_event);
+	spawn_at = (LONG)luaL_checkinteger(L, 1);
+	return 0;
+}
+
+static int l_test_end_spawned(lua_State *L)
+{
+	(void)L;
+	SetEvent(spawn_event);
+	return 0;
+}
+
+static int l_test_change_on_suspend(lua_State *L)
+{
+	size_t size;
+	const char *bytes = luaL_checklstring(L, 2, &size);
+
+	memcpy(&change_address, luaL_checkstring(L, 1), sizeof change_address);
+	memcpy(change_bytes, bytes, size);
+	change_size = size;
+	return 0;
+}
+
+static int l_test_deny_next_thread(lua_State *L)
+{
+	find_plus(L, 2);
+	if (!real_get_proc)
+		replace_plus_import("GetProcAddress", (void *)denying_get_proc, (void **)&real_get_proc);
+	next_thread_denied = lua_toboolean(L, 1);
+	return 0;
+}
+
+static HANDLE (WINAPI *real_snapshot)(DWORD flags, DWORD process);
+static volatile LONG snapshot_denied;
+
+static HANDLE WINAPI denying_snapshot(DWORD flags, DWORD process)
+{
+	if (snapshot_denied) {
+		SetLastError(ERROR_ACCESS_DENIED);
+		return INVALID_HANDLE_VALUE;
+	}
+	return real_snapshot(flags, process);
+}
+
+static int l_test_deny_snapshot(lua_State *L)
+{
+	find_plus(L, 2);
+	if (!real_snapshot)
+		replace_plus_import("CreateToolhelp32Snapshot", (void *)denying_snapshot, (void **)&real_snapshot);
+	snapshot_denied = lua_toboolean(L, 1);
+	return 0;
+}
+
+static BOOL (WINAPI *real_context)(HANDLE thread, LPCONTEXT context);
+static volatile LONG context_failures;
+
+static BOOL WINAPI failing_context(HANDLE thread, LPCONTEXT context)
+{
+	if (InterlockedDecrement(&context_failures) >= 0) {
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	return real_context(thread, context);
+}
+
+static int l_test_fail_context(lua_State *L)
+{
+	find_plus(L, 2);
+	if (!real_context)
+		replace_plus_import("GetThreadContext", (void *)failing_context, (void **)&real_context);
+	context_failures = (LONG)luaL_checkinteger(L, 1);
+	return 0;
+}
+
+static int l_test_fail_alloc(lua_State *L)
+{
+	find_plus(L, 2);
+	if (!real_alloc)
+		replace_plus_import("VirtualAlloc", (void *)refusing_alloc, (void **)&real_alloc);
+	refused_size = (SIZE_T)luaL_checkinteger(L, 1);
+	return 0;
+}
+
+static int l_test_microseconds(lua_State *L)
+{
+	LARGE_INTEGER now, frequency;
+
+	QueryPerformanceCounter(&now);
+	QueryPerformanceFrequency(&frequency);
+	lua_pushnumber(L, (lua_Number)((double)(now.QuadPart % (frequency.QuadPart * 10)) * 1e6 / (double)frequency.QuadPart));
+	return 1;
+}
+
+static const BYTE *reader_address;
+static volatile LONG reader_stop;
+static volatile LONG64 reader_reads;
+static volatile LONG64 reader_torn;
+static volatile LONG reader_gap;
+static HANDLE reader_thread;
+
+static DWORD WINAPI run_reader(void *unused)
+{
+	UINT32 words[4];
+	LARGE_INTEGER frequency, now, last;
+	LONG gap;
+
+	(void)unused;
+	QueryPerformanceFrequency(&frequency);
+	QueryPerformanceCounter(&last);
+	while (!reader_stop) {
+		_mm_storeu_si128((__m128i *)words, _mm_loadu_si128((const __m128i *)reader_address));
+		if (words[0] != words[1] || words[1] != words[2] || words[2] != words[3])
+			reader_torn++;
+		reader_reads++;
+		QueryPerformanceCounter(&now);
+		gap = (LONG)((now.QuadPart - last.QuadPart) * 1000000 / frequency.QuadPart);
+		if (gap > reader_gap)
+			reader_gap = gap;
+		last = now;
+	}
+	return 0;
+}
+
+static int l_test_aligned_offset(lua_State *L)
+{
+	ULONG_PTR address;
+	ULONG_PTR alignment = (ULONG_PTR)luaL_checkinteger(L, 2);
+
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	lua_pushnumber(L, (lua_Number)((alignment - address % alignment) % alignment));
+	return 1;
+}
+
+static int l_test_reader_start(lua_State *L)
+{
+	memcpy(&reader_address, luaL_checkstring(L, 1), sizeof reader_address);
+	reader_stop = 0;
+	reader_reads = 0;
+	reader_torn = 0;
+	reader_gap = 0;
+	reader_thread = CreateThread(NULL, 0, run_reader, NULL, 0, NULL);
+	return 0;
+}
+
+static int l_test_reader_counts(lua_State *L)
+{
+	lua_pushnumber(L, (lua_Number)reader_reads);
+	lua_pushnumber(L, (lua_Number)reader_torn);
+	lua_pushnumber(L, (lua_Number)reader_gap);
+	return 3;
+}
+
+static int l_test_reader_stop(lua_State *L)
+{
+	reader_stop = 1;
+	WaitForSingleObject(reader_thread, 5000);
+	CloseHandle(reader_thread);
+	return l_test_reader_counts(L);
 }
 
 static void WINAPI far_only_system_info(LPSYSTEM_INFO info)
@@ -1064,6 +1416,7 @@ static const struct {
 	{ "second", fault_second },
 	{ "worker_stuck", fault_worker_stuck },
 	{ "two_threads", fault_two_threads },
+	{ "overlap", fault_overlap },
 	{ "worker_waits", fault_worker_waits },
 	{ "worker_blocked", fault_worker_blocked },
 	{ "worker_dead", fault_worker_dead },
@@ -1230,6 +1583,7 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_crash", l_test_crash);
 	lua_register(L, "test_recovered_crash", l_test_recovered_crash);
 	lua_register(L, "test_execute_crash", l_test_execute_crash);
+	lua_register(L, "test_run", l_test_run);
 	lua_register(L, "test_thread_crash", l_test_thread_crash);
 	lua_register(L, "test_allocator_crash", l_test_allocator_crash);
 	lua_register(L, "test_hook_timing", l_test_hook_timing);
@@ -1252,6 +1606,23 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_park_rip", l_test_park_rip);
 	lua_register(L, "test_park_flag", l_test_park_flag);
 	lua_register(L, "test_park_finish", l_test_park_finish);
+	lua_register(L, "test_park_leave_on_retry", l_test_park_leave_on_retry);
+	lua_register(L, "test_park_left", l_test_park_left);
+	lua_register(L, "test_fail_protect", l_test_fail_protect);
+	lua_register(L, "test_fail_alloc", l_test_fail_alloc);
+	lua_register(L, "test_watch_suspend", l_test_watch_suspend);
+	lua_register(L, "test_suspend_calls", l_test_suspend_calls);
+	lua_register(L, "test_spawn_on_suspend", l_test_spawn_on_suspend);
+	lua_register(L, "test_end_spawned", l_test_end_spawned);
+	lua_register(L, "test_change_on_suspend", l_test_change_on_suspend);
+	lua_register(L, "test_deny_next_thread", l_test_deny_next_thread);
+	lua_register(L, "test_deny_snapshot", l_test_deny_snapshot);
+	lua_register(L, "test_fail_context", l_test_fail_context);
+	lua_register(L, "test_microseconds", l_test_microseconds);
+	lua_register(L, "test_aligned_offset", l_test_aligned_offset);
+	lua_register(L, "test_reader_start", l_test_reader_start);
+	lua_register(L, "test_reader_counts", l_test_reader_counts);
+	lua_register(L, "test_reader_stop", l_test_reader_stop);
 	lua_register(L, "test_force_far_hooks", l_test_force_far_hooks);
 	lua_register(L, "test_far_function", l_test_far_function);
 	lua_register(L, "test_catch_site_call", l_test_catch_site_call);

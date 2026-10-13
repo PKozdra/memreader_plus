@@ -33,7 +33,7 @@ local function counter_bytes(scratch, counter)
 end
 
 local function run()
-	check(mr.plus_version == '0.10.0', 'plus_version is ' .. tostring(mr.plus_version))
+	check(mr.plus_version == '0.11.0', 'plus_version is ' .. tostring(mr.plus_version))
 	local murmur, count = mr.find_pattern(MURMUR)
 	check(count == 1, 'the murmur hash pattern matches once: ' .. tostring(count))
 	local text = mr.alloc(#KEY + 1)
