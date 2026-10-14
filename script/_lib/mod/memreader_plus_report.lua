@@ -133,7 +133,9 @@ local function mask_paths(text)
 end
 
 local function load_bin()
-	local chunk, load_error = loadfile('/script/memreader_plus/bin')
+	local release = _G.memreader_plus_release
+	if not release then error('no release was started', 0) end
+	local chunk, load_error = loadfile('/script/memreader_plus/' .. release .. '/bin')
 	if not chunk then error('bin.lua missing: ' .. tostring(load_error), 0) end
 	return chunk()
 end

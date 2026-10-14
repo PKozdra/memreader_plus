@@ -1,0 +1,2 @@
+script/_lib/mod/!memreader_plus_boot.lua -text
+tests/fixtures/v0_12_0/** -text

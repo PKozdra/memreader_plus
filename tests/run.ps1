@@ -17,6 +17,8 @@ $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
     call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; links = 0; far_hook = 0; cave = 0; cave_session = 0; owner_report = 0; change_rows = 0; claims = 0; held_bytes = 0; batch = 0; sites = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
     file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
+    newest_wins_single = 0; newest_wins_two_releases = 0; newest_wins_old_bundle_first = 0; newest_wins_cpecific_after = 0
+    newest_wins_stale_cache = 0; newest_wins_no_lookup = 0; newest_wins_bad_markers = 0; newest_wins_failed_start = 0; newest_wins_frozen_boot = 0
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash; fault_report_in_site = $crash; fault_report_in_cave = $crash; fault_report_in_link = $crash; fault_report_in_original = $crash; fault_report_in_around = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
     fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash
@@ -138,7 +140,7 @@ $commandLineStart = 'Command line: '
 $commandLineBuffer = 1039
 $profilePacks = Join-Path $env:LOCALAPPDATA 'Temp\memreader_plus_test_packs'
 $cpecificDir = [IO.Path]::GetFullPath((Join-Path $root '..\..\workshop\2789863945_twwh3-memreader'))
-$needsCpecific = @('plus_first', 'cpecific_first', 'cpecific_bigread')
+$needsCpecific = @('plus_first', 'cpecific_first', 'cpecific_bigread', 'newest_wins_cpecific_after')
 
 function New-ModFile($work) {
     $packs = New-Item -ItemType Directory (Join-Path $work 'packs')

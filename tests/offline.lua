@@ -33,6 +33,31 @@ loadfile = function(path)
 	return real_loadfile(path)
 end
 
+local function windows_path(path)
+	return (path:gsub('/', '\\'))
+end
+
+local function vfs_lookup(folder, pattern)
+	local seen = {}
+	local found = {}
+	for _, base in ipairs(VFS) do
+		local listing = io.popen('dir /b "' .. windows_path(base .. folder .. pattern) .. '" 2>nul')
+		for name in listing:lines() do
+			local entry = windows_path(folder:sub(2) .. name:gsub('\r$', '')):lower()
+			if not seen[entry] then
+				seen[entry] = true
+				found[#found + 1] = entry
+			end
+		end
+		listing:close()
+	end
+	table.sort(found)
+	return table.concat(found, ',')
+end
+
+common = { filesystem_lookup = vfs_lookup }
+local RELEASE = vfs_lookup('/script/memreader_plus/releases/', '*.lua'):match('([%d_]+)%.lua$')
+
 local function run_mod(path)
 	local chunk, err = real_loadfile(path)
 	assert(chunk, err)
@@ -544,7 +569,7 @@ end
 
 local OURS = PACK .. '/script/_lib/mod/memreader_plus.lua'
 local REPORT = PACK .. '/script/_lib/mod/memreader_plus_report.lua'
-local LOADER = PACK .. '/script/memreader_plus/loader.lua'
+local LOADER = PACK .. '/script/memreader_plus/' .. RELEASE .. '/loader.lua'
 local THEIRS = WORKSHOP_MR .. '/script/_lib/mod/memreader.lua'
 
 local function api(mr, label, small_only)
@@ -586,6 +611,80 @@ local HOST_FAULTS = {
 	fault_report_move_retry = { 'move_retry', false },
 	fault_report_move_fails = { 'move_fails', false },
 }
+
+local BOOT = 'script/_lib/mod/!memreader_plus_boot.lua'
+local ENTRY = 'script/_lib/mod/memreader_plus.lua'
+local OLD_LAYOUT = ROOT .. '/tests/fixtures/v0_11_0'
+local FROZEN_LAYOUT = ROOT .. '/tests/fixtures/v0_12_0'
+
+local function collect_log()
+	local lines = {}
+	ModLog = function(msg)
+		lines[#lines + 1] = msg
+		print('  log: ' .. msg)
+	end
+	return lines
+end
+
+local function count_logged(lines, part)
+	local count = 0
+	for _, line in ipairs(lines) do
+		if has(line, part) then count = count + 1 end
+	end
+	return count
+end
+
+local function count_dll_writes(refuse)
+	local writes = 0
+	local open = io.open
+	io.open = function(name, mode)
+		if mode == 'wb' and has(tostring(name), '.dll') then
+			writes = writes + 1
+			if refuse then return nil, 'Permission denied' end
+		end
+		return open(name, mode)
+	end
+	return function()
+		return writes
+	end
+end
+
+local function write_vfs(relative, text)
+	local path = 'vfs/' .. relative
+	os.execute('mkdir "' .. windows_path(path:match('^(.*)/')) .. '" >nul 2>nul')
+	local file = assert(io.open(path, 'wb'))
+	file:write(text)
+	file:close()
+end
+
+local function fake_manager()
+	return {
+		saving_game = function() end,
+		load_named_value = function() end,
+		load_named_string = function() end,
+	}
+end
+
+local function run_entry(entry, env)
+	local chunk = assert(loadfile('/' .. entry:gsub('\\', '/')))
+	if env then setfenv(chunk, env) end
+	local ok, problem = pcall(chunk)
+	check(ok, 'ran ' .. entry .. (ok and '' or ': ' .. tostring(problem)))
+end
+
+local function run_lib_mod()
+	local entries = {}
+	for entry in vfs_lookup('/script/_lib/mod/', '*.lua'):gmatch('[^,]+') do
+		local name = entry:match('([^\\]+)%.lua$')
+		if name ~= 'memreader_plus_context' and name ~= 'memreader_plus_report' then entries[#entries + 1] = entry end
+	end
+	table.sort(entries, function(a, b)
+		return a:lower() < b:lower()
+	end)
+	for _, entry in ipairs(entries) do
+		run_entry(entry)
+	end
+end
 
 if SCENARIO == 'api' then
 	run_mod(OURS)
@@ -5122,7 +5221,8 @@ elseif SCENARIO:sub(1, 9) == 'file_edit' then
 		'script/memreader_plus/file_edits/good.lua,script/memreader_plus/file_edits/broken.lua,script/memreader_plus/file_edits/notable.lua,script/memreader_plus/file_edits/readme.txt'
 	os.execute('mkdir appdata')
 	common = {
-		filesystem_lookup = function()
+		filesystem_lookup = function(folder, pattern)
+			if has(folder, '/releases/') then return vfs_lookup(folder, pattern) end
 			return lookup
 		end,
 		get_appdata_screenshots_path = function()
@@ -5738,7 +5838,7 @@ elseif SCENARIO:sub(1, 9) == 'file_edit' then
 		ok, why = twui.preview({ path = 'x', ops = { { after = '</l', attribute = 'a', value = '1' } } }, hierarchy_names)
 		check(ok == nil and why == 'op 1: the last anchor does not end inside a start tag', 'attribute op outside a start tag')
 
-		local switch = assert(loadfile('/script/memreader_plus/file_edit_switch'))()
+		local switch = assert(loadfile('/script/memreader_plus/' .. RELEASE .. '/file_edit_switch'))()
 		local screenshots = common.get_appdata_screenshots_path
 		common.get_appdata_screenshots_path = function()
 			return 'appdata/\197\129ukasz/screenshots/'
@@ -6081,7 +6181,7 @@ elseif SCENARIO == 'report_loader' then
 	local bin_missing = false
 	local plain_loadfile = loadfile
 	loadfile = function(path)
-		if path ~= '/script/memreader_plus/bin' then return plain_loadfile(path) end
+		if path ~= '/script/memreader_plus/' .. RELEASE .. '/bin' then return plain_loadfile(path) end
 		if bin_missing then return nil, 'no such file' end
 		return function()
 			return bin
@@ -6089,7 +6189,7 @@ elseif SCENARIO == 'report_loader' then
 	end
 	local function run_loader()
 		_G.memreader_plus_load_error = nil
-		return assert(real_loadfile(LOADER))(ModLog)
+		return assert(real_loadfile(LOADER))(ModLog, RELEASE)
 	end
 
 	bin = { module = 'missing_folder/twwh3-memreader_plus', data = 'x' }
@@ -6138,6 +6238,179 @@ elseif SCENARIO == 'report_loader' then
 	)
 	bin = { module = 'absent_module', data = 'x' }
 	check(has(report_text(), '  absent_module.dll: not found in the game folder\n'), 'a missing DLL is reported')
+elseif SCENARIO == 'newest_wins_single' then
+	local logged = collect_log()
+	local manager = fake_manager()
+	local env = setmetatable({ cm = manager }, { __index = _G })
+	run_entry(PASS == 1 and BOOT or ENTRY, env)
+	local plus = _G.memreader_plus
+	check(plus ~= nil and type(plus.plus_version) == 'string', 'Plus is loaded, pass ' .. PASS)
+	check(
+		count_logged(logged, ('[memreader_plus] releases found: %s; loading %s'):format(RELEASE, RELEASE)) == 1,
+		'the boot logs the one release it found and loaded'
+	)
+	check(_G.memreader == plus, '_G.memreader is _G.memreader_plus')
+	check(_G.memreader_plus_release == RELEASE, 'the loader records its release')
+	check(count_logged(logged, 'loaded ' .. plus.plus_version) == 1, 'one loaded line')
+	check(manager.numeric_locale_safe == true, 'the loader read cm from the environment of its entry')
+	run_entry('script/_lib/mod/memreader.lua', env)
+	check(count_logged(logged, 'loaded ' .. plus.plus_version) == 1 and _G.memreader == plus, 'a second entry reaches the shim and changes nothing')
+	NEXT_PASS = PASS == 1 and failures == 0
+elseif SCENARIO == 'newest_wins_two_releases' then
+	local logged = collect_log()
+	write_vfs('script/memreader_plus/releases/0_0_1.lua', "return '0_0_1'\n")
+	write_vfs('script/memreader_plus/0_0_1/loader.lua', "local log = ...\nlog('[lower release] ran')\n")
+	table.insert(VFS, 1, 'vfs')
+	run_entry(BOOT)
+	check(_G.memreader_plus ~= nil, 'the higher release loaded')
+	check(
+		count_logged(logged, ('releases found: 0_0_1, %s; loading %s'):format(RELEASE, RELEASE)) == 1,
+		'both releases are listed and the higher one is loaded'
+	)
+	check(count_logged(logged, '[lower release] ran') == 0, 'the lower loader never ran')
+elseif SCENARIO == 'newest_wins_old_bundle_first' then
+	local logged = collect_log()
+	local dll_writes = count_dll_writes()
+	table.insert(VFS, 1, OLD_LAYOUT)
+	local old_loader = loadfile('/script/memreader_plus/loader')
+	check(old_loader and has(debug.getinfo(old_loader, 'S').source, 'v0_11_0'), 'the old loader holds the legacy path')
+	run_lib_mod()
+	local plus = _G.memreader_plus
+	check(plus ~= nil and _G.memreader == plus, 'Plus is loaded')
+	check(count_logged(logged, 'loaded ' .. plus.plus_version) == 1, 'one loaded line')
+	check(count_logged(logged, 'loaded 0.11.0') == 0, 'no loaded 0.11.0 line')
+	check(count_logged(logged, 'cannot write') == 0 and count_logged(logged, 'not loaded') == 0, 'no write or load failure is logged')
+	check(dll_writes() == 1, 'the DLL is written once')
+elseif SCENARIO == 'newest_wins_cpecific_after' then
+	collect_log()
+	run_entry(BOOT)
+	local plus = _G.memreader_plus
+	run_mod(THEIRS)
+	check(plus ~= nil and _G.memreader == plus, "Cpecific's loader after the boot leaves _G.memreader at Plus")
+	check(not exists('twwh3-memreader.dll'), "Cpecific's DLL was never written")
+	_G.memreader = {}
+	package.loaded['twwh3-memreader'] = {}
+	package.loaded['twwh2-memreader'] = nil
+	run_mod(OURS)
+	check(
+		_G.memreader == plus and package.loaded['twwh3-memreader'] == plus and package.loaded['twwh2-memreader'] == plus,
+		'the legacy entry puts the Plus names back'
+	)
+elseif SCENARIO == 'newest_wins_stale_cache' then
+	local logged = collect_log()
+	local dll_writes = count_dll_writes()
+	local served = {}
+	local stale = {
+		['/script/memreader_plus/loader'] = OLD_LAYOUT .. '/script/memreader_plus/loader.lua',
+		['/script/memreader_plus/bin'] = OLD_LAYOUT .. '/script/memreader_plus/bin.lua',
+		['/script/_lib/mod/memreader'] = OLD_LAYOUT .. '/script/_lib/mod/memreader.lua',
+		['/script/_lib/mod/memreader_plus'] = OLD_LAYOUT .. '/script/_lib/mod/memreader_plus.lua',
+	}
+	local fresh_loadfile = loadfile
+	loadfile = function(path)
+		local key = path:gsub('%.lua$', '')
+		if not stale[key] then return fresh_loadfile(path) end
+		served[key] = (served[key] or 0) + 1
+		return real_loadfile(stale[key])
+	end
+	run_lib_mod()
+	local plus = _G.memreader_plus
+	check(
+		served['/script/memreader_plus/loader'] == 2 and served['/script/memreader_plus/bin'] == nil,
+		'the cache served the old loader twice and never the old bin'
+	)
+	check(plus ~= nil and _G.memreader == plus, 'the new release is loaded')
+	check(count_logged(logged, 'loaded ' .. plus.plus_version) == 1, 'one loaded line')
+	check(count_logged(logged, 'cannot write') == 0 and count_logged(logged, 'not loaded') == 0, 'no write or load failure is logged')
+	check(dll_writes() == 1, 'the DLL is written once')
+	local bin = assert(fresh_loadfile('/script/memreader_plus/' .. RELEASE .. '/bin'))()
+	check(read_all('twwh3-memreader_plus.dll') == bin.data, "the DLL on disk is the release's own")
+elseif SCENARIO == 'newest_wins_no_lookup' then
+	local logged = collect_log()
+	common = {}
+	run_entry(BOOT)
+	common = nil
+	run_entry(BOOT)
+	common = {
+		filesystem_lookup = function()
+			error('boom', 0)
+		end,
+	}
+	run_entry(BOOT)
+	check(_G.memreader_plus == nil, 'Plus is not loaded without a release list')
+	check(
+		#logged == 3 and count_logged(logged, 'common.filesystem_lookup is missing') == 2 and count_logged(logged, 'listing the releases failed: boom') == 1,
+		'one log line per start and no error escapes'
+	)
+	local loader = assert(real_loadfile(LOADER))
+	check(loader(ModLog) == nil and _G.memreader_plus == nil, 'a loader started without an id returns nil')
+	check(count_logged(logged, 'started without a release id') == 1 and _G.memreader_plus_release == nil, 'and says so in one log line')
+elseif SCENARIO == 'newest_wins_failed_start' then
+	local logged = collect_log()
+	local dll_writes = count_dll_writes(true)
+	local started = { listeners = 0, popups = 0 }
+	local core = {
+		is_campaign = function()
+			return true
+		end,
+		is_frontend = function()
+			return false
+		end,
+		add_listener = function()
+			started.listeners = started.listeners + 1
+		end,
+	}
+	local cm = {
+		add_first_tick_callback = function()
+			started.popups = started.popups + 1
+		end,
+	}
+	local env = setmetatable({ core = core, cm = cm }, { __index = _G })
+	table.insert(VFS, 2, OLD_LAYOUT)
+	local shim = loadfile('/script/memreader_plus/loader')
+	check(shim and not has(debug.getinfo(shim, 'S').source, 'v0_11_0'), 'the shim holds the legacy loader path, the old bundle is mounted below it')
+	run_entry(BOOT, env)
+	check(_G.memreader_plus == nil and count_logged(logged, 'not loaded: cannot write') == 1, 'the DLL write fails and Plus does not start')
+	check(dll_writes() == 1 and started.listeners == 1 and started.popups == 1, 'the loader ran once: one write, one agree listener, one blocked-popup call')
+	run_entry('script/_lib/mod/memreader.lua', env)
+	run_entry('script/_lib/mod/memreader_plus.lua', env)
+	check(dll_writes() == 1 and started.listeners == 1 and started.popups == 1, 'the legacy entries start nothing again')
+	check(count_logged(logged, 'releases found') == 1 and count_logged(logged, 'not loaded') == 1, 'no second boot run and no second failure line')
+	check(
+		count_logged(logged, 'agreement module not loaded') == 0 and count_logged(logged, 'number format guard not installed') == 0,
+		'the old loader never ran'
+	)
+elseif SCENARIO == 'newest_wins_frozen_boot' then
+	local logged = collect_log()
+	local manager = fake_manager()
+	local env = setmetatable({ cm = manager }, { __index = _G })
+	table.insert(VFS, 1, FROZEN_LAYOUT)
+	local function source_of(path)
+		return debug.getinfo(assert(loadfile(path)), 'S').source
+	end
+	check(
+		has(source_of('/script/_lib/mod/!memreader_plus_boot'), 'v0_12_0') and has(source_of('/script/memreader_plus/loader'), 'v0_12_0'),
+		'the frozen 0.12.0 boot and shim hold their paths'
+	)
+	run_entry(PASS == 1 and BOOT or ENTRY, env)
+	local plus = _G.memreader_plus
+	check(plus ~= nil and _G.memreader == plus and _G.memreader_plus_release == RELEASE, 'the current release loads through the frozen files, pass ' .. PASS)
+	check(
+		count_logged(logged, ('releases found: %s; loading %s'):format(RELEASE, RELEASE)) == 1 and count_logged(logged, 'loaded ' .. plus.plus_version) == 1,
+		'one boot line and one loaded line'
+	)
+	check(manager.numeric_locale_safe == true, 'the current loader reads cm from the environment the frozen files give it')
+	NEXT_PASS = PASS == 1 and failures == 0
+elseif SCENARIO == 'newest_wins_bad_markers' then
+	local logged = collect_log()
+	for _, name in ipairs({ 'x', '1_2', '999_0_0' }) do
+		write_vfs('script/memreader_plus/releases/' .. name .. '.lua', "return 'x'\n")
+	end
+	table.insert(VFS, 1, 'vfs')
+	run_entry(BOOT)
+	check(_G.memreader_plus ~= nil, 'the release that has a folder is loaded')
+	check(count_logged(logged, ('releases found: %s, 999_0_0; loading %s'):format(RELEASE, RELEASE)) == 1, 'names that are no release ids are skipped')
+	check(count_logged(logged, 'release 999_0_0 did not load') == 1, 'a marker without a folder falls back to the next release')
 elseif SCENARIO == 'cpecific_bigread' then
 	io.stdout:setvbuf('no')
 	run_mod(THEIRS)

@@ -1330,7 +1330,9 @@ def loader_world(agree_source, dll_works=True):
 
 
 def run_loader(lua):
-    return lua.eval("function(source) local result = loadstring(source, '@loader')(mod_log) return result end")(LOADER)
+    return lua.eval(
+        "function(source) local result = loadstring(source, '@loader')(mod_log, RELEASE) return result end"
+    )(LOADER)
 
 
 def scenario_loader():

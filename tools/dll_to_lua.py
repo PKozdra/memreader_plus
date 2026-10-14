@@ -1,8 +1,6 @@
 import argparse
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUT = ROOT / "dist" / "pack" / "script" / "memreader_plus" / "bin.lua"
 MODULE = "twwh3-memreader_plus"
 ESCAPES = {0x0A: b"\\n", 0x0D: b"\\r", 0x22: b'\\"', 0x5C: b"\\\\"}
 
@@ -23,7 +21,7 @@ def lua_string(data: bytes) -> bytes:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Embed the DLL into bin.lua for the loader.")
     parser.add_argument("dll", type=Path, help="the built memreader_plus.dll")
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="bin.lua to write")
+    parser.add_argument("--out", type=Path, required=True, help="bin.lua to write, inside the release folder")
     return parser.parse_args()
 
 

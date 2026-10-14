@@ -1,4 +1,6 @@
 log_lines, sites_args = {}, {}
+RELEASE = 'test_release'
+FOLDER = '/script/memreader_plus/' .. RELEASE .. '/'
 
 fake = {
 	set_log = function() end,
@@ -22,18 +24,18 @@ io.open = function(_, mode)
 end
 
 function loadfile(path)
-	if path == '/script/memreader_plus/bin' then
+	if path == FOLDER .. 'bin' then
 		return function()
 			return { module = 'fake_plus', data = 'x' }
 		end
 	end
-	if path == '/script/memreader_plus/agree' then return loadstring(AGREE_SOURCE, '@agree') end
-	if path == '/script/memreader_plus/twui' then
+	if path == FOLDER .. 'agree' then return loadstring(AGREE_SOURCE, '@agree') end
+	if path == FOLDER .. 'twui' then
 		return function()
 			return { edit = function() end }
 		end
 	end
-	if path == '/script/memreader_plus/sites' then
+	if path == FOLDER .. 'sites' then
 		return function(...)
 			sites_args = { ... }
 			return { attach = function() end }

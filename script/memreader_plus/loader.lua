@@ -1,4 +1,4 @@
-local mod_log = ...
+local mod_log, release = ...
 
 if _G.memreader_plus then return _G.memreader_plus end
 
@@ -9,15 +9,23 @@ local function log(message)
 	if type(mod_log) == 'function' then mod_log('[memreader_plus] ' .. message) end
 end
 
+if type(release) ~= 'string' then
+	log('not loaded: started without a release id')
+	return nil
+end
+
+_G.memreader_plus_release = release
+local folder = '/script/memreader_plus/' .. release .. '/'
+
 local function load_agree()
-	local chunk = assert(loadfile('/script/memreader_plus/agree'))
+	local chunk = assert(loadfile(folder .. 'agree'))
 	local agree, internals = chunk()
 	_G.memreader_plus_agree = agree
 	return internals
 end
 
 local function load_dll()
-	local chunk, load_error = loadfile('/script/memreader_plus/bin')
+	local chunk, load_error = loadfile(folder .. 'bin')
 	if not chunk then return nil, 'bin.lua missing: ' .. tostring(load_error) end
 	local bin = chunk()
 	local filename = bin.module .. '.dll'
@@ -38,7 +46,7 @@ local function load_dll()
 end
 
 local function install_locale_guard()
-	local chunk = assert(loadfile('/script/memreader_plus/locale_guard'))
+	local chunk = assert(loadfile(folder .. 'locale_guard'))
 	return chunk().install(entry_env and entry_env.cm or nil)
 end
 
@@ -103,12 +111,12 @@ local function log_file_edit_notes(plus)
 end
 
 local function load_twui(plus)
-	local chunk = assert(loadfile('/script/memreader_plus/twui'))
+	local chunk = assert(loadfile(folder .. 'twui'))
 	plus.twui = chunk(plus)
 end
 
 local function load_sites(plus, agree)
-	local chunk = assert(loadfile('/script/memreader_plus/sites'))
+	local chunk = assert(loadfile(folder .. 'sites'))
 	chunk(plus, agree).attach()
 end
 

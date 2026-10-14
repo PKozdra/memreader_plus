@@ -14,16 +14,28 @@ $dll = Join-Path $build 'Release\memreader_plus.dll'
 
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory $stage | Out-Null
-Copy-Item -Recurse (Join-Path $root 'script') $stage
-$required = 'memreader_plus\loader.lua', 'memreader_plus\agree.lua', 'memreader_plus\sites.lua', 'memreader_plus\twui.lua', 'memreader_plus\file_edit_switch.lua', 'memreader_plus\locale_guard.lua'
+$release = python (Join-Path $root 'tools\stage_release.py') $stage | Select-Object -Last 1
+if ($LASTEXITCODE) { throw 'stage_release failed' }
+$plus = "script\memreader_plus"
+$required = @(
+    'script\_lib\mod\!memreader_plus_boot.lua', 'script\_lib\mod\memreader.lua', 'script\_lib\mod\memreader_plus.lua',
+    'script\_lib\mod\memreader_plus_context.lua', 'script\_lib\mod\memreader_plus_report.lua',
+    "$plus\loader.lua", "$plus\releases\$release.lua"
+)
+foreach ($name in 'loader', 'agree', 'sites', 'twui', 'file_edit_switch', 'locale_guard') { $required += "$plus\$release\$name.lua" }
 foreach ($name in $required) {
-    if (-not (Test-Path (Join-Path $stage "script\$name"))) { throw "$name is missing from the pack folder" }
+    if (-not (Test-Path -LiteralPath (Join-Path $stage $name))) { throw "$name is missing from the pack folder" }
+}
+foreach ($name in 'agree', 'sites', 'twui', 'file_edit_switch', 'locale_guard', 'bin') {
+    if (Test-Path -LiteralPath (Join-Path $stage "$plus\$name.lua")) { throw "$plus\$name.lua must live in the release folder only" }
 }
 $licenses = @(Get-Content -Raw (Join-Path $root 'LICENSE.md'); Get-Content -Raw (Join-Path $root 'vendor\minhook\LICENSE.txt'))
-Set-Content -Encoding utf8 (Join-Path $stage 'script\memreader_plus\third_party_licenses.txt') ($licenses -join "`r`n`r`n")
+Set-Content -Encoding utf8 (Join-Path $stage "$plus\third_party_licenses.txt") ($licenses -join "`r`n`r`n")
 Copy-Item $dll $dist
-python (Join-Path $root 'tools\dll_to_lua.py') $dll
+python (Join-Path $root 'tools\dll_to_lua.py') $dll --out (Join-Path $stage "$plus\$release\bin.lua")
 if ($LASTEXITCODE) { throw 'dll_to_lua failed' }
+python (Join-Path $root 'tools\stage_release.py') $stage --check-published
+if ($LASTEXITCODE) { throw 'the release id is already published with other bytes' }
 
 if (-not $NoPack) {
     python (Join-Path $root 'tools\build_pack.py') $stage $pack

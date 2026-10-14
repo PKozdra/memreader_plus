@@ -57,6 +57,7 @@ Every difference, with before and after values, is in [Differences from memreade
 - [Crash reports](#crash-reports)
 - [Runtime report](#runtime-report)
 - [Both mods installed](#both-mods-installed)
+- [Other mods that carry memreader Plus](#other-mods-that-carry-memreader-plus)
 - [API reference](#api-reference)
 - [Differences from memreader 1.2](#differences-from-memreader-12)
 - [Building from source](#building-from-source)
@@ -1071,12 +1072,16 @@ Writes a runtime report into the folder of the crash reports and returns its fil
 
 ## Both mods installed
 
-Players will often have memreader and memreader Plus enabled together. Both mods ship a loader at the same path, `script/_lib/mod/memreader.lua`. The game runs the `_lib/mod` files in alphabetical order, and that loader runs before `memreader_plus.lua`. Of the two copies, the game uses the one from the pack whose `mod` line comes first in the mod list. Mod managers usually write that list in alphabetical order by pack name, which puts `memreader_plus.pack` before Cpecific's `twwh3-memreader.pack`. That order is only a default, and the player can change it.
+Players will often have memreader and memreader Plus enabled together. The game runs the `_lib/mod` files in alphabetical order, so memreader Plus starts from `script/_lib/mod/!memreader_plus_boot.lua`, a file that runs before the loaders of both mods. It loads memreader Plus and registers it under the module name of Cpecific's DLL. Both mods also ship a loader at the same path, `script/_lib/mod/memreader.lua`, and the game uses the copy from the pack whose `mod` line comes first in the mod list.
 
-1. If memreader Plus is listed first, its `memreader.lua` loads memreader Plus, and Cpecific's loader never runs.
-2. If Cpecific's memreader is listed first, Cpecific's loader loads Cpecific's DLL and sets `_G.memreader`. Then `memreader_plus.lua` loads memreader Plus, which replaces `_G.memreader`. Cpecific's DLL stays loaded but is not used.
+1. If memreader Plus is listed first, its `memreader.lua` finds memreader Plus already loaded and does nothing else. Cpecific's loader never runs.
+2. If Cpecific's memreader is listed first, Cpecific's loader asks for its DLL, gets memreader Plus instead and sets `_G.memreader` to it. Cpecific's DLL is not loaded.
 
-memreader Plus replaces Cpecific's memreader in both cases, and every mod that uses `_G.memreader` ends up using memreader Plus. This holds for any script that reads `_G.memreader` after the `_lib/mod` files have loaded, for example a script in `script/campaign/mod`. If Cpecific's memreader is listed first, a `_lib/mod` file that sorts before `memreader_plus.lua` can still see Cpecific's version. If memreader Plus cannot write its DLL (two game instances running different versions lock the file), it logs `cannot write ...` and does not load, and `_G.memreader` stays Cpecific's.
+memreader Plus replaces Cpecific's memreader in any load order, and every mod that uses `_G.memreader` ends up using memreader Plus. A `_lib/mod` file whose name sorts before `!memreader_plus_boot.lua` runs before either mod loads and finds no `_G.memreader`. If memreader Plus cannot write its DLL (two game instances running different versions lock the file), it logs `cannot write ...` and does not load. Cpecific's loader then loads Cpecific's DLL, and `_G.memreader` is Cpecific's.
+
+## Other mods that carry memreader Plus
+
+Some mods ship a copy of memreader Plus inside their own pack. Each release of memreader Plus keeps its scripts in a folder named after the release, under `script/memreader_plus/`, and the start file loads the newest release it finds there, whatever the load order. Copies made before this layout use only the old loader paths. By the time they run, the newest memreader Plus is already loaded, so they stop without loading anything. If you ship a copy in your mod, take all of `script/memreader_plus/` and the `script/_lib/mod/` files of one release and keep them unchanged.
 
 ## API reference
 
