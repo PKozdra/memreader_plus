@@ -755,7 +755,7 @@ The fields of an entry:
 | `name`, `feature`, `kind` | all | `kind` is `anchor`, `patch`, `value`, `cave`, `frame`, `relocate`, `site`, `prefix`, `postfix`, `around` or `hook` (the same as `around`). `feature` groups the entries that work or fail together |
 | `pattern` or `variants` | all | the hex pattern, which must match once. `variants` is a list of tables that can each override `pattern`, `at`, `expect` and `bytes`, tried in order, and the first that matches once and verifies wins |
 | `at` | all but `anchor` | offset from the match to the site, 0 when left out |
-| `expect` | all but `anchor`, `frame`, `relocate` | the bytes that must be at the site, hex with `??` |
+| `expect` | all but `anchor`, `frame`, `relocate` | the bytes that must be at the site, hex with `??`. A link can leave it out when it hooks the match itself (no `at`) or has an `expect_target`, except with target `'call'`, which reads the call from it. The linter refuses a link's `expect` that only repeats the start of the pattern |
 | `bytes` | `patch`, `cave` | `patch`: the new bytes, as long as `expect`. `cave`: the code, where `{name:4}` is a 4-byte value (`{name:1}`, `{name:8}`) that comes from a read of the same name or from the table given to `install` |
 | `reads` | all | values read out of the match, `uint8`, `int32`, `call`, `rip` or `chain`, with optional `equals`, `low` and `high` checks. `from = 'other_entry'` takes a read from another entry |
 | `size`, `low`, `high`, `before` | `value` | the field the mod sets later with `native.set`, and how many bytes before the site the checked opcode starts |
@@ -764,6 +764,8 @@ The fields of an entry:
 | `target`, `expect_target` | links | hook the target of the `E8` call at the site (`'call'`), the start of the function (`'start'`) or a pointer from a read, and check its first bytes |
 | `grow` | `frame` | bytes for `p:frame` |
 | `sites` | `relocate` | a list of `{ at, expect, bytes }` relative to the match |
+
+An older memreader Plus refuses a link without `expect`. A Plus that accepts one sets `memreader_plus.supports.links_without_expect` to `true`, so a mod that leaves `expect` out can check the field and tell the player to update memreader Plus.
 
 The object it returns:
 

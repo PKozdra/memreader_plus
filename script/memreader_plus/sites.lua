@@ -482,7 +482,8 @@ end
 local function attach_problem(self, rec)
 	local held = held_reason(self, rec)
 	if held then return held end
-	if not fits(plus.read_original(rec.site, 0, #rec.expect), rec.expect) then return 'unexpected bytes' end
+	local expect = rec.expect
+	if expect and not fits(plus.read_original(rec.site, 0, #expect), expect) then return 'unexpected bytes' end
 	local target = rec.expect_target
 	if target and not fits(plus.read_original(rec.address, 0, #target), target) then return 'unexpected bytes at the target' end
 	return nil
@@ -905,6 +906,8 @@ function sites.attach()
 		getmetatable(handle).__index.sites = method
 		return handle
 	end
+	plus.supports = plus.supports or {}
+	plus.supports.links_without_expect = true
 end
 
 sites.parse_hex = parse_hex
