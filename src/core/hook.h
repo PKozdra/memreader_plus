@@ -16,6 +16,8 @@ typedef struct {
 	int function;
 	int item;
 	int priority;
+	LinkFilter *when;
+	int when_ref;
 	BYTE kind;
 	BYTE doomed;
 } Callback;
@@ -90,6 +92,7 @@ void set_result(HookFrame *frame, int type, UINT64 bits);
 
 int run_typed(Hook *hook, HookFrame *frame);
 int hook_next_typed(lua_State *L, HookCall *call);
+void add_filter_text(Text *report, const Hook *hook);
 void prepare_links(lua_State *L);
 void forget_links(void);
 void rebuild_links(Hook *hook);

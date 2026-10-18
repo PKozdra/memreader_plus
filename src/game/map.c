@@ -8,7 +8,8 @@ enum {
 	MAX_KEY_LENGTH = 4096,
 	MAX_BUCKETS = 1 << 24,
 	MAX_BUCKET_NODES = 1 << 20,
-	MAX_INDEX = 0xFFFFFF
+	MAX_INDEX = 0xFFFFFF,
+	MAX_NODES = 1 << 20
 };
 
 static const UINT32 HASH_SEED = 0x4a545eed;
@@ -66,18 +67,50 @@ static UINT32 murmur_hash(const BYTE *data, size_t length)
 	return hash ^ (hash >> 16);
 }
 
-static void open_map(lua_State *L, Map *map)
+enum MapProblem { MAP_OK, MAP_BAD_KEY, MAP_UNREADABLE, MAP_NOT_A_MAP };
+
+static char problem_text[96];
+
+static int read_map(Map *map, INT_PTR address, const char *key, size_t length)
 {
 	CaVector *buckets = &map->buckets;
 
-	map->address = pointer_argument(L, 1);
-	map->key = luaL_checklstring(L, 2, &map->length);
-	if (map->length > MAX_KEY_LENGTH || strlen(map->key) != map->length)
-		luaL_argerror(L, 2, lua_pushfstring(L, "must be a key of at most %d bytes without a zero byte", MAX_KEY_LENGTH));
-	if (!copy_memory(buckets, map->address + BUCKETS, sizeof *buckets))
-		luaL_error(L, "failed to read memory");
+	map->address = address;
+	map->key = key;
+	map->length = length;
+	if (length > MAX_KEY_LENGTH || strlen(key) != length)
+		return MAP_BAD_KEY;
+	if (!copy_memory(buckets, address + BUCKETS, sizeof *buckets))
+		return MAP_UNREADABLE;
 	if (buckets->size < 1 || buckets->size > MAX_BUCKETS || (UINT32)buckets->size > buckets->capacity || !buckets->data)
-		luaL_error(L, "not a CA unordered map (bucket capacity %d, size %d)", (int)buckets->capacity, buckets->size);
+		return MAP_NOT_A_MAP;
+	return MAP_OK;
+}
+
+static const char *map_problem(int problem, const Map *map)
+{
+	if (problem == MAP_BAD_KEY)
+		_snprintf_s(problem_text, sizeof problem_text, _TRUNCATE, "the key must be at most %d bytes without a zero byte", MAX_KEY_LENGTH);
+	else if (problem == MAP_UNREADABLE)
+		_snprintf_s(problem_text, sizeof problem_text, _TRUNCATE, "failed to read memory");
+	else
+		_snprintf_s(problem_text, sizeof problem_text, _TRUNCATE, "not a CA unordered map (bucket capacity %d, size %d)", (int)map->buckets.capacity, map->buckets.size);
+	return problem_text;
+}
+
+static void open_map(lua_State *L, Map *map)
+{
+	INT_PTR address = pointer_argument(L, 1);
+	size_t length;
+	const char *key = luaL_checklstring(L, 2, &length);
+	int problem = read_map(map, address, key, length);
+
+	if (problem == MAP_BAD_KEY)
+		luaL_argerror(L, 2, lua_pushfstring(L, "must be a key of at most %d bytes without a zero byte", MAX_KEY_LENGTH));
+	if (problem == MAP_UNREADABLE)
+		luaL_error(L, "failed to read memory");
+	if (problem == MAP_NOT_A_MAP)
+		luaL_error(L, "not a CA unordered map (bucket capacity %d, size %d)", (int)map->buckets.capacity, map->buckets.size);
 }
 
 static INT_PTR bucket_entry(const Map *map, UINT32 index)
@@ -202,6 +235,91 @@ static int l_map_remove_key(lua_State *L)
 	game_heap_free(L, node, TRUE);
 	lua_pushboolean(L, TRUE);
 	return 1;
+}
+
+const char *map_find(INT_PTR address, const char *key, size_t length, INT_PTR *node)
+{
+	Map map;
+	int problem = read_map(&map, address, key, length);
+
+	if (problem != MAP_OK)
+		return map_problem(problem, &map);
+	*node = find_node(&map);
+	return NULL;
+}
+
+BOOL map_node_index(INT_PTR node, UINT32 *index)
+{
+	return copy_memory(index, node + NODE_VALUE + offsetof(KeyValue, index), sizeof *index);
+}
+
+INT_PTR map_source_of(INT_PTR address, UINT32 index)
+{
+	INT_PTR node, end = address + LIST_END, source = 0;
+	UINT32 found;
+	int steps;
+
+	if (!copy_memory(&node, address + LIST_FIRST, sizeof node))
+		return 0;
+	for (steps = 0; node && node != end && steps < MAX_NODES; steps++) {
+		if (map_node_index(node, &found) && found == index) {
+			copy_memory(&source, node + NODE_VALUE + offsetof(KeyValue, source), sizeof source);
+			return source;
+		}
+		if (!copy_memory(&node, node + NODE_NEXT, sizeof node))
+			return 0;
+	}
+	return 0;
+}
+
+const char *map_put(lua_State *L, INT_PTR address, const char *key, size_t length, UINT32 index, INT_PTR source, INT_PTR *node)
+{
+	Map map;
+	__declspec(align(16)) KeyValue value;
+	__declspec(align(16)) UINT64 result[2] = { 0, 0 };
+	UINT64 arguments[3], unused;
+	Fault fault = { 0, 0, NULL };
+	int problem = read_map(&map, address, key, length);
+	BOOL called;
+
+	if (problem != MAP_OK)
+		return map_problem(problem, &map);
+	if (!emplace_unique)
+		emplace_unique = find_unique(emplace_pattern);
+	if (!emplace_unique)
+		return "the game's map insert was not found in this game build";
+	memset(&value, 0, sizeof value);
+	value.index = index;
+	value.source = source;
+	make_game_string(L, &value.key, key);
+	arguments[0] = (UINT64)address;
+	arguments[1] = (UINT64)result;
+	arguments[2] = (UINT64)&value;
+	called = call_native(emplace_unique, arguments, 3, &unused, &fault);
+	free_game_string(L, (INT_PTR)&value.key);
+	if (!called)
+		return "the game's map insert failed";
+	*node = (INT_PTR)result[0];
+	return (BYTE)result[1] ? NULL : "key exists";
+}
+
+const char *map_take(lua_State *L, INT_PTR address, const char *key, size_t length, UINT32 index)
+{
+	Map map;
+	UINT32 found;
+	INT_PTR node;
+	int problem = read_map(&map, address, key, length);
+
+	if (problem != MAP_OK)
+		return map_problem(problem, &map);
+	node = find_node(&map);
+	if (!node || !map_node_index(node, &found) || found != index)
+		return NULL;
+	if (!unlink_node(&map, node))
+		return "failed to write memory";
+	free_game_string(L, node + NODE_VALUE);
+	game_heap_free(L, node, TRUE);
+	return NULL;
 }
 
 const luaL_Reg map_functions[] = {

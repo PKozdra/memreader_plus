@@ -602,12 +602,12 @@ Returns the owner name that `patch_list` and the crash reports show.
 ### Prefix, postfix and around
 
 ```lua
-p:prefix(at, signature, name, fn, [priority])   -- fn(call, a1, ..., an)
-p:postfix(at, signature, name, fn, [priority])  -- fn(call, result, a1, ..., an) -> nil keeps the result
-p:around(at, signature, name, fn, [priority])   -- fn(game, a1, ..., an) -> result
+p:prefix(at, signature, name, fn, [priority], [when])   -- fn(call, a1, ..., an)
+p:postfix(at, signature, name, fn, [priority], [when])  -- fn(call, result, a1, ..., an) -> nil keeps the result
+p:around(at, signature, name, fn, [priority], [when])   -- fn(game, a1, ..., an) -> result
 ```
 
-All three put a link on the function at `at`. `at` is a pointer, or a target table (below). The signature is the one `call` and `hook` use, and arguments reach `fn` converted the same way. `priority` is a whole number from -1000 to 1000, 0 when left out.
+All three put a link on the function at `at`. `at` is a pointer, or a target table (below). The signature is the one `call` and `hook` use, and arguments reach `fn` converted the same way. `priority` is a whole number from -1000 to 1000, 0 when left out. `when` can be left out too, see [Link filter](#link-filter).
 
 The links of one call run in three steps, on the script thread:
 
@@ -663,6 +663,23 @@ Other threads never reach links. A call that comes on a thread other than the sc
 
 Do not call the game's script functions inside a link, for the reasons given under [Rules for hooks](#rules-for-hooks). A skip also skips whatever else the game function does, so run the function with `game` or `call:original` when you can, and change the one value that is wrong.
 
+#### Link filter
+A link on a function that the game calls millions of times in a turn can ask Plus to check a condition first and skip Lua for every call that fails it. The filter is the `when` table, the argument after `priority` in `prefix`, `postfix` and `around`:
+
+```lua
+local factions = mr.pointer_set()
+factions:fill({ faction_a, faction_b }) -- pointers of the factions that need the link
+p:around(at, 'void(pointer, pointer, pointer, int32, uint8)', 'scale_effects', fn, nil, { arg = 2, reads = { 0x10 }, set = factions })
+```
+
+`arg` is the position of a `pointer`, `int64` or `uint64` argument in the signature. `reads` is a list of up to 4 whole offsets from -16777215 to 16777215. Plus starts with the argument, follows each offset in turn (the key becomes the 8 bytes found at the key plus the offset), and runs the link only when the final key is in the set. Before each read, Plus checks the key and the key plus the offset. If either is 0 or outside the range of user memory, Plus skips the read and the call does not pass. The final key is not read, so it only has to be in the set, and 0 never is. The test uses the arguments the game passed, before any `call:set`.
+
+When no link of an address passes, the game function runs without any Lua and without a count in `hook_info`. Links without a `when`, and `hook` callbacks, are never filtered, so an address that holds one still enters Lua on every call.
+
+`mr.pointer_set()` returns an empty set. `set:fill(list)` replaces the whole content with up to 4096 pointers, `int64` or `uint64` values and returns `true`, or `nil` and the reason (`value 2 is not a pointer, int64 or uint64`, `at most 4096 values`), leaving the set as it was. `set:fill(true)` makes every key except 0 a member, and `set:fill({})` empties the set. Fill the set from state that every player's game shares, such as the first tick or an agreed option, never from a UI event or the local faction, because pointer values differ between machines and the choice of members must not.
+
+If a read faults, Plus switches the filter off for that link until the next game mode. The link stays attached and its `errors` goes up by one, and every later call counts as not passing. `p:info(name)` and `patch_list` show `filtered` (calls that did not pass) and `when = { arg, reads, members = number | 'all', off = text | nil }`. An older Plus ignores `when` and runs the link on every call, so keep the link correct without the filter.
+
 ### Changing code under an owner
 
 ```lua
@@ -692,9 +709,26 @@ Two things hold for all of these. A byte range that one change replaced is claim
 #### Removing
 
 #### `handle:remove(name: string): true | nil, string`
-Takes one change back. A patch or a set puts the saved bytes back, if the bytes there are still the ones you wrote. A link or a site is detached. A cave, a frame and a relocation can't be taken back, and the answer is `nil, 'stays for the session'`. An unknown name answers `nil, 'unknown name'`.
+Takes one change back. A patch or a set puts the saved bytes back, if the bytes there are still the ones you wrote. A link or a site is detached. A row is taken out of its table. A cave, a frame and a relocation can't be taken back, and the answer is `nil, 'stays for the session'`. An unknown name answers `nil, 'unknown name'`.
 #### `handle:remove_all(): true | nil, string, removed: float, stays: float`
 Removes everything of the handle's owner that can be taken back. It returns `true`, the number removed and the number that stay. When a change could not be put back it returns `nil`, the reason and the two numbers.
+
+### Adding rows to a game table
+
+```lua
+local record, row = p:row(name, table, template, key, [edits]) -- the new record and its row number | nil, why
+```
+
+#### `handle:row(name: string, table: pointer, template: pointer, key: string, [edits: table]): pointer, float | nil, string`
+Adds one row to a loaded database table, recorded under your mod's name so that `remove` takes it out again. `table` is the game's table object and `template` is a pointer to an existing row of that table. `key` is the text the game builds for the key of the row, 1 to 255 bytes. The new row is a copy of the template, and `edits` changes bytes in the copy. It is a table from an offset to a typed value or a string, for example `{ [0x18] = source_row }`, with at most 16 entries, no offset below 8 (the first 8 bytes are the row's vtable) and no overlaps.
+
+Plus allocates the row with the game's allocator, puts it at the end of the table's list of rows and adds `key` to the table's key map. It returns the pointer to the row and the row number, which counts from 0. The same call again returns the same row, and the same name with other arguments answers `nil, 'the name is already used for a different change'`. `p:info(name)` and `patch_list` show `kind = 'row'`, `state` (`ours`, or `missing` when the row is not in the table any more), `table`, `key` and `row`.
+
+The copy shares whatever the template points to. Use `row` for rows made of numbers and pointers to other rows. A row that owns text or a list would share it with the template.
+
+A refusal answers `nil` and the reason: `not a database table`, `the template is not a row of this table`, `key exists`, `the key must be 1 to 255 bytes without a zero byte`, an edit message such as `edits overlap`, or `full` after 256 rows.
+
+Add rows before the game reads the table. A table that the game copies when a battle loads needs its rows before that battle loads. The rows stay until you remove them, also across mode switches, and `p:remove(name)` works from any mode. Taking a row out removes its key and the row from the end of the list, so it works only for the last row of its table. If another mod added a row after yours, the answer is `nil, 'rows were added after it'`, and the remove works once that row is gone. `remove_all` takes an owner's rows out newest first. Every player needs the same rows when a multiplayer battle loads, and Plus does not check that.
 
 ### Batches
 

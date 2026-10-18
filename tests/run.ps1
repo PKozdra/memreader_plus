@@ -9,13 +9,13 @@ $exe = Join-Path $hostBuild 'Release\Warhammer3.exe'
 $crash = -1073741819
 $reportPrefix = 'memreader_crash_report_'
 
-$Only = if ($Perf) { @('links') } else { @($Only -split ',') }
+$Only = if ($Perf) { @('links', 'link_filter') } else { @($Only -split ',') }
 $env:PLUS_PERF = if ($Perf) { '1' } else { '' }
 $failed = @()
 $skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
-    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; links = 0; far_hook = 0; cave = 0; cave_session = 0; owner_report = 0; change_rows = 0; claims = 0; held_bytes = 0; batch = 0; sites = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
+    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; links = 0; link_filter = 0; far_hook = 0; cave = 0; cave_session = 0; owner_report = 0; change_rows = 0; claims = 0; held_bytes = 0; rows = 0; batch = 0; sites = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
     file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
     newest_wins_single = 0; newest_wins_two_releases = 0; newest_wins_old_bundle_first = 0; newest_wins_cpecific_after = 0
     newest_wins_stale_cache = 0; newest_wins_no_lookup = 0; newest_wins_bad_markers = 0; newest_wins_failed_start = 0; newest_wins_frozen_boot = 0
@@ -37,10 +37,10 @@ $reports = @{
     fault_report_worker_blocked = 'none'; fault_report_worker_dead = 'none'; fault_report_move_retry = 'started'; fault_report_move_fails = 'started'
     exit_report = 'started'; exit_report_terminate = 'started'; exit_report_crt = 'started'; exit_report_quiet = 'none'; exit_report_off = 'none'
     runtime_report = 'none'; runtime_report_reports_off = 'none'; runtime_report_no_folder = 'none'; runtime_report_write_fails = 'none'
-    runtime_report_then_crash = 'started'; settings_cut = 'started'; settings_none = 'started'; report_native = 'none'; owner_report = 'none'
+    runtime_report_then_crash = 'started'; settings_cut = 'started'; settings_none = 'started'; report_native = 'none'; owner_report = 'none'; rows = 'none'
 }
 $runtimeCounts = @{
-    runtime_report = 1; runtime_report_reports_off = 1; runtime_report_no_folder = 0; runtime_report_write_fails = 0; runtime_report_then_crash = 1; report_native = 1; owner_report = 2
+    runtime_report = 1; runtime_report_reports_off = 1; runtime_report_no_folder = 0; runtime_report_write_fails = 0; runtime_report_then_crash = 1; report_native = 1; owner_report = 2; rows = 1
 }
 $readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
@@ -114,7 +114,7 @@ $scenarioNeedles = @{
 }
 $scenarioAbsent = @{ fault_report_in_original = @('memreader Plus link running') }
 $ownerHeader = 'memreader Plus changes by owner:'
-$ownerScenarios = @('owner_report', 'fault_report_in_cave', 'fault_report_in_link', 'fault_report_in_original', 'fault_report_in_around')
+$ownerScenarios = @('owner_report', 'rows', 'fault_report_in_cave', 'fault_report_in_link', 'fault_report_in_original', 'fault_report_in_around')
 $scenarioPatterns = @{ fault_report_in_site = 'Warhammer3\.exe\+0x[0-9a-f]+  function \+0x[0-9a-f]+, offset \+0x128\r?\n' }
 $contextNeedles = @(
     'Game context set by script at safe moments:', '  mode: campaign', '  campaign: main_warhammer', '  campaign type: sp', '  difficulty: hard',

@@ -3608,6 +3608,24 @@ elseif SCENARIO == 'owner_report' then
 		local p = mr.patcher('alpha_mod')
 		check(#mr.patch_list('alpha_mod') == 6, 'the registry survives the mode switch')
 		check(p:info('on_target').state == 'detached', 'a site without its callback after the mode switch is detached')
+		local filtered = mr.patcher('filter_mod')
+		local filter_set, broken_set = mr.pointer_set(), mr.pointer_set()
+		filter_set:fill({ mr.uint64(5), mr.uint64(6) })
+		broken_set:fill(true)
+		check(
+			filtered:prefix(address('hook_single'), 'int64(int64)', 'seen', function() end, nil, { arg = 1, reads = { 16, -8 }, set = filter_set }) == true
+				and filtered:prefix(
+						address('hook_mixed'),
+						'double(int64, double, float, int32, int8, double)',
+						'broken',
+						function() end,
+						nil,
+						{ arg = 1, reads = { 0 }, set = broken_set }
+					)
+					== true,
+			'two filtered links, one on a chain that will fault'
+		)
+		mr.call(address('hook_mixed'), 'double(int64, double, float, int32, int8, double)', mr.int64(test_reserved()), 0, 0, 0, 0, 0)
 		local cave = install_all(p, code, false)
 		check(mr.eq(cave, mr.hook_info(address('cave_target')).cave), 'repeating every name is a no-op and the cave pointer is the same')
 		check(#mr.patch_list('alpha_mod') == 6, 'and adds nothing')
@@ -3647,6 +3665,8 @@ elseif SCENARIO == 'owner_report' then
 			', code cave, from [string "raw_cave_caller"]:1\n',
 			', site hook, RUNNING (on the stack)',
 			', by alpha_mod/on_target, gamma_mod/shared\n',
+			', by filter_mod/seen when arg 1 [+0x10] [-0x8] in 2\n',
+			', by filter_mod/broken when arg 1 [+0x0] in all, off: read at 0x',
 			', by alpha_mod/load_copy\n',
 			', by alpha_mod/army_cap\n',
 			', by alpha_mod/planner\n',
@@ -4540,6 +4560,776 @@ elseif SCENARIO == 'batch' then
 	)
 	test_fail_context(0, mr.hop_slots)
 	check(test_park_finish() == 77, 'the thread finished')
+elseif SCENARIO == 'link_filter' then
+	io.stdout:setvbuf('no')
+	local logged = {}
+	ModLog = function(message)
+		logged[#logged + 1] = message
+		print('  log: ' .. message)
+	end
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local SIGNATURE = 'int64(pointer, pointer, pointer, int32, uint8)'
+	local SINGLE = 'int64(int64)'
+	local EXPECTED = 35
+	local target, single = mr.pointer(test_function('host_source')), mr.pointer(test_function('hook_single'))
+	local dummy = mr.alloc(16)
+	local function contains(text, part)
+		return type(text) == 'string' and string.find(text, part, 1, true) ~= nil
+	end
+	local function lines_with(part)
+		local count = 0
+		for _, line in ipairs(logged) do
+			if contains(line, part) then count = count + 1 end
+		end
+		return count
+	end
+	local function call_with(source)
+		return mr.tonumber(mr.call(target, SIGNATURE, dummy, source, dummy, 3, 5))
+	end
+	local function make_source(key)
+		local block = mr.alloc(32)
+		mr.write(block, 0x10, key)
+		return block
+	end
+	local function pass_through(game)
+		return game()
+	end
+	local trace = {}
+	local function mark(text)
+		trace[#trace + 1] = text
+	end
+	local function seen()
+		local text = table.concat(trace, ' ')
+		trace = {}
+		return text
+	end
+
+	if PASS == 1 then
+		local p = mr.patcher('filter_a')
+		local f1, f2, f3 = mr.alloc(16), mr.alloc(16), mr.alloc(16)
+		local s1, s2, s3 = make_source(f1), make_source(f2), make_source(f3)
+		check(mr.eq(mr.read_pointer(s1, 0x10), f1), 'a test source holds its key at +0x10')
+		check(call_with(s1) == EXPECTED, 'the original result before any link')
+
+		local set = mr.pointer_set()
+		check(set:fill({ f1 }) == true, 'fill takes a list of pointers')
+		local hits = 0
+		check(p:around(target, SIGNATURE, 'gate', function(game)
+			hits = hits + 1
+			return game()
+		end, nil, { arg = 2, reads = { 0x10 }, set = set }) == true, 'an around with a when option and no priority')
+		check(call_with(s1) == EXPECTED and hits == 1, 'a member runs the link')
+		check(call_with(s2) == EXPECTED and call_with(s3) == EXPECTED and hits == 1, 'other keys run the original with no Lua entry, and the result is right')
+		local row = p:info('gate')
+		check(row.calls == 1 and row.filtered == 2 and row.errors == 0, 'the row counts calls and filtered: ' .. row.calls .. ' ' .. row.filtered)
+		check(mr.hook_info(target).calls == 1, 'and the hook counts only the call that entered Lua')
+		check(
+			row.when.arg == 2 and row.when.reads[1] == 16 and #row.when.reads == 1 and row.when.members == 1 and row.when.off == nil,
+			'the row shows the filter'
+		)
+		local listed = mr.patch_info(target).links[1]
+		check(listed.filtered == 2 and listed.when.arg == 2 and listed.when.members == 1, 'patch_info shows it too')
+		check(mr.patch_list('filter_a')[1].filtered == 2 and mr.patch_list('filter_a')[1].when.members == 1, 'and patch_list')
+
+		check(set:fill({ f2, f3 }) == true, 'fill again')
+		check(call_with(s1) == EXPECTED and hits == 1, 'fill replaces the whole content: the old member is out')
+		check(call_with(s2) == EXPECTED and call_with(s3) == EXPECTED and hits == 3, 'and the new ones are in')
+		check(p:info('gate').when.members == 2, 'members counts them')
+		check(set:fill({}) == true and call_with(s2) == EXPECTED and hits == 3 and p:info('gate').when.members == 0, 'an empty list empties the set')
+		check(set:fill(true) == true and p:info('gate').when.members == 'all', 'true makes every key a member')
+		check(call_with(s1) == EXPECTED and call_with(s2) == EXPECTED and call_with(s3) == EXPECTED and hits == 6, 'all three run')
+
+		local faults = test_access_faults()
+		local filtered_before = p:info('gate').filtered
+		local null_hop = mr.alloc(32)
+		local junk_hop = make_source(mr.pointer('\52\18\0\0\0\0\0\0'))
+		local rejected = {
+			call_with(nil),
+			call_with(mr.pointer('\0\16\0\0\0\0\0\0')),
+			call_with(mr.pointer('\0\0\0\0\0\0\0\128')),
+			call_with(mr.pointer('\0\0\255\255\255\127\0\0')),
+			call_with(null_hop),
+		}
+		check(
+			#rejected == 5 and rejected[1] == EXPECTED and rejected[5] == EXPECTED and hits == 6,
+			'a NULL argument, a NULL key, a small value and values above user space run the original only'
+		)
+		check(p:info('gate').filtered == filtered_before + 5, 'and each counts as filtered')
+		check(test_access_faults() == faults, 'without a single access violation: the range check comes before every read')
+		check(call_with(junk_hop) == EXPECTED and hits == 7, 'the last key is only checked for NULL, a small value is looked up')
+		p:remove_all()
+
+		local q = mr.patcher('filter_b')
+		local all = mr.pointer_set()
+		all:fill(true)
+		local chain_hits = 0
+		check(q:around(target, SIGNATURE, 'chain', function(game)
+			chain_hits = chain_hits + 1
+			return game()
+		end, nil, { arg = 2, reads = { 0x10, 0 }, set = all }) == true, 'an around that follows two reads')
+		local tagged = mr.alloc(16)
+		mr.write(tagged, 0, mr.uint64(77))
+		local good_source = make_source(tagged)
+		local reserved = mr.pointer(test_reserved())
+		local bad_source = make_source(reserved)
+		check(call_with(good_source) == EXPECTED and chain_hits == 1, 'a chain of two reads passes')
+		faults = test_access_faults()
+		check(call_with(bad_source) == EXPECTED and chain_hits == 1, 'a chain that faults runs the original and skips the link')
+		check(test_access_faults() == faults + 1, 'it costs one access violation')
+		local faulted = q:info('chain')
+		check(
+			faulted.errors == 1
+				and contains(faulted.error, 'when: read at 0x')
+				and contains(faulted.error, 'faulted (read 2)')
+				and contains(faulted.error, 'the link is off until the next mode'),
+			'the fault is an error of the link: ' .. tostring(faulted.error)
+		)
+		check(
+			contains(faulted.when.off, 'faulted (read 2)') and mr.patch_info(target).links[1].when.off == faulted.when.off,
+			'and the rows say the filter is off'
+		)
+		mr.flush_log()
+		check(lines_with('filter_b/chain (around): when: read at 0x') == 1, 'and it is logged once')
+		for _ = 1, 1000 do
+			call_with(bad_source)
+		end
+		check(test_access_faults() == faults + 1, 'later calls do not read again: no more access violations')
+		check(call_with(good_source) == EXPECTED and chain_hits == 1, 'the filter stays off for the mode, even for a chain that would pass')
+		faulted = q:info('chain')
+		check(faulted.errors == 1 and faulted.filtered == 1002, 'one error, every call counted as filtered: ' .. faulted.filtered)
+		mr.flush_log()
+		check(lines_with('filter_b/chain (around): when: read at 0x') == 1, 'and still logged once')
+
+		local function refusal(when)
+			return select(2, q:around(target, SIGNATURE, 'bad_when', pass_through, nil, when))
+		end
+		local ARG = 'when.arg must name a pointer, int64 or uint64 argument'
+		local OFFSETS = 'when.reads must hold whole offsets from -16777215 to 16777215'
+		check(refusal({ arg = 4, set = all }) == ARG, 'an int32 argument is refused')
+		check(refusal({ arg = 5, set = all }) == ARG, 'a uint8 argument is refused')
+		check(refusal({ arg = 0, set = all }) == ARG and refusal({ arg = 6, set = all }) == ARG, 'an argument outside the signature is refused')
+		check(refusal({ arg = '2', set = all }) == ARG and refusal({ set = all }) == ARG, 'arg must be a number')
+		check(refusal({ arg = 2, reads = { 1, 2, 3, 4, 5 }, set = all }) == 'when.reads takes at most 4 offsets', 'five reads are refused')
+		check(
+			refusal({ arg = 2, reads = { 0.5 }, set = all }) == OFFSETS and refusal({ arg = 2, reads = { 16777216 }, set = all }) == OFFSETS,
+			'offsets are whole and bounded'
+		)
+		check(refusal({ arg = 2, reads = { 'x' }, set = all }) == OFFSETS, 'a text is not an offset')
+		check(refusal({ arg = 2, reads = 5, set = all }) == 'when.reads must be a list of offsets', 'reads is a list')
+		check(refusal({ arg = 2 }) == 'when.set must be a pointer set', 'a set is needed')
+		check(
+			refusal({ arg = 2, set = {} }) == 'when.set must be a pointer set' and refusal({ arg = 2, set = dummy }) == 'when.set must be a pointer set',
+			'and it must be one'
+		)
+		check(refusal({ arg = 2, set = all, read = { 0x10 } }) == 'when has an unknown field', 'a misspelled field is refused')
+		check(not pcall(q.around, q, target, SIGNATURE, 'bad_when', pass_through, nil, 5), 'a when that is not a table raises')
+		check(q:info('bad_when') == nil and #mr.patch_info(target).links == 1, 'refusals register nothing')
+		check(
+			q:around(target, SIGNATURE, 'edge', pass_through, nil, { arg = 2, reads = { -16777215, 16777215, 0, 8 }, set = all }) == true,
+			'four reads at the limits are accepted'
+		)
+		q:remove('edge')
+		check(
+			q:around(target, SIGNATURE, 'wide', pass_through, nil, { arg = 1 }) == nil,
+			'a pointer argument is accepted as the key, but a set is still needed'
+		)
+
+		local tiny = mr.pointer_set()
+		check(select(2, tiny:fill({ 5 })) == 'value 1 is not a pointer, int64 or uint64', 'a Lua number is not a value')
+		check(select(2, tiny:fill({ f1, mr.uint32(5) })) == 'value 2 is not a pointer, int64 or uint64', 'a uint32 is not either')
+		check(select(2, tiny:fill({ f1, 'text' })) == 'value 2 is not a pointer, int64 or uint64', 'and a string is not')
+		check(
+			not pcall(tiny.fill, tiny, 5) and not pcall(tiny.fill, tiny, false) and not pcall(tiny.fill, tiny),
+			'fill of something else than a list or true raises'
+		)
+		check(not pcall(tiny.fill, {}, {}), 'fill needs a set')
+		check(q:around(target, SIGNATURE, 'probe', pass_through, nil, { arg = 2, reads = { 0x10 }, set = tiny }) == true, 'a link on the small set')
+		q:remove('chain')
+		check(tiny:fill({ f1 }) == true, 'fill')
+		local probe_before = q:info('probe').calls
+		check(call_with(s1) == EXPECTED and q:info('probe').calls == probe_before + 1, 'f1 is in')
+		local big = {}
+		for i = 1, 4097 do
+			big[i] = mr.uint64(i * 16)
+		end
+		local ok, why = tiny:fill(big)
+		check(ok == nil and why == 'at most 4096 values', 'more than 4096 values are refused: ' .. tostring(why))
+		ok, why = tiny:fill({ f2, mr.uint32(1) })
+		check(ok == nil and q:info('probe').when.members == 1, 'a refusal leaves the set as it was')
+		check(call_with(s1) == EXPECTED and q:info('probe').calls == probe_before + 2, 'and f1 is still in')
+		check(call_with(s2) == EXPECTED and q:info('probe').calls == probe_before + 2, 'and f2 is not')
+
+		local function key_of(i)
+			return string.char((i * 16) % 256, math.floor(i * 16 / 256) % 256, math.floor(i * 16 / 65536) % 256, 1, 0, 0, 0x10, 0)
+		end
+		local members = {}
+		for i = 1, 4096 do
+			members[i] = mr.uint64(key_of(i))
+		end
+		check(tiny:fill(members) == true and q:info('probe').when.members == 4096, 'a set of 4096 values')
+		local scratch = mr.alloc(32)
+		local before = q:info('probe').calls
+		for i = 1, 4096 do
+			mr.write(scratch, 0x10, members[i])
+			call_with(scratch)
+		end
+		check(q:info('probe').calls == before + 4096, 'every one of them is found')
+		before = q:info('probe').filtered
+		local calls_before = q:info('probe').calls
+		for i = 4097, 8192 do
+			mr.write(scratch, 0x10, mr.uint64(key_of(i)))
+			call_with(scratch)
+		end
+		check(q:info('probe').filtered == before + 4096 and q:info('probe').calls == calls_before, 'and 4096 others are not')
+		local duplicates = { f1, f1, mr.pointer('\0\0\0\0\0\0\0\0'), mr.int64(5) }
+		check(tiny:fill(duplicates) == true and q:info('probe').when.members == 2, 'a repeated value and a NULL are one member and none')
+		q:remove_all()
+
+		local c = mr.patcher('filter_c')
+		local only_f1 = mr.pointer_set()
+		only_f1:fill({ f1 })
+		local replaced_by, seen_source = nil, nil
+		c:prefix(target, SIGNATURE, 'pre', function(call)
+			mark('P')
+			if replaced_by then call:set(2, replaced_by) end
+		end, 5)
+		c:around(target, SIGNATURE, 'filtered', function(game, list, source)
+			mark('A')
+			seen_source = source
+			return game()
+		end, 0, { arg = 2, reads = { 0x10 }, set = only_f1 })
+		c:postfix(target, SIGNATURE, 'post', function()
+			mark('F')
+		end, 0)
+		replaced_by = s1
+		check(
+			call_with(s2) == EXPECTED and seen() == 'P F',
+			'the filter reads the arguments the game passed: a prefix that sets a member source does not wake the around'
+		)
+		replaced_by = s2
+		check(
+			call_with(s1) == EXPECTED and seen() == 'P A F' and mr.eq(seen_source, s2),
+			'and one that replaces a member source does not stop it, the around gets the new one'
+		)
+		replaced_by = nil
+		c:remove_all()
+
+		local d = mr.patcher('filter_d')
+		d:prefix(target, SIGNATURE, 'pre', function()
+			mark('P')
+		end, 0, { arg = 2, reads = { 0x10 }, set = only_f1 })
+		d:around(target, SIGNATURE, 'around', function(game)
+			mark('A')
+			return game()
+		end, 0, { arg = 2, reads = { 0x10 }, set = only_f1 })
+		d:postfix(target, SIGNATURE, 'post', function()
+			mark('F')
+		end, 0, { arg = 2, reads = { 0x10 }, set = only_f1 })
+		check(call_with(s1) == EXPECTED and seen() == 'P A F', 'prefix, around and postfix can all be filtered, a member runs all three')
+		local hook_calls = mr.hook_info(target).calls
+		check(call_with(s2) == EXPECTED and call_with(s3) == EXPECTED and seen() == '', 'three filters saying no: no link runs and the result is the original')
+		check(mr.hook_info(target).calls == hook_calls, 'the hook did not even count the calls: they went straight to the original')
+		check(d:info('pre').filtered == 2 and d:info('around').filtered == 2 and d:info('post').filtered == 2, 'each link counts them')
+		mr.hook(target, SIGNATURE, function(...)
+			mark('H')
+			return mr.hook_next(target, ...)
+		end)
+		check(call_with(s2) == EXPECTED and seen() == 'H', 'an old hook on the address is never filtered')
+		check(
+			mr.hook_info(target).calls == hook_calls + 1 and d:info('pre').filtered == 3,
+			'it makes the call enter the full path, the filtered links stay out'
+		)
+		mr.unhook(target)
+		d:remove_all()
+
+		local e = mr.patcher('filter_e')
+		local other_set = mr.pointer_set()
+		other_set:fill({ f1 })
+		local function install_same(set, reads)
+			return e:around(target, SIGNATURE, 'same', pass_through, nil, { arg = 2, reads = reads, set = set })
+		end
+		check(install_same(only_f1, { 0x10 }) == true, 'a filtered link')
+		call_with(s1)
+		check(e:info('same').calls == 1, 'it ran once')
+		check(install_same(only_f1, { 0x10 }) == true and e:info('same').calls == 1, 'the same name with the same function, set and reads is a no-op')
+		check(install_same(other_set, { 0x10 }) == true and e:info('same').calls == 0, 'another set object replaces the link')
+		call_with(s1)
+		check(install_same(other_set, { 0x20 }) == true and e:info('same').calls == 0 and e:info('same').when.reads[1] == 32, 'other offsets replace it')
+		check(e:around(target, SIGNATURE, 'same', pass_through) == true and e:info('same').when == nil, 'no when at all replaces it too')
+		check(install_same(other_set, { 0x10 }) == true and e:info('same').when.arg == 2, 'and a when replaces the link without one')
+		check(
+			e:around(target, SIGNATURE, 'same', pass_through, nil, { arg = 3, set = other_set }) == true and e:info('same').when.arg == 3,
+			'another argument replaces it'
+		)
+		e:remove_all()
+
+		local g = mr.patcher('filter_g')
+		local orphan_hits = 0
+		g:around(
+			target,
+			SIGNATURE,
+			'orphan',
+			function(game)
+				orphan_hits = orphan_hits + 1
+				return game()
+			end,
+			nil,
+			{
+				arg = 2,
+				reads = { 0x10 },
+				set = (function()
+					local made = mr.pointer_set()
+					made:fill({ f1 })
+					return made
+				end)(),
+			}
+		)
+		for _ = 1, 30 do
+			mr.pointer_set():fill(true)
+		end
+		collectgarbage()
+		collectgarbage()
+		check(
+			call_with(s1) == EXPECTED and orphan_hits == 1 and call_with(s2) == EXPECTED and orphan_hits == 1,
+			'a set that only the link holds survives the garbage collector'
+		)
+		g:remove_all()
+		for _ = 1, 30 do
+			mr.pointer_set():fill({ f1 })
+		end
+		collectgarbage()
+		collectgarbage()
+
+		local refill = mr.pointer_set()
+		refill:fill({ f1 })
+		local h = mr.patcher('filter_h')
+		h:around(target, SIGNATURE, 'refill', function(game)
+			refill:fill({})
+			return game()
+		end, nil, { arg = 2, reads = { 0x10 }, set = refill })
+		check(call_with(s1) == EXPECTED and h:info('refill').calls == 1, 'a link that empties its own set runs')
+		check(call_with(s1) == EXPECTED and h:info('refill').calls == 1 and h:info('refill').filtered == 1, 'and the next call sees the new content')
+		h:remove_all()
+
+		local thread_set = mr.pointer_set()
+		thread_set:fill({ mr.int64(5) })
+		local t = mr.patcher('filter_t')
+		local value_hits = 0
+		t:around(single, SINGLE, 'by_value', function(game)
+			value_hits = value_hits + 1
+			return game()
+		end, nil, { arg = 1, set = thread_set })
+		check(mr.tonumber(mr.call(single, SINGLE, 5)) == 16 and value_hits == 1, 'an int64 argument without reads is the key')
+		check(mr.tonumber(mr.call(single, SINGLE, 6)) == 19 and value_hits == 1 and t:info('by_value').filtered == 1, 'another value is filtered')
+		check(
+			mr.tonumber(mr.call(mr.pointer(test_function('call_on_thread')), 'int64(pointer, int64)', single, 5)) == 16,
+			'a call on another thread runs the original'
+		)
+		check(
+			mr.hook_info(single).other_thread_calls == 1 and value_hits == 1 and t:info('by_value').filtered == 1,
+			'it is counted as an other thread call and the filter does not run there'
+		)
+		local unsigned_set = mr.pointer_set()
+		unsigned_set:fill({ mr.uint64('\255\255\255\255\255\255\255\255') })
+		t:around(single, SINGLE, 'by_value', function(game)
+			value_hits = value_hits + 10
+			return game()
+		end, nil, { arg = 1, set = unsigned_set })
+		check(mr.tonumber(mr.call(single, SINGLE, -1)) == -2 and value_hits == 11, 'an int64 -1 is the same key as a uint64 with all bits set')
+		t:remove_all()
+
+		local block = mr.pointer(test_source_block())
+		mr.write(block, 0x10, f1)
+		local function ns_per_call(calls)
+			return (test_source_loop(test_function('host_source'), calls))
+		end
+		local function least(calls)
+			local best = math.huge
+			for _ = 1, os.getenv('PLUS_PERF') == '1' and 15 or 5 do
+				local value = ns_per_call(calls)
+				if value < best then best = value end
+			end
+			return best
+		end
+		local timing = mr.patcher('filter_timing')
+		local none = mr.pointer_set()
+		local detour_only = least(1000000)
+		timing:around(target, SIGNATURE, 'timed', pass_through, nil, { arg = 2, reads = { 0x10 }, set = none })
+		local rejected_ns = least(1000000)
+		timing:remove_all()
+		timing:around(target, SIGNATURE, 'timed', pass_through)
+		local around_ns = least(100000)
+		timing:remove_all()
+		local accepting = mr.pointer_set()
+		accepting:fill(true)
+		timing:around(target, SIGNATURE, 'timed', pass_through, nil, { arg = 2, reads = { 0x10 }, set = accepting })
+		local accepted_ns = least(100000)
+		timing:remove_all()
+		print(
+			string.format(
+				'  timing (ns per native call, least of rounds): detour only %.1f, filtered link saying no %.1f (+%.1f), unfiltered pass-through around %.1f (+%.1f), filtered around saying yes %.1f',
+				detour_only,
+				rejected_ns,
+				rejected_ns - detour_only,
+				around_ns,
+				around_ns - detour_only,
+				accepted_ns
+			)
+		)
+		local enforce = os.getenv('PLUS_PERF') == '1'
+		local function budget(met, what)
+			if met or enforce then
+				check(met, what)
+			else
+				print('WARN ' .. what .. ' (a budget, enforced by tests\\run.ps1 -Perf)')
+			end
+		end
+		budget(rejected_ns - detour_only <= (around_ns - detour_only) / 10, 'a rejected call costs at most a tenth of a pass-through around')
+		budget(rejected_ns - detour_only < 60, 'and under 60 ns above the detour')
+
+		local carry_set = mr.pointer_set()
+		carry_set:fill(true)
+		check(
+			q:around(target, SIGNATURE, 'carry', pass_through, nil, { arg = 2, reads = { 0x10, 0 }, set = carry_set }) == true,
+			'a link that stays attached into the next mode'
+		)
+		call_with(bad_source)
+		check(q:info('carry').when.off ~= nil and q:info('carry').errors == 1, 'with its filter off')
+
+		NEXT_PASS = failures == 0
+	else
+		local p = mr.patcher('filter_b')
+		check(#mr.patch_info(target).links == 0, 'a new mode starts with every link detached')
+		local row = p:info('carry')
+		check(row ~= nil and row.state == 'detached', 'the old row says detached: ' .. tostring(row and row.state))
+		local tagged = mr.alloc(16)
+		mr.write(tagged, 0, mr.uint64(77))
+		local good_source = make_source(tagged)
+		local bad_source = make_source(mr.pointer(test_reserved()))
+		local fresh = mr.pointer_set()
+		fresh:fill(true)
+		local chain_hits = 0
+		check(p:around(target, SIGNATURE, 'carry', function(game)
+			chain_hits = chain_hits + 1
+			return game()
+		end, nil, { arg = 2, reads = { 0x10, 0 }, set = fresh }) == true, 'the same link attaches again with a new set')
+		row = p:info('carry')
+		check(row.errors == 0 and row.filtered == 0 and row.when.off == nil and row.state == 'stays', 'with its counters and its filter fresh')
+		check(call_with(good_source) == EXPECTED and chain_hits == 1, 'the filter works again')
+		local faults = test_access_faults()
+		check(call_with(bad_source) == EXPECTED and call_with(bad_source) == EXPECTED and test_access_faults() == faults + 1, 'and may fault once in this mode')
+		mr.flush_log()
+		check(lines_with('filter_b/carry (around): when: read at 0x') == 1, 'logged once in this mode as well')
+		check(p:info('carry').errors == 1 and p:info('carry').when.off ~= nil and call_with(good_source) == EXPECTED and chain_hits == 1, 'and off again')
+		p:remove_all()
+	end
+elseif SCENARIO == 'rows' then
+	io.stdout:setvbuf('no')
+	run_mod(OURS)
+	local entry_live = test_heap_blocks()
+	local mr = _G.memreader_plus
+	local filler = mr.pointer(test_function('filler_code'))
+	local RECORD_SIZE = 0x20
+	local KEYS = 0x28
+	local BUCKETS = 31
+	local NODE_INDEX, NODE_SOURCE = 0x20, 0x28
+	local STATE_FILE = 'rows_state.txt'
+	local size_function = mr.game_alloc(8)
+	mr.write(size_function, 0, '\184\32\0\0\0\195\0\0')
+	local record_vtable = mr.game_alloc(8)
+
+	local function hex(bytes)
+		return (bytes:gsub('.', function(c)
+			return ('%02x'):format(c:byte())
+		end))
+	end
+	local function pointer_from_text(text)
+		local raw = {}
+		for i = #text - 1, 1, -2 do
+			raw[#raw + 1] = string.char(tonumber(text:sub(i, i + 1), 16))
+		end
+		return mr.pointer(table.concat(raw))
+	end
+
+	local function make_table(names, capacity)
+		local block = mr.game_alloc(KEYS + 0x30 + (BUCKETS + 1) * 8)
+		local vtable = mr.game_alloc(24)
+		local map = mr.add(block, KEYS)
+		local finish, data = mr.add(map, 8), mr.add(map, 0x30)
+		local buffer = mr.game_alloc(capacity * 8)
+		local t = { block = block, map = map, vtable = vtable, records = {}, targets = {} }
+		mr.write(vtable, 16, size_function)
+		mr.write(block, 0, vtable)
+		mr.write(map, 0x10, finish)
+		mr.write(map, 0x18, mr.uint32(BUCKETS + 1))
+		mr.write(map, 0x1C, mr.uint32(BUCKETS + 1))
+		mr.write(map, 0x20, data)
+		for i = 0, BUCKETS do
+			mr.write(data, i * 8, finish)
+		end
+		mr.write(map, 0x28, 1.0)
+		mr.write(block, 8, mr.uint32(capacity))
+		mr.write(block, 12, mr.int32(#names))
+		mr.write(block, 16, buffer)
+		t.source = mr.game_alloc(8)
+		for i, name in ipairs(names) do
+			local record, target = mr.game_alloc(RECORD_SIZE), mr.game_alloc(8)
+			mr.write(record, 0, record_vtable)
+			mr.write(record, 8, target)
+			mr.write(record, 0x18, mr.add(target, 4))
+			mr.write(buffer, (i - 1) * 8, record)
+			mr.map_add_key(map, name, i - 1, t.source)
+			t.records[i], t.targets[i] = record, target
+		end
+		return t
+	end
+	local function snapshot(t)
+		local count, data = mr.read_array(t.block, 8)
+		local records, keys = {}, {}
+		for i = 0, count - 1 do
+			local record = mr.read_pointer(data, i * 8)
+			records[#records + 1] = mr.tostring(record) .. ':' .. hex(mr.read(record, 0, RECORD_SIZE))
+		end
+		local nodes = mr.read_list(t.map, 0, { 0, 'struct', { key = { 0x10, 'string' }, index = { NODE_INDEX, 'uint32' } } })
+		for _, node in ipairs(nodes) do
+			keys[#keys + 1] = node.key .. '=' .. node.index
+		end
+		table.sort(keys)
+		return count .. '|' .. table.concat(records, ';') .. '|' .. table.concat(keys, ' ')
+	end
+	local function key_index(t, key)
+		local node = mr.map_find_key(t.map, key)
+		return node and mr.read_uint32(node, NODE_INDEX)
+	end
+	local function row_count(t)
+		return mr.read_int32(t.block, 12)
+	end
+	local function live()
+		return test_heap_blocks()
+	end
+	local function refusal(...)
+		local record, why = ...
+		return record == nil and why
+	end
+	local DIFFERENT = 'the name is already used for a different change'
+
+	if PASS == 1 then
+		local deferred = 0
+		local t = make_table({ 'a', 'b', 'c' }, 3)
+		local u = make_table({ 'a', 'b', 'c' }, 16)
+		local before_t, before_u = snapshot(t), snapshot(u)
+		local p = mr.patcher('rows_a')
+		check(type(p.row) == 'function' and mr.supports.rows == true, 'the handle has row and the flag says so')
+
+		local live0, data0 = live(), mr.read_pointer(t.block, 16)
+		local record, row = p:row('first', t.block, t.records[1], 'ax', { [0x18] = t.targets[2] })
+		check(mr.type(record) == 'pointer' and row == 3, 'a row is added at the end of a full table: row ' .. tostring(row))
+		check(row_count(t) == 4 and mr.read_uint32(t.block, 8) == 6, 'the vector grew to six')
+		local data1 = mr.read_pointer(t.block, 16)
+		check(not mr.eq(data1, data0), 'into a new buffer')
+		check(mr.eq(mr.read_pointer(data1, 0), t.records[1]) and mr.eq(mr.read_pointer(data1, 16), t.records[3]), 'the old pointers moved over')
+		check(mr.eq(mr.read_pointer(data1, 24), record), 'and the new one is last')
+		check(mr.eq(mr.read_pointer(record, 0), record_vtable), 'the record has the template vtable')
+		check(
+			mr.eq(mr.read_pointer(record, 8), t.targets[1]) and mr.eq(mr.read_pointer(record, 0x18), t.targets[2]),
+			'it holds the template bytes and the edit'
+		)
+		check(key_index(t, 'ax') == 3, 'the key maps to the new row')
+		check(mr.eq(mr.read_pointer(mr.map_find_key(t.map, 'ax'), NODE_SOURCE), t.source), "and carries the template's source")
+		check(live() == live0 + 3, 'one record, one buffer and one key node: ' .. (live() - live0))
+		deferred = deferred + 1
+		local info = p:info('first')
+		check(info.kind == 'row' and info.state == 'ours' and mr.eq(info.at, record), 'info: kind, state, address')
+		check(info.key == 'ax' and info.row == 3 and mr.eq(info.table, t.block), 'info: key, row, table')
+		check(#mr.patch_list('rows_a') == 1 and mr.patch_list('rows_a')[1].kind == 'row', 'patch_list lists it')
+
+		local again, again_row = p:row('first', t.block, t.records[1], 'ax', { [0x18] = t.targets[2] })
+		check(mr.eq(again, record) and again_row == 3 and row_count(t) == 4 and live() == live0 + 3, 'the same call again is a no-op')
+		check(refusal(p:row('first', t.block, t.records[1], 'ax', { [0x18] = t.targets[3] })) == DIFFERENT, 'other edits are a different change')
+		check(refusal(p:row('first', t.block, t.records[1], 'ay', { [0x18] = t.targets[2] })) == DIFFERENT, 'another key is a different change')
+		check(refusal(p:row('first', u.block, u.records[1], 'ax', { [0x18] = u.targets[2] })) == DIFFERENT, 'another table is a different change')
+		check(row_count(t) == 4, 'and nothing was added')
+
+		check(p:remove('first') == true, 'remove')
+		check(snapshot(t) == before_t, 'the table has the same rows, bytes and keys again')
+		check(mr.is_null(mr.read_pointer(mr.read_pointer(t.block, 16), 24)), 'the freed slot is zero')
+		check(mr.map_find_key(t.map, 'ax') == nil and p:info('first') == nil, 'the key and the item are gone')
+		check(live() == live0 + 3, 'the record and the key node are freed at the mode switch, not now')
+		deferred = deferred + 2
+		check(select(2, p:remove('first')) == 'unknown name', 'remove twice')
+		local second, second_row = p:row('first', t.block, t.records[2], 'ax')
+		check(second ~= nil and second_row == 3 and mr.read_uint32(t.block, 8) == 6, 'a row can be added again after a remove, no growth now')
+		check(
+			mr.eq(mr.read_pointer(second, 8), t.targets[2]) and mr.eq(mr.read_pointer(second, 0x18), mr.add(t.targets[2], 4)),
+			'a row without edits copies the template'
+		)
+		check(p:remove('first') == true and snapshot(t) == before_t, 'removed again')
+		deferred = deferred + 2
+
+		local base = live()
+		p:row('r1', u.block, u.records[1], 'k1', { [0x10] = mr.uint32(7) })
+		p:row('r2', u.block, u.records[2], 'k2', { [0x1C] = 'abcd', [8] = u.targets[3] })
+		p:row('r3', u.block, u.records[3], 'k3')
+		check(row_count(u) == 6 and mr.read_uint32(u.block, 8) == 16 and live() == base + 6, 'three rows in a table with room: no growth')
+		local function row_record(t, i)
+			return mr.read_pointer(mr.read_pointer(t.block, 16), i * 8)
+		end
+		check(mr.read_uint32(row_record(u, 3), 0x10) == 7, 'a typed value edit writes its width')
+		check(mr.read(row_record(u, 4), 0x1C, 4) == 'abcd' and mr.eq(mr.read_pointer(row_record(u, 4), 8), u.targets[3]), 'a string edit and a pointer edit')
+		check(key_index(u, 'k1') == 3 and key_index(u, 'k2') == 4 and key_index(u, 'k3') == 5, 'keys and indices')
+		p:row('first', t.block, t.records[1], 'ax')
+		local ok, removed, stayed = p:remove_all()
+		check(ok == true and removed == 4 and stayed == 0, 'remove_all takes the owner rows back, newest first: ' .. tostring(removed))
+		check(snapshot(u) == before_u and snapshot(t) == before_t and #mr.patch_list('rows_a') == 0, 'both tables are as before')
+		deferred = deferred + 8
+
+		local q = mr.patcher('rows_b')
+		check(p:row('p1', u.block, u.records[2], 'kp1') ~= nil and q:row('q1', u.block, u.records[3], 'kq1') ~= nil, 'two owners add one row each')
+		check(refusal(p:remove('p1')) == 'rows were added after it' and p:info('p1').state == 'ours', 'a row under another owner row cannot go')
+		local all_ok, all_why, all_removed, all_stayed = p:remove_all()
+		check(
+			all_ok == nil and all_why == '1 changes could not be put back' and all_removed == 0 and all_stayed == 0,
+			'remove_all reports it: ' .. tostring(all_why)
+		)
+		check(row_count(u) == 5 and q:info('q1').state == 'ours', 'and leaves both rows')
+		check(q:remove('q1') == true and p:remove('p1') == true and snapshot(u) == before_u, 'the newer owner goes first, then the older')
+		deferred = deferred + 4
+		q:row('q2', u.block, u.records[1], 'kq2')
+		p:row('p2', u.block, u.records[1], 'kp2')
+		check(p:remove_all() == true and q:info('q2').state == 'ours' and row_count(u) == 4, "an owner's restore leaves another owner's row alone")
+		check(key_index(u, 'kq2') == 3 and key_index(u, 'kp2') == nil, 'its key is still there')
+		check(q:remove_all() == true and snapshot(u) == before_u, 'and the other owner restores its own')
+		deferred = deferred + 4
+
+		check(refusal(p:row('bad', mr.game_alloc(64), u.records[1], 'zz')) == 'not a database table', 'a block of zeros is not a table')
+		check(refusal(p:row('bad', nil, u.records[1], 'zz')) == 'not a database table', 'NULL is not a table')
+		local other_table = make_table({ 'a' }, 4)
+		mr.write(other_table.vtable, 16, mr.add(size_function, 2))
+		check(
+			refusal(p:row('bad', other_table.block, other_table.records[1], 'zz')) == 'not a database table',
+			'a vtable without the record size function is not a table'
+		)
+		check(refusal(p:row('bad', u.block, mr.game_alloc(32), 'zz')) == 'the template is not a row of this table', 'the template must be a row of the table')
+		check(refusal(p:row('bad', u.block, nil, 'zz')) == 'the template is not a row of this table', 'NULL is no template')
+		check(refusal(p:row('bad', u.block, u.records[1], 'a')) == 'key exists', 'an existing key')
+		local KEY = 'the key must be 1 to 255 bytes without a zero byte'
+		check(
+			refusal(p:row('bad', u.block, u.records[1], '')) == KEY and refusal(p:row('bad', u.block, u.records[1], ('x'):rep(256))) == KEY,
+			'empty and long keys'
+		)
+		check(refusal(p:row('bad', u.block, u.records[1], 'a\0b')) == KEY, 'a key with a zero byte')
+		check(p:row('long', u.block, u.records[1], ('x'):rep(255)) ~= nil and p:remove('long') == true, 'a key of 255 bytes works')
+		deferred = deferred + 2
+		check(not pcall(p.row, p, 'bad', u.block, u.records[1], {}), 'a key that is not text raises')
+		check(not pcall(p.row, p, 'bad', u.block, u.records[1], 'zz', 5), 'edits that are not a table raise')
+		local function bad_edits(edits)
+			return select(2, p:row('bad', u.block, u.records[1], 'zz', edits))
+		end
+		check(bad_edits({ [0] = 'x' }) == 'an edit offset must be a whole number from 8 to the end of the record', 'the vtable cannot be edited')
+		check(bad_edits({ [0x20] = 'x' }) == 'an edit offset must be a whole number from 8 to the end of the record', 'offsets stop at the record end')
+		check(bad_edits({ [8.5] = 'x' }) == 'an edit offset must be a whole number from 8 to the end of the record', 'offsets are whole')
+		check(bad_edits({ x = 'x' }) == 'edits are keyed by the offset in the record', 'edits are keyed by offsets')
+		check(bad_edits({ [8] = 5 }) == 'an edit takes a typed value or a string', 'a Lua number is not a value')
+		check(bad_edits({ [0x10] = ('x'):rep(17) }) == 'an edit does not fit in the record', 'a long edit is refused')
+		check(bad_edits({ [8] = u.targets[1], [0xC] = mr.uint32(1) }) == 'edits overlap', 'overlapping edits')
+		check(bad_edits({ [8] = '' }) == 'an edit does not fit in the record', 'an empty edit')
+		local many = {}
+		for i = 8, 24 do
+			many[i] = 'x'
+		end
+		check(bad_edits(many) == 'at most 16 edits', 'seventeen edits')
+		check(snapshot(u) == before_u and #mr.patch_list('rows_a') == 0 and row_count(u) == 3, 'refusals change nothing')
+		check(p:patch('dup', mr.add(filler, 0x300), '\0\0\0\0', '\1\0\0\0') == true, 'a patch takes a name')
+		check(refusal(p:row('dup', u.block, u.records[1], 'zz')) == DIFFERENT, 'a row cannot use the name of another kind')
+		check(p:remove('dup') == true and snapshot(u) == before_u, 'removed')
+
+		local big = make_table({ 'a' }, 300)
+		local added = 0
+		for i = 1, 300 do
+			if p:row('f' .. i, big.block, big.records[1], 'f' .. i) then added = added + 1 end
+		end
+		check(added == 256 and refusal(p:row('f257', big.block, big.records[1], 'f257')) == 'full', 'at most 256 rows: ' .. added)
+		check(select(2, p:remove_all()) == 256 and row_count(big) == 1, 'and all of them come back, whatever the order of their slots')
+		deferred = deferred + 512
+
+		local lost = make_table({ 'a' }, 8)
+		local lost_before, lost_live = snapshot(lost), live()
+		test_fail_emplace(1)
+		check(refusal(p:row('lost', lost.block, lost.records[1], 'zz')) == 'key exists', 'a key the game insert did not take is a refusal')
+		check(snapshot(lost) == lost_before and p:info('lost') == nil, 'the append was rolled back and nothing was registered')
+		check(live() == lost_live + 1, 'the record waits for the mode switch to be freed')
+		deferred = deferred + 1
+		check(p:row('lost', lost.block, lost.records[1], 'zz') ~= nil and p:remove('lost') == true and snapshot(lost) == lost_before, 'and the next call works')
+		deferred = deferred + 2
+
+		local moved = make_table({ 'a', 'b' }, 8)
+		local moved_before = snapshot(moved)
+		local mrec = p:row('moved', moved.block, moved.records[1], 'mv')
+		local old_vtable, other_vtable = mr.read_pointer(moved.block, 0), mr.game_alloc(24)
+		local row_bytes = mr.read(mr.read_pointer(moved.block, 16), 16, 8)
+		mr.write(other_vtable, 16, size_function)
+		mr.write(moved.block, 0, other_vtable)
+		check(
+			p:info('moved').state == 'missing' and refusal(p:remove('moved')) == 'the table changed',
+			'a table with another vtable is missing, the remove is refused'
+		)
+		mr.write(moved.block, 0, old_vtable)
+		check(p:info('moved').state == 'ours', 'and ours again when it is back')
+		mr.vector_insert(moved.block, 8, 8, 4)
+		check(refusal(p:remove('moved')) == 'rows were added after it', 'a raw element after the row blocks the remove')
+		mr.vector_erase(moved.block, 8, 8, 4)
+		mr.vector_erase(moved.block, 8, 8, 3)
+		check(p:info('moved').state == 'missing' and refusal(p:remove('moved')) == 'the row is not in the table', 'a row the game dropped is missing')
+		check(#mr.patch_list('rows_a') == 1, 'the item stays listed')
+		check(refusal(p:row('moved', moved.block, moved.records[1], 'mv')) == DIFFERENT, 'and repeating its call does not claim it is there')
+		mr.vector_insert(moved.block, 8, 8, 3, row_bytes)
+		check(p:remove('moved') == true and snapshot(moved) == moved_before, 'put back by hand, it can be removed')
+		deferred = deferred + 2
+
+		local keep = p:row('keep', u.block, u.records[1], 'kk', { [0x18] = u.targets[3] })
+		local live_end = live()
+		local file = assert(io.open(STATE_FILE, 'wb'))
+		file:write(table.concat({
+			mr.tostring(u.block),
+			mr.tostring(keep),
+			mr.tostring(u.records[1]),
+			mr.tostring(u.targets[3]),
+			before_u,
+			tostring(live_end - deferred - entry_live),
+			tostring(entry_live),
+		}, '\n'))
+		file:close()
+		NEXT_PASS = failures == 0
+	else
+		local lines = {}
+		for line in assert(io.open(STATE_FILE, 'rb')):lines() do
+			lines[#lines + 1] = line
+		end
+		local u = { block = pointer_from_text(lines[1]) }
+		u.map = mr.add(u.block, KEYS)
+		local keep, template, target = pointer_from_text(lines[2]), pointer_from_text(lines[3]), pointer_from_text(lines[4])
+		local before_u, permanent, first_entry = lines[5], tonumber(lines[6]), tonumber(lines[7])
+		check(
+			entry_live - first_entry == permanent,
+			'after the mode switch every deferred block is freed and nothing else: ' .. (entry_live - first_entry) .. ' vs ' .. permanent
+		)
+		local p = mr.patcher('rows_a')
+		check(#mr.patch_list('rows_a') == 1 and p:info('keep').state == 'ours' and mr.eq(p:info('keep').at, keep), 'the registry survives the mode switch')
+		check(p:info('keep').key == 'kk' and p:info('keep').row == 3 and key_index(u, 'kk') == 3, 'with its key and row')
+		local again, again_row = p:row('keep', u.block, template, 'kk', { [0x18] = target })
+		check(mr.eq(again, keep) and again_row == 3 and row_count(u) == 4, 'the same call in the new mode is a no-op')
+		fill_crash_context(mr)
+		set_report_settings(mr)
+		local name = mr.write_runtime_report()
+		check(type(name) == 'string' and exists(name), 'a runtime report is written: ' .. tostring(name))
+		local text = read_all(name)
+		check(has(text, '  rows_a: 1 row\n'), 'the owner block counts the row')
+		local before_remove = live()
+		check(p:remove('keep') == true and row_count(u) == 3 and key_index(u, 'kk') == nil, 'the new mode removes the row by name')
+		check(snapshot(u) == before_u, 'the table is as it was before the row')
+		check(live() == before_remove, 'and the record and the key node wait for the next switch')
+	end
 elseif SCENARIO == 'sites' then
 	local logged = {}
 	ModLog = function(message)
@@ -4981,6 +5771,64 @@ elseif SCENARIO == 'sites' then
 	test_park_leave_on_retry(mr.hop_slots)
 	check(busy.install_feature('f_busy_frame') == true and test_park_left(), 'the lone frame installs once the thread leaves')
 	check(test_park_finish() == 79 and rows('sites_mod').busy_frame.state == 'stays', 'and is owned')
+
+	local source_at = address('host_source')
+	local SOURCE = 'int64(pointer, pointer, pointer, int32, uint8)'
+	local when_entries = {
+		{
+			name = 'when_around',
+			feature = 'f_when',
+			kind = 'around',
+			pattern = hex_of(source_at, 32),
+			signature = SOURCE,
+			when = { arg = 2, reads = { 16 } },
+		},
+		{ name = 'when_plain', feature = 'f_when_plain', kind = 'prefix', pattern = hex_of(source_at, 32), signature = SOURCE },
+		{ name = 'when_site', feature = 'f_when_site', kind = 'site', pattern = 'AA', expect = '90 90 90 90 90', when = { arg = 1 } },
+	}
+	check(unique(hex_of(source_at, 32)), 'the host function for the when entries has a unique pattern')
+	check(mr.supports.link_when == true, 'sites.attach sets supports.link_when')
+	local function when_object()
+		return mr.patcher('when_mod'):sites(when_entries, log)
+	end
+	local when_fn = function(game)
+		return game()
+	end
+	local member_set = mr.pointer_set()
+	local member_key, other_key = mr.alloc(16), mr.alloc(16)
+	local member_source, other_source = mr.alloc(32), mr.alloc(32)
+	mr.write(member_source, 16, member_key)
+	mr.write(other_source, 16, other_key)
+	member_set:fill({ member_key })
+	local function source_call(source)
+		return mr.tonumber(mr.call(source_at, SOURCE, member_key, source, member_key, 3, 5))
+	end
+	local when_sites = when_object()
+	check(when_sites.found('when_around') and when_sites.found('when_plain'), 'entries with and without when are found')
+	local installed, reason = when_sites.install('when_around', when_fn)
+	check(installed == false and reason == 'no set for when', 'a plain function on an entry with when is refused: ' .. tostring(reason))
+	when_sites = when_object()
+	installed, reason = when_sites.install('when_around', { fn = when_fn })
+	check(installed == false and reason == 'no set for when', 'and so is a table without a set: ' .. tostring(reason))
+	when_sites = when_object()
+	installed, reason = when_sites.install('when_plain', { fn = when_fn, set = member_set })
+	check(installed == false and reason == 'set given but the entry has no when', 'a set for an entry without when is refused: ' .. tostring(reason))
+	check(mr.hook_info(source_at) == nil and #mr.patch_list('when_mod') == 0, 'the refusals hook nothing')
+	when_sites = when_object()
+	check(when_sites.install('when_around', { fn = when_fn, set = member_set }) == true, 'an entry with when installs with its function and set')
+	local when_row = mr.patcher('when_mod'):info('when_around')
+	check(
+		when_row.kind == 'around' and when_row.when.arg == 2 and when_row.when.reads[1] == 16 and when_row.when.members == 1,
+		'and the link has the filter: arg, offset, members'
+	)
+	check(source_call(member_source) == 35 and source_call(other_source) == 35, 'both calls give the original result')
+	when_row = mr.patcher('when_mod'):info('when_around')
+	check(when_row.calls == 1 and when_row.filtered == 1, 'the member ran the link and the other key was filtered')
+	check(when_object().install('when_around', { fn = when_fn, set = member_set }) == true, 'a second object over the installed link installs without error')
+	check(mr.patcher('when_mod'):info('when_around').calls == 1, 'and does not replace it')
+	when_object().log_missing()
+	check(said('when_site not found (bad entry: bad when): f_when_site off'), 'when on a site entry is a bad entry, off with a log line')
+	mr.patcher('when_mod'):remove_all()
 
 	assert(loadfile(ROOT .. '/tests/mp_agree_mock.lua'))()
 	check(type(memreader_plus_agree) == 'function' and mr.agree == memreader_plus_agree, 'the loader exposes the agreement function on both names')

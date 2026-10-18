@@ -226,6 +226,52 @@ static INT64 hook_single(INT64 x)
 	return x * 3 + 1;
 }
 
+static INT64 host_source(void *list, void *source, void *effects, INT32 count, UINT8 flag)
+{
+	(void)list;
+	(void)source;
+	(void)effects;
+	return (INT64)count * 10 + flag;
+}
+
+typedef INT64 (*SourceFunction)(void *, void *, void *, INT32, UINT8);
+
+static BYTE source_block[64];
+
+static int l_test_source_block(lua_State *L)
+{
+	void *block = source_block;
+
+	lua_pushlstring(L, (const char *)&block, sizeof block);
+	return 1;
+}
+
+static int l_test_source_loop(lua_State *L)
+{
+	SourceFunction function;
+	LARGE_INTEGER start, end, frequency;
+	INT64 sum = 0;
+	int calls = (int)luaL_checknumber(L, 2), i;
+
+	memcpy(&function, luaL_checkstring(L, 1), sizeof function);
+	QueryPerformanceFrequency(&frequency);
+	QueryPerformanceCounter(&start);
+	for (i = 0; i < calls; i++)
+		sum += function(NULL, source_block, NULL, 3, 5);
+	QueryPerformanceCounter(&end);
+	lua_pushnumber(L, (lua_Number)((double)(end.QuadPart - start.QuadPart) * 1e9 / (double)frequency.QuadPart / calls));
+	lua_pushnumber(L, (lua_Number)sum);
+	return 2;
+}
+
+static int l_test_reserved(lua_State *L)
+{
+	void *page = VirtualAlloc(NULL, 4096, MEM_RESERVE, PAGE_NOACCESS);
+
+	lua_pushlstring(L, (const char *)&page, sizeof page);
+	return 1;
+}
+
 static float hook_float(float a, float b)
 {
 	return a - b;
@@ -399,6 +445,7 @@ static int format(char *out, size_t size, const char *text, ...)
 
 LONG host_live_blocks(void);
 LONG host_open_streams(void);
+void host_fail_emplace(LONG count);
 int patch_target(void);
 void register_file_edit_tests(lua_State *L);
 
@@ -408,6 +455,12 @@ static int l_test_open_streams(lua_State *L)
 {
 	lua_pushinteger(L, host_open_streams());
 	return 1;
+}
+
+static int l_test_fail_emplace(lua_State *L)
+{
+	host_fail_emplace((LONG)luaL_checknumber(L, 1));
+	return 0;
 }
 
 static int l_test_heap_blocks(lua_State *L)
@@ -450,6 +503,7 @@ static const struct {
 	{ "throw_out", throw_out },
 	{ "hook_target", hook_target },
 	{ "hook_single", hook_single },
+	{ "host_source", host_source },
 	{ "hook_float", hook_float },
 	{ "hook_mixed", hook_mixed },
 	{ "hook_store", hook_store },
@@ -1602,6 +1656,10 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "cave_count", l_cave_count);
 	lua_register(L, "cave_count_address", l_cave_count_address);
 	lua_register(L, "test_access_faults", l_test_access_faults);
+	lua_register(L, "test_source_block", l_test_source_block);
+	lua_register(L, "test_source_loop", l_test_source_loop);
+	lua_register(L, "test_reserved", l_test_reserved);
+	lua_register(L, "test_fail_emplace", l_test_fail_emplace);
 	lua_register(L, "test_park_start", l_test_park_start);
 	lua_register(L, "test_park_rip", l_test_park_rip);
 	lua_register(L, "test_park_flag", l_test_park_flag);

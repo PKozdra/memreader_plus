@@ -35,9 +35,11 @@ enum { OWNER_SIZE = 64, ITEM_NAME_SIZE = 48, TAG_SIZE = OWNER_SIZE + ITEM_NAME_S
 
 enum OwnerText { OWNER_NONE, OWNER_NAMED, OWNER_CALLER };
 
-enum ItemKind { ITEM_SITE, ITEM_VALUE, ITEM_CAVE, ITEM_PATCH, ITEM_FRAME, ITEM_RELOCATE, ROW_KIND_COUNT, ITEM_PREFIX = ROW_KIND_COUNT, ITEM_POSTFIX, ITEM_AROUND, ITEM_KIND_COUNT };
+enum ItemKind { ITEM_SITE, ITEM_VALUE, ITEM_CAVE, ITEM_PATCH, ITEM_FRAME, ITEM_RELOCATE, ITEM_ROW, ROW_KIND_COUNT, ITEM_PREFIX = ROW_KIND_COUNT, ITEM_POSTFIX, ITEM_AROUND, ITEM_KIND_COUNT };
 
 enum { LINK_ERROR_SIZE = 256 };
+
+enum { SET_SLOTS = 8192, SET_MEMBERS = 4096, MAX_WHEN_READS = 4, MAX_WHEN_OFFSET = 0xFFFFFF };
 
 enum FrameResult { FRAME_OK, FRAME_BAD_AMOUNT, FRAME_OUTSIDE, FRAME_NO_FUNCTION, FRAME_REFUSED };
 
@@ -61,6 +63,7 @@ typedef struct {
 	INT_PTR at;
 	UINT32 calls;
 	UINT32 skips;
+	UINT32 filtered;
 	UINT32 errors;
 	BYTE unlogged;
 	char name[ITEM_NAME_SIZE];
@@ -73,6 +76,29 @@ typedef struct {
 	int item;
 	int hold;
 } Claim;
+
+typedef struct {
+	BOOL all;
+	int count;
+	UINT64 slots[SET_SLOTS];
+} PointerSet;
+
+typedef struct {
+	int argument;
+	int read_count;
+	INT32 reads[MAX_WHEN_READS];
+	const PointerSet *set;
+	BOOL broken;
+	int fault_read;
+	UINT64 fault_at;
+} LinkFilter;
+
+typedef struct {
+	int (*add)(lua_State *L, int owner, const char *name);
+	const char *(*undo)(lua_State *L, int item);
+	const char *(*state)(int item);
+	void (*describe)(lua_State *L, int item);
+} RowKind;
 
 typedef struct {
 	BYTE type;
@@ -212,7 +238,10 @@ extern const luaL_Reg farhook_functions[];
 extern const luaL_Reg cave_functions[];
 extern const luaL_Reg frame_functions[];
 extern const luaL_Reg patcher_functions[];
+extern const luaL_Reg set_functions[];
 
+PointerSet *to_set(lua_State *L, int index);
+BOOL set_has(const PointerSet *set, UINT64 key);
 TypedValue *push_value(lua_State *L, int type, INT64 number);
 TypedValue *to_value(lua_State *L, int index);
 INT64 value_to_integer(const TypedValue *value);
@@ -287,9 +316,11 @@ int try_cave(lua_State *L, INT_PTR address, const char *bytes, size_t size, BYTE
 int callback_generation(void);
 void mark_callback(INT_PTR target, int item);
 int l_function_hook(lua_State *L);
-const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, int kind, int priority, int item, int function_index);
-BOOL link_is_current(lua_State *L, const Signature *signature, int item, int priority, int function_index);
+const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, int kind, int priority, int item, int function_index,
+	const LinkFilter *when, int set_index);
+BOOL link_is_current(lua_State *L, const Signature *signature, int item, int priority, int function_index, const LinkFilter *when);
 void remove_link(int item);
+void push_filter_fields(lua_State *L, int item);
 void flush_link_log(lua_State *L);
 int l_flush_log(lua_State *L);
 int l_set_log(lua_State *L);
@@ -351,6 +382,9 @@ int count_claims(int item);
 BYTE *held_bytes(const Claim *claim);
 BYTE *wrote_bytes(const Claim *claim);
 const char *item_state(int index);
+extern const char different_change[];
+void register_row_kind(const RowKind *kind);
+const RowKind *row_handler_get(void);
 BOOL is_link_kind(int kind);
 const char *item_kind_name(int kind);
 int shown_kind(const Item *item);

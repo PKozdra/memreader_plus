@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(memreader_plus VERSION 0.12.0 LANGUAGES C ASM_MASM)
+project(memreader_plus VERSION 0.13.0 LANGUAGES C ASM_MASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -31,6 +31,7 @@ add_library(memreader_plus SHARED
 	src/core/hook.c
 	src/core/hook.h
 	src/core/link.c
+	src/core/set.c
 	src/core/farhook.c
 	src/core/cave.c
 	src/core/owners.c
@@ -53,6 +54,7 @@ add_library(memreader_plus SHARED
 	src/game/pack.c
 	src/game/map.c
 	src/game/list.c
+	src/game/rows.c
 	src/file_edit/file_edit.h
 	src/file_edit/file_edit.c
 	src/file_edit/registry.c

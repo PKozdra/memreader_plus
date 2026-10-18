@@ -18,13 +18,14 @@ typedef struct {
 
 static const char *const kind_words[ROW_KIND_COUNT][2] = {
 	{ "link", "links" }, { "value", "values" }, { "cave", "caves" },
-	{ "patch", "patches" }, { "frame", "frames" }, { "relocation", "relocations" }
+	{ "patch", "patches" }, { "frame", "frames" }, { "relocation", "relocations" }, { "row", "rows" }
 };
 
 static const char *const kind_names[ITEM_KIND_COUNT] = {
-	"site", "value", "cave", "patch", "frame", "relocate", "prefix", "postfix", "around"
+	"site", "value", "cave", "patch", "frame", "relocate", "row", "prefix", "postfix", "around"
 };
 
+static const RowKind *row_handler;
 static char owners[MAX_OWNERS][OWNER_SIZE];
 static int owner_count;
 static Item items[MAX_ITEMS];
@@ -36,6 +37,16 @@ static int pool_used;
 static AnonymousCave anonymous[MAX_ANONYMOUS];
 static int anonymous_count;
 static int anonymous_unlisted;
+
+void register_row_kind(const RowKind *kind)
+{
+	row_handler = kind;
+}
+
+const RowKind *row_handler_get(void)
+{
+	return row_handler;
+}
 
 BOOL is_link_kind(int kind)
 {
@@ -280,6 +291,8 @@ const char *item_state(int index)
 
 	if (is_detached(&items[index]))
 		return "detached";
+	if (items[index].kind == ITEM_ROW)
+		return row_handler ? row_handler->state(index) : "missing";
 	if ((items[index].kind != ITEM_PATCH && items[index].kind != ITEM_VALUE) || at < 0)
 		return "stays";
 	claim = &claims[at];

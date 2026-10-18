@@ -8,6 +8,7 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 {
 	prepare_hooks();
 	watch_crashes(L);
+	register_row_kind(&rows_kind);
 	lua_newtable(L);
 	luaL_register(L, NULL, value_functions);
 	luaL_register(L, NULL, memory_functions);
@@ -28,6 +29,7 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 	luaL_register(L, NULL, list_functions);
 	luaL_register(L, NULL, frame_functions);
 	luaL_register(L, NULL, patcher_functions);
+	luaL_register(L, NULL, set_functions);
 
 	push_value(L, VALUE_POINTER, (INT_PTR)GetModuleHandleA(NULL));
 	lua_setfield(L, -2, "base");

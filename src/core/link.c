@@ -25,6 +25,7 @@ typedef struct TypedCall {
 	UINT64 replacement;
 	UINT64 result;
 	UINT32 pending_mask;
+	UINT32 blocked;
 	BOOL pending_skip;
 	BOOL replaced;
 	BOOL faulted;
@@ -41,6 +42,10 @@ typedef struct TypedCall {
 	Fault fault;
 } TypedCall;
 
+enum { LOWEST_USER_ADDRESS = 0x10000 };
+enum FilterOutcome { FILTER_READ, FILTER_STOPPED, FILTER_FAULTED };
+
+static const UINT64 highest_user_address = 0x7FFFFFFEFFFF;
 static const char sink_key = 0;
 static const char *const link_names[] = { "around", "prefix", "postfix", "around" };
 
@@ -103,33 +108,116 @@ void rebuild_links(Hook *hook)
 	}
 }
 
-static BOOL runnable(const Hook *hook, int slot)
+static BOOL runnable(const Hook *hook, UINT32 blocked, int slot)
 {
 	const Callback *callback = &hook->callbacks[slot];
 
-	return holds_function(callback) && lua_status(callback->state) == 0;
+	return !(blocked & (1u << slot)) && holds_function(callback) && lua_status(callback->state) == 0;
 }
 
-static BOOL any_runnable(const Hook *hook)
+static BOOL any_runnable(const Hook *hook, UINT32 blocked)
 {
 	int phase, n;
 
 	for (phase = 0; phase < PHASE_COUNT; phase++) {
 		for (n = 0; n < hook->order_count[phase]; n++) {
-			if (runnable(hook, hook->order[phase][n]))
+			if (runnable(hook, blocked, hook->order[phase][n]))
 				return TRUE;
 		}
 	}
 	return FALSE;
 }
 
-static int next_around(const Hook *hook, int position)
+static int next_around(const Hook *hook, UINT32 blocked, int position)
 {
 	for (; position < hook->order_count[PHASE_AROUND]; position++) {
-		if (runnable(hook, hook->order[PHASE_AROUND][position]))
+		if (runnable(hook, blocked, hook->order[PHASE_AROUND][position]))
 			return position;
 	}
 	return -1;
+}
+
+static BOOL in_user_space(UINT64 address)
+{
+	return address >= LOWEST_USER_ADDRESS && address <= highest_user_address;
+}
+
+static void filter_fault_text(char *out, size_t size, const LinkFilter *when)
+{
+	_snprintf_s(out, size, _TRUNCATE, "when: read at 0x%llx faulted (read %d); the link is off until the next mode",
+		(unsigned long long)when->fault_at, when->fault_read);
+}
+
+static int follow_reads(LinkFilter *when, UINT64 key, UINT64 *result)
+{
+	volatile UINT64 current = key, address = 0;
+	volatile int index = 0, outcome = FILTER_READ;
+	Fault fault = { 0, 0, NULL };
+
+	__try {
+		for (; index < when->read_count && outcome == FILTER_READ; index++) {
+			address = current + (UINT64)(INT64)when->reads[index];
+			if (!in_user_space(current) || !in_user_space(address))
+				outcome = FILTER_STOPPED;
+			else
+				current = *(const UINT64 *)address;
+		}
+	} __except (catch_fault(GetExceptionInformation()->ExceptionRecord, &fault)) {
+		if (fault.code == STATUS_GUARD_PAGE_VIOLATION)
+			restore_guard(fault.address);
+		when->broken = TRUE;
+		when->fault_read = index + 1;
+		when->fault_at = address;
+		outcome = FILTER_FAULTED;
+	}
+	*result = current;
+	return outcome;
+}
+
+static void note_filter_fault(const Callback *callback)
+{
+	Item *entry;
+
+	if (callback->item < 0 || !item_at(callback->item)->used)
+		return;
+	entry = item_at(callback->item);
+	if (entry->errors++ > 0)
+		return;
+	filter_fault_text(entry->error, sizeof entry->error, callback->when);
+	entry->unlogged = TRUE;
+	pending_log = TRUE;
+}
+
+static BOOL passes(const Callback *callback, const HookFrame *frame, const Signature *signature)
+{
+	LinkFilter *when = callback->when;
+	UINT64 key;
+	int outcome;
+
+	if (when->broken)
+		return FALSE;
+	key = argument_slot(frame, when->argument, signature->arguments[when->argument]);
+	outcome = follow_reads(when, key, &key);
+	if (outcome == FILTER_FAULTED)
+		note_filter_fault(callback);
+	return outcome == FILTER_READ && key != 0 && set_has(when->set, key);
+}
+
+static UINT32 blocked_links(Hook *hook, const HookFrame *frame)
+{
+	UINT32 blocked = 0;
+	int slot;
+
+	for (slot = 0; slot < hook->callback_count; slot++) {
+		const Callback *callback = &hook->callbacks[slot];
+
+		if (!callback->when || !runnable(hook, 0, slot) || passes(callback, frame, &hook->signature))
+			continue;
+		blocked |= 1u << slot;
+		if (callback->item >= 0)
+			item_at(callback->item)->filtered++;
+	}
+	return blocked;
 }
 
 static void push_arguments(lua_State *L, const Signature *signature, const UINT64 *arguments)
@@ -367,7 +455,7 @@ static void run_around(TypedCall *t, int position, const UINT64 *arguments, UINT
 
 static void run_chain(TypedCall *t, int position, const UINT64 *arguments, UINT64 *result)
 {
-	position = next_around(t->hook, position);
+	position = next_around(t->hook, t->blocked, position);
 	if (position < 0)
 		call_bottom(t, arguments, result);
 	else
@@ -396,7 +484,7 @@ static void run_prefixes(TypedCall *t)
 
 	for (n = 0; n < hook->order_count[PHASE_PREFIX]; n++) {
 		slot = hook->order[PHASE_PREFIX][n];
-		if (!runnable(hook, slot))
+		if (!runnable(hook, t->blocked, slot))
 			continue;
 		t->pending_mask = 0;
 		t->pending_skip = FALSE;
@@ -416,7 +504,7 @@ static void run_postfixes(TypedCall *t)
 
 	for (n = 0; n < hook->order_count[PHASE_POSTFIX]; n++) {
 		slot = hook->order[PHASE_POSTFIX][n];
-		if (!runnable(hook, slot))
+		if (!runnable(hook, t->blocked, slot))
 			continue;
 		t->replaced = FALSE;
 		if (run_link(t, slot, PHASE_POSTFIX, &tag) && t->replaced)
@@ -431,7 +519,7 @@ static void raise_fault(const Fault *fault)
 	RaiseException(fault->code, 0, fault->address ? 2 : 0, information);
 }
 
-int run_typed(Hook *hook, HookFrame *frame)
+static int run_links(Hook *hook, HookFrame *frame, UINT32 blocked)
 {
 	TypedCall t;
 	HookCall call = { hook, frame, NULL, 0, -1, innermost, &t };
@@ -440,10 +528,9 @@ int run_typed(Hook *hook, HookFrame *frame)
 	LONG paused;
 	int i;
 
-	if (!any_runnable(hook))
-		return RUN_ORIGINAL;
 	t.hook = hook;
 	t.frame = frame;
+	t.blocked = blocked;
 	t.result = 0;
 	t.pending_mask = 0;
 	t.pending_skip = FALSE;
@@ -488,6 +575,15 @@ int run_typed(Hook *hook, HookFrame *frame)
 	}
 	set_result(frame, signature->result, t.result);
 	return outcome;
+}
+
+int run_typed(Hook *hook, HookFrame *frame)
+{
+	UINT32 blocked = blocked_links(hook, frame);
+
+	if (!any_runnable(hook, blocked))
+		return RUN_ORIGINAL;
+	return run_links(hook, frame, blocked);
 }
 
 static int run_below(lua_State *L, TypedCall *t, int first)
@@ -710,13 +806,26 @@ static const char *check_room(const Hook *hook, int old)
 	return "at most 32 links on this address";
 }
 
-const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, int kind, int priority, int item, int function_index)
+static int pin_filter(lua_State *L, const LinkFilter *when, int set_index, LinkFilter **pinned)
+{
+	*pinned = lua_newuserdata(L, sizeof **pinned);
+	**pinned = *when;
+	lua_createtable(L, 1, 0);
+	lua_pushvalue(L, set_index);
+	lua_rawseti(L, -2, 1);
+	lua_setfenv(L, -2);
+	return luaL_ref(L, LUA_REGISTRYINDEX);
+}
+
+const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, int kind, int priority, int item, int function_index,
+	const LinkFilter *when, int set_index)
 {
 	Hook *hook = find_hook(at);
 	Item *entry = item_at(item);
 	Callback *callback;
 	const char *why;
-	int old, others, thread, function;
+	LinkFilter *pinned = NULL;
+	int old, others, thread, function, filter = LUA_NOREF;
 
 	if (!hook || hook->kind != KIND_FUNCTION)
 		return "the address holds no function hook";
@@ -733,6 +842,8 @@ const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, in
 	thread = luaL_ref(L, LUA_REGISTRYINDEX);
 	lua_pushvalue(L, function_index);
 	function = luaL_ref(L, LUA_REGISTRYINDEX);
+	if (when)
+		filter = pin_filter(L, when, set_index, &pinned);
 	if (others == 0 && hook->running == 0) {
 		hook->signature = *signature;
 		if (old < 0) {
@@ -749,6 +860,8 @@ const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, in
 	callback->function = function;
 	callback->item = item;
 	callback->priority = priority;
+	callback->when = pinned;
+	callback->when_ref = filter;
 	callback->kind = (BYTE)(kind - ITEM_PREFIX + LINK_PREFIX);
 	callback->doomed = FALSE;
 	hook->typed++;
@@ -757,6 +870,7 @@ const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, in
 	entry->attached = callback_generation();
 	entry->calls = 0;
 	entry->skips = 0;
+	entry->filtered = 0;
 	entry->errors = 0;
 	entry->unlogged = FALSE;
 	entry->error[0] = '\0';
@@ -764,13 +878,22 @@ const char *attach_link(lua_State *L, INT_PTR at, const Signature *signature, in
 	return NULL;
 }
 
-BOOL link_is_current(lua_State *L, const Signature *signature, int item, int priority, int function_index)
+static BOOL same_filter(const LinkFilter *a, const LinkFilter *b)
+{
+	if (!a || !b)
+		return a == b;
+	return a->argument == b->argument && a->set == b->set && a->read_count == b->read_count &&
+		memcmp(a->reads, b->reads, sizeof a->reads[0] * (size_t)a->read_count) == 0;
+}
+
+BOOL link_is_current(lua_State *L, const Signature *signature, int item, int priority, int function_index, const LinkFilter *when)
 {
 	Hook *hook = find_hook(item_at(item)->at);
 	int slot = hook ? slot_of(hook, item) : -1;
 	BOOL same;
 
-	if (slot < 0 || hook->callbacks[slot].priority != priority || !same_signature(&hook->signature, signature))
+	if (slot < 0 || hook->callbacks[slot].priority != priority || !same_signature(&hook->signature, signature) ||
+		!same_filter(hook->callbacks[slot].when, when))
 		return FALSE;
 	lua_rawgeti(L, LUA_REGISTRYINDEX, hook->callbacks[slot].function);
 	same = lua_rawequal(L, -1, function_index);
@@ -837,6 +960,83 @@ int l_flush_log(lua_State *L)
 	return 0;
 }
 
+static void add_filter_fields(lua_State *L, const Callback *callback, const Item *entry)
+{
+	const LinkFilter *when = callback->when;
+	char text[LINK_ERROR_SIZE];
+	int i;
+
+	lua_pushnumber(L, (lua_Number)entry->filtered);
+	lua_setfield(L, -2, "filtered");
+	lua_createtable(L, 0, 4);
+	lua_pushnumber(L, (lua_Number)(when->argument + 1));
+	lua_setfield(L, -2, "arg");
+	lua_createtable(L, when->read_count, 0);
+	for (i = 0; i < when->read_count; i++) {
+		lua_pushnumber(L, (lua_Number)when->reads[i]);
+		lua_rawseti(L, -2, i + 1);
+	}
+	lua_setfield(L, -2, "reads");
+	if (when->set->all)
+		lua_pushliteral(L, "all");
+	else
+		lua_pushnumber(L, (lua_Number)when->set->count);
+	lua_setfield(L, -2, "members");
+	if (when->broken) {
+		filter_fault_text(text, sizeof text, when);
+		lua_pushstring(L, text);
+		lua_setfield(L, -2, "off");
+	}
+	lua_setfield(L, -2, "when");
+}
+
+void push_filter_fields(lua_State *L, int item)
+{
+	const Hook *hook = find_hook(item_at(item)->at);
+	int slot = hook ? slot_of(hook, item) : -1;
+
+	if (slot >= 0 && hook->callbacks[slot].when)
+		add_filter_fields(L, &hook->callbacks[slot], item_at(item));
+}
+
+static void add_read_text(Text *report, INT32 offset)
+{
+	add_text(report, offset < 0 ? " [-0x%x]" : " [+0x%x]", offset < 0 ? -offset : offset);
+}
+
+static void add_one_filter_text(Text *report, const LinkFilter *when)
+{
+	int i;
+
+	add_text(report, "arg %d", when->argument + 1);
+	for (i = 0; i < when->read_count; i++)
+		add_read_text(report, when->reads[i]);
+	if (when->set->all)
+		add_text(report, " in all");
+	else
+		add_text(report, " in %d", when->set->count);
+	if (when->broken)
+		add_text(report, ", off: read at 0x%llx faulted", (unsigned long long)when->fault_at);
+}
+
+void add_filter_text(Text *report, const Hook *hook)
+{
+	const char *separator = " when ";
+	int i;
+
+	__try {
+		for (i = 0; i < hook->callback_count; i++) {
+			if (!is_attached(&hook->callbacks[i]) || !hook->callbacks[i].when)
+				continue;
+			add_text(report, "%s", separator);
+			add_one_filter_text(report, hook->callbacks[i].when);
+			separator = "; ";
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		add_text(report, ", filter unreadable");
+	}
+}
+
 static void push_link_row(lua_State *L, const Hook *hook, const Callback *callback)
 {
 	const Item *entry = callback->item >= 0 ? item_at(callback->item) : NULL;
@@ -863,6 +1063,8 @@ static void push_link_row(lua_State *L, const Hook *hook, const Callback *callba
 		lua_pushstring(L, entry->error);
 		lua_setfield(L, -2, "error");
 	}
+	if (callback->when)
+		add_filter_fields(L, callback, entry);
 }
 
 static void push_links(lua_State *L, const Hook *hook)

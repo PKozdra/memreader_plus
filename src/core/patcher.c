@@ -4,7 +4,7 @@
 #include "batch.h"
 #include "hook.h"
 
-enum { MAX_RELOCATE_SITES = 1024, MAX_PRIORITY = 1000, MAX_FIELD_NUMBER = 16777215, FIELD_BYTE = 1, FIELD_WORD = 4 };
+enum { MAX_RELOCATE_SITES = 1024, MAX_PRIORITY = 1000, MAX_FIELD_NUMBER = 16777215, FIELD_BYTE = 1, FIELD_WORD = 4, WHEN_INDEX = 7 };
 
 enum { METATABLE_KEY, HANDLES_KEY, KEY_COUNT };
 
@@ -23,7 +23,7 @@ typedef struct {
 
 static char keys[KEY_COUNT];
 
-static const char different_change[] = "the name is already used for a different change";
+const char different_change[] = "the name is already used for a different change";
 static const char hooked_bytes[] = "refused: the first bytes of a hooked function run from the hook's copy, so a change there would never run";
 const char hooked_call[] = "not from inside a hooked call";
 static const char changed_bytes[] = "the bytes were changed by something else";
@@ -934,15 +934,100 @@ static int create_function_hook(lua_State *L, INT_PTR at)
 	return 0;
 }
 
+static BOOL has_only_when_fields(lua_State *L)
+{
+	const char *key;
+
+	lua_pushnil(L);
+	while (lua_next(L, WHEN_INDEX)) {
+		key = lua_type(L, -2) == LUA_TSTRING ? lua_tostring(L, -2) : "";
+		if (strcmp(key, "arg") != 0 && strcmp(key, "reads") != 0 && strcmp(key, "set") != 0) {
+			lua_pop(L, 2);
+			return FALSE;
+		}
+		lua_pop(L, 1);
+	}
+	return TRUE;
+}
+
+static BOOL is_key_type(int type)
+{
+	return type == VALUE_POINTER || type == VALUE_INT64 || type == VALUE_UINT64;
+}
+
+static const char *when_argument(lua_State *L, const Signature *signature, LinkFilter *when)
+{
+	lua_Number number = 0;
+
+	lua_getfield(L, WHEN_INDEX, "arg");
+	if (lua_type(L, -1) == LUA_TNUMBER)
+		number = lua_tonumber(L, -1);
+	lua_pop(L, 1);
+	if (!is_whole(number, 1, signature->count) || !is_key_type(signature->arguments[(int)number - 1]))
+		return "when.arg must name a pointer, int64 or uint64 argument";
+	when->argument = (int)number - 1;
+	return NULL;
+}
+
+static const char *when_reads(lua_State *L, LinkFilter *when)
+{
+	const char *why = NULL;
+	lua_Number number;
+	int i, count;
+
+	lua_getfield(L, WHEN_INDEX, "reads");
+	if (!lua_isnil(L, -1) && !lua_istable(L, -1))
+		why = "when.reads must be a list of offsets";
+	count = why || lua_isnil(L, -1) ? 0 : (int)lua_objlen(L, -1);
+	if (count > MAX_WHEN_READS)
+		why = "when.reads takes at most 4 offsets";
+	for (i = 1; !why && i <= count; i++) {
+		lua_rawgeti(L, -1, i);
+		number = lua_type(L, -1) == LUA_TNUMBER ? lua_tonumber(L, -1) : 0.5f;
+		lua_pop(L, 1);
+		if (!is_whole(number, -MAX_WHEN_OFFSET, MAX_WHEN_OFFSET))
+			why = "when.reads must hold whole offsets from -16777215 to 16777215";
+		else
+			when->reads[i - 1] = (INT32)number;
+	}
+	lua_pop(L, 1);
+	when->read_count = why ? 0 : count;
+	return why;
+}
+
+static const char *parse_when(lua_State *L, const Signature *signature, LinkFilter *when, int *set_index)
+{
+	const char *why;
+
+	memset(when, 0, sizeof *when);
+	if (!has_only_when_fields(L))
+		return "when has an unknown field";
+	why = when_argument(L, signature, when);
+	if (!why)
+		why = when_reads(L, when);
+	if (why)
+		return why;
+	lua_getfield(L, WHEN_INDEX, "set");
+	when->set = to_set(L, -1);
+	if (!when->set) {
+		lua_pop(L, 1);
+		return "when.set must be a pointer set";
+	}
+	*set_index = lua_gettop(L);
+	return NULL;
+}
+
 static int add_link(lua_State *L, int kind)
 {
 	Patcher *self = check_self(L);
 	Signature signature;
+	LinkFilter when;
+	const LinkFilter *filter = NULL;
 	const char *name, *why;
 	char holder[TAG_SIZE];
 	INT_PTR at;
 	size_t length;
-	int refused, priority, item;
+	int refused, priority, item, set_index = 0;
 	BOOL created;
 
 	parse_signature(L, luaL_checkstring(L, 3), &signature);
@@ -951,6 +1036,13 @@ static int add_link(lua_State *L, int kind)
 	why = check_priority(L, 6, &priority);
 	if (why)
 		return refuse(L, why);
+	if (!lua_isnoneornil(L, WHEN_INDEX)) {
+		luaL_checktype(L, WHEN_INDEX, LUA_TTABLE);
+		why = parse_when(L, &signature, &when, &set_index);
+		if (why)
+			return refuse(L, why);
+		filter = &when;
+	}
 	flush_link_log(L);
 	if (!valid_name(name, length, ITEM_NAME_SIZE - 1))
 		return refuse(L, "name must be 1 to 47 letters, digits or underscores");
@@ -962,7 +1054,7 @@ static int add_link(lua_State *L, int kind)
 	item = find_item(self->owner, name);
 	if (item >= 0 && (item_at(item)->kind != kind || item_at(item)->at != at))
 		return refuse(L, different_change);
-	if (item >= 0 && link_is_current(L, &signature, item, priority, 5))
+	if (item >= 0 && link_is_current(L, &signature, item, priority, 5, filter))
 		return succeed(L);
 	if (item < 0 && !registry_room(0, 0))
 		return refuse(L, full_message);
@@ -974,7 +1066,7 @@ static int add_link(lua_State *L, int kind)
 	created = item < 0;
 	if (created)
 		item = add_item(self->owner, name, kind, at);
-	why = attach_link(L, at, &signature, kind, priority, item, 5);
+	why = attach_link(L, at, &signature, kind, priority, item, 5, filter, set_index);
 	if (why && created)
 		remove_item(item);
 	return why ? refuse(L, why) : succeed(L);
@@ -1031,6 +1123,8 @@ static const char *undo_item(lua_State *L, int item)
 
 	if (entry->kind == ITEM_PATCH || entry->kind == ITEM_VALUE)
 		why = restore_value(item);
+	else if (entry->kind == ITEM_ROW)
+		why = row_handler_get() ? row_handler_get()->undo(L, item) : changed_bytes;
 	else if (entry->kind == ITEM_SITE)
 		detach_site(L, entry);
 	else if (entry->kind >= ITEM_PREFIX)
@@ -1058,10 +1152,28 @@ static int l_remove(lua_State *L)
 	return why ? refuse(L, why) : succeed(L);
 }
 
+static int remove_owner_rows(lua_State *L, int owner)
+{
+	int item, removed = 0, progress = 1;
+
+	while (progress) {
+		progress = 0;
+		for (item = item_total() - 1; item >= 0; item--) {
+			if (!item_at(item)->used || item_at(item)->owner != owner || item_at(item)->kind != ITEM_ROW)
+				continue;
+			if (!undo_item(L, item)) {
+				removed++;
+				progress = 1;
+			}
+		}
+	}
+	return removed;
+}
+
 static int l_remove_all(lua_State *L)
 {
 	Patcher *self = check_self(L);
-	int item, removed = 0, stayed = 0, failed = 0;
+	int item, removed = remove_owner_rows(L, self->owner), stayed = 0, failed = 0;
 
 	for (item = 0; item < item_total(); item++) {
 		const char *why;
@@ -1102,6 +1214,8 @@ static void push_row(lua_State *L, int item)
 	lua_setfield(L, -2, "at");
 	lua_pushstring(L, item_state(item));
 	lua_setfield(L, -2, "state");
+	if (entry->kind == ITEM_ROW && row_handler_get())
+		row_handler_get()->describe(L, item);
 	if (entry->kind < ITEM_PREFIX)
 		return;
 	lua_pushnumber(L, (lua_Number)entry->priority);
@@ -1116,6 +1230,18 @@ static void push_row(lua_State *L, int item)
 		lua_pushstring(L, entry->error);
 		lua_setfield(L, -2, "error");
 	}
+	push_filter_fields(L, item);
+}
+
+static int l_row(lua_State *L)
+{
+	Patcher *self;
+	const char *name;
+	int refused = open_method(L, &self, &name);
+
+	if (refused)
+		return refused;
+	return row_handler_get() ? row_handler_get()->add(L, self->owner, name) : refuse(L, "rows are not available");
 }
 
 static int l_owner(lua_State *L)
@@ -1165,6 +1291,7 @@ static const luaL_Reg method_functions[] = {
 	{ "relocate", l_relocate },
 	{ "batch", l_batch },
 	{ "site", l_site },
+	{ "row", l_row },
 	{ "prefix", l_prefix },
 	{ "postfix", l_postfix },
 	{ "around", l_around },

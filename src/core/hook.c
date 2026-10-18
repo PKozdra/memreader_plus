@@ -350,8 +350,11 @@ void detach(Hook *hook, int index)
 		return;
 	luaL_unref(callback->state, LUA_REGISTRYINDEX, callback->function);
 	luaL_unref(callback->state, LUA_REGISTRYINDEX, callback->thread);
+	luaL_unref(callback->state, LUA_REGISTRYINDEX, callback->when_ref);
 	callback->function = LUA_NOREF;
 	callback->state = NULL;
+	callback->when = NULL;
+	callback->when_ref = LUA_NOREF;
 	callback->doomed = FALSE;
 	hook->stale = TRUE;
 }
@@ -388,6 +391,8 @@ static int forget_callbacks(lua_State *L)
 		for (j = 0; j < hooks[i].callback_count; j++) {
 			hooks[i].callbacks[j].function = LUA_NOREF;
 			hooks[i].callbacks[j].state = NULL;
+			hooks[i].callbacks[j].when = NULL;
+			hooks[i].callbacks[j].when_ref = LUA_NOREF;
 			hooks[i].callbacks[j].doomed = FALSE;
 		}
 		hooks[i].callback_count = 0;
@@ -752,6 +757,8 @@ static int add_callback(lua_State *L, Hook *hook, int function, const Signature 
 	callback->priority = 0;
 	callback->kind = LINK_HOOK;
 	callback->doomed = FALSE;
+	callback->when = NULL;
+	callback->when_ref = LUA_NOREF;
 	hook->stale = TRUE;
 	lua_pushthread(L);
 	callback->thread = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -970,7 +977,9 @@ static void add_hook_line(Text *report, lua_State *live, const Hook *hook)
 	if (hook->error[0])
 		add_text(report, ", last callback error: %s", hook->error);
 	owner_phrase(owner, sizeof owner, hook->target);
-	add_text(report, "%s\n", owner);
+	add_text(report, "%s", owner);
+	add_filter_text(report, hook);
+	add_text(report, "\n");
 }
 
 static BOOL running_link(const Hook *hook, LinkTag *out)

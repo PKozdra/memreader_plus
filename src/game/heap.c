@@ -32,13 +32,18 @@ static INT_PTR find_free(void)
 	return (INT_PTR)found[0];
 }
 
-static void find_heap(lua_State *L)
+BOOL game_heap_found(void)
 {
 	if (game_malloc && game_free)
-		return;
+		return TRUE;
 	game_malloc = find_unique(malloc_pattern);
 	game_free = find_free();
-	if (!game_malloc || !game_free)
+	return game_malloc && game_free;
+}
+
+static void find_heap(lua_State *L)
+{
+	if (!game_heap_found())
 		luaL_error(L, "the game's allocator was not found in this game build");
 }
 

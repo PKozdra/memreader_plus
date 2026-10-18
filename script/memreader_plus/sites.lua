@@ -10,6 +10,7 @@ local READ_SIZES = { uint8 = 1, int32 = 4, call = 8, rip = 8 }
 local ARG_LIMITS = { [1] = { -128, 255 }, [4] = { -MAX_EXACT, MAX_EXACT }, [8] = { 0, MAX_EXACT } }
 local HOOK_KINDS = { hook = 'function', prefix = 'function', postfix = 'function', around = 'function', site = 'site' }
 local LINK_METHODS = { hook = 'around', prefix = 'prefix', postfix = 'postfix', around = 'around' }
+local WHEN_KINDS = { prefix = true, postfix = true, around = true }
 local STAYS = { cave = true, frame = true, relocate = true }
 local UNGATED = { anchor = true, frame = true, relocate = true }
 local MUST_BE_INSTALLED = { frame = true, relocate = true }
@@ -138,10 +139,15 @@ local function shape_problem(entry, by_name)
 	if by_name[entry.name] then return 'name used twice' end
 	if type(entry.feature) ~= 'string' or entry.feature == '' then return 'no feature' end
 	if not KINDS[entry.kind] then return 'unknown kind' end
+	local function bad_when(spec)
+		return type(spec) == 'table' and spec.when ~= nil and (not WHEN_KINDS[entry.kind] or type(spec.when) ~= 'table')
+	end
+	if bad_when(entry) then return 'bad when' end
 	if (entry.pattern == nil) == (entry.variants == nil) then return 'needs a pattern or variants, not both' end
 	local list = entry.variants or { entry }
 	if type(list) ~= 'table' or #list == 0 then return 'variants is empty' end
 	for _, spec in ipairs(list) do
+		if bad_when(spec) then return 'bad when' end
 		local pattern = type(spec) == 'table' and (spec.pattern or entry.pattern) or nil
 		local bytes = type(pattern) == 'string' and parse_hex(pattern) or nil
 		if not bytes or #bytes == 0 or #bytes > MAX_PATTERN_BYTES or bytes[1] == false then return 'bad pattern' end
@@ -472,11 +478,26 @@ local function inert_until_agreed(self, rec, body)
 	end
 end
 
-local function attach_link(self, rec, given)
+local function link_when(rec, set)
+	if not rec.spec.when then return nil end
+	local when = {}
+	for key, value in pairs(rec.spec.when) do
+		when[key] = value
+	end
+	when.set = set
+	return when
+end
+
+local function attach_link(self, rec, fn, set)
 	local handle = self.handle
-	local body = inert_until_agreed(self, rec, given)
+	local body = inert_until_agreed(self, rec, fn)
 	if rec.kind == 'site' then return handle:site(rec.name, rec.target, body, rec.spec.priority) end
-	return handle[LINK_METHODS[rec.kind]](handle, rec.target, rec.spec.signature, rec.name, body, rec.spec.priority)
+	return handle[LINK_METHODS[rec.kind]](handle, rec.target, rec.spec.signature, rec.name, body, rec.spec.priority, link_when(rec, set))
+end
+
+local function given_parts(given)
+	if type(given) == 'table' then return given.fn, given.set end
+	return given, nil
 end
 
 local function attach_problem(self, rec)
@@ -489,14 +510,17 @@ local function attach_problem(self, rec)
 	return nil
 end
 
-local function plan_attach(self, rec, body)
+local function plan_attach(self, rec, given)
 	if rec.installed then return NOTHING end
+	local body, set = given_parts(given)
 	if type(body) ~= 'function' then return nil, 'no callback' end
+	if rec.spec.when and set == nil then return nil, 'no set for when' end
+	if set ~= nil and not rec.spec.when then return nil, 'set given but the entry has no when' end
 	local problem = attach_problem(self, rec)
 	if problem then return nil, problem end
 	return {
 		attach = function()
-			return attach_link(self, rec, body)
+			return attach_link(self, rec, body, set)
 		end,
 	}
 end
@@ -908,6 +932,8 @@ function sites.attach()
 	end
 	plus.supports = plus.supports or {}
 	plus.supports.links_without_expect = true
+	plus.supports.link_when = true
+	plus.supports.rows = true
 end
 
 sites.parse_hex = parse_hex

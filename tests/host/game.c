@@ -232,6 +232,13 @@ static const char *host_text(HostString *string, size_t *length)
 	return string->heap.data;
 }
 
+static volatile LONG failing_inserts;
+
+void host_fail_emplace(LONG count)
+{
+	failing_inserts = count;
+}
+
 UINT64 *host_emplace(HostMap *map, UINT64 *out, HostString *value)
 {
 	UINT32 count = map->bucket_size - 1, bucket;
@@ -240,6 +247,12 @@ UINT64 *host_emplace(HostMap *map, UINT64 *out, HostString *value)
 	HostNode *end, *node, *before;
 	INT64 j;
 
+	if (failing_inserts > 0) {
+		failing_inserts--;
+		out[0] = 0;
+		out[1] = 0;
+		return out;
+	}
 	bucket = count ? host_murmur((const BYTE *)key, length) % count : 0;
 	end = map->buckets[bucket + 1];
 	for (node = map->buckets[bucket]; node != end; node = node->next) {
