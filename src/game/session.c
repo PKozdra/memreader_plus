@@ -7,6 +7,8 @@ enum {
 	SESSION_SIZE = 1 << 17,
 	MAX_MODS = 2048,
 	MAX_PATHS = 1024,
+	LONGEST_REAL_LIST = 16384,
+	SESSION_RESERVE = 2048,
 	MAX_SHADOWED = 256,
 	MAX_SCRIPT_SIZE = 1 << 20,
 	MOD_ENTRY_SIZE = 0x20,
@@ -56,8 +58,10 @@ static const WCHAR steam_apps[] = L"\\steamapps\\";
 
 static Mod mods[MAX_MODS];
 static int mod_count;
+static int mods_unlisted;
 static char paths[MAX_PATHS][MAX_PATH];
 static int path_count;
+static int paths_unlisted;
 static Shadowed shadowed[MAX_SHADOWED];
 static int shadowed_count;
 static char session_buffer[SESSION_SIZE];
@@ -151,8 +155,12 @@ static void add_path(const char *path)
 	size_t length;
 	int i;
 
-	if (path_count == MAX_PATHS || !path[0])
+	if (!path[0])
 		return;
+	if (path_count == MAX_PATHS) {
+		paths_unlisted++;
+		return;
+	}
 	if (!(length = GetFullPathNameA(path, MAX_PATH, full, NULL)) || length >= MAX_PATH)
 		return;
 	while (length > 3 && (full[length - 1] == '\\' || full[length - 1] == '/'))
@@ -166,7 +174,11 @@ static void add_path(const char *path)
 
 static void add_mod(const char *name)
 {
-	if (mod_count < MAX_MODS && name[0])
+	if (!name[0])
+		return;
+	if (mod_count == MAX_MODS)
+		mods_unlisted++;
+	else
 		strncpy_s(mods[mod_count++].name, MAX_PATH, name, _TRUNCATE);
 }
 
@@ -189,13 +201,14 @@ static BOOL read_mods_from_memory(void)
 	if (!getter)
 		return FALSE;
 	array = getter_target((const BYTE *)getter, LEA_RAX);
-	if (!array || !copy_memory(&list, (INT_PTR)array, sizeof list) || list.count > MAX_MODS)
+	if (!array || !copy_memory(&list, (INT_PTR)array, sizeof list) || list.count > LONGEST_REAL_LIST)
 		return FALSE;
-	for (i = 0; i < (int)list.count; i++) {
+	for (i = 0; i < (int)list.count && mod_count < MAX_MODS; i++) {
 		if (!read_ca_text(list.data + (INT_PTR)i * MOD_ENTRY_SIZE, FALSE, name, sizeof name))
 			return FALSE;
 		add_mod(name);
 	}
+	mods_unlisted = (int)list.count - i;
 	return TRUE;
 }
 
@@ -213,12 +226,13 @@ static BOOL read_paths_from_memory(void)
 		return FALSE;
 	if (!copy_memory(&collection, (INT_PTR)slot, sizeof collection) || !collection ||
 		!copy_memory(&data, collection + PATHS_DATA, sizeof data) ||
-		!copy_memory(&total, collection + PATHS_COUNT, sizeof total) || total > MAX_PATHS)
+		!copy_memory(&total, collection + PATHS_COUNT, sizeof total) || total > LONGEST_REAL_LIST)
 		return FALSE;
-	for (i = 0; i < (int)total; i++) {
+	for (i = 0; i < (int)total && path_count < MAX_PATHS; i++) {
 		if (read_path_string(data + (INT_PTR)i * PATH_ENTRY_SIZE, path))
 			add_path(path);
 	}
+	paths_unlisted = (int)total - i;
 	return path_count > 0;
 }
 
@@ -464,6 +478,11 @@ static void find_user_data(void)
 	_snprintf_s(crash_folder, sizeof crash_folder, _TRUNCATE, "%s\\crash_report", user_data);
 }
 
+static BOOL has_session_room(void)
+{
+	return session.used + SESSION_RESERVE < session.size;
+}
+
 void describe_session(void)
 {
 	int i;
@@ -477,7 +496,7 @@ void describe_session(void)
 	if (read_mods_from_memory() && read_paths_from_memory())
 		mods_source = "game memory";
 	else {
-		mod_count = path_count = 0;
+		mod_count = path_count = mods_unlisted = paths_unlisted = 0;
 		read_mods_from_script();
 	}
 	locate_packs();
@@ -485,13 +504,19 @@ void describe_session(void)
 	add_text(&session, "\nGame: Warhammer3.exe ");
 	add_game_version();
 	add_text(&session, ", memreader Plus %s\nCommand line: %s\nGame crash folder: %s\nMods in load order (%d, from %s):\n",
-		MEMREADER_PLUS_VERSION, command_line, crash_folder, mod_count, mods_source);
-	for (i = 0; i < mod_count; i++)
+		MEMREADER_PLUS_VERSION, command_line, crash_folder, mod_count + mods_unlisted, mods_source);
+	for (i = 0; i < mod_count && has_session_room(); i++)
 		add_mod_line(i);
+	if (i < mod_count + mods_unlisted)
+		add_text(&session, "  and %d more mods not listed\n", mod_count + mods_unlisted - i);
+	if (paths_unlisted)
+		add_text(&session, "  %d more search paths were not searched\n", paths_unlisted);
 	if (shadowed_count) {
 		add_text(&session, "Same name in a later search path, not loaded:\n");
-		for (i = 0; i < shadowed_count; i++)
+		for (i = 0; i < shadowed_count && has_session_room(); i++)
 			add_text(&session, "  %s  %s\n", mods[shadowed[i].mod].name, paths[shadowed[i].path]);
+		if (i < shadowed_count)
+			add_text(&session, "  and %d more\n", shadowed_count - i);
 	}
 }
 

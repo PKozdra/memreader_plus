@@ -267,6 +267,30 @@ void mark_callback(INT_PTR target, int item)
 		hook->callbacks[hook->callback_count - 1].item = item;
 }
 
+void set_cave_listing(INT_PTR target, char *listing)
+{
+	Hook *hook = find_hook(target);
+
+	if (hook && !hook->listing)
+		hook->listing = listing;
+	else if (listing)
+		HeapFree(GetProcessHeap(), 0, listing);
+}
+
+const char *cave_listing(INT_PTR target)
+{
+	Hook *hook = find_hook(target);
+
+	return hook ? hook->listing : NULL;
+}
+
+size_t cave_length(INT_PTR target)
+{
+	Hook *hook = find_hook(target);
+
+	return hook && hook->kind == KIND_CAVE ? hook->cave_size : 0;
+}
+
 void *cave_start(INT_PTR target)
 {
 	Hook *hook = find_hook(target);
@@ -874,6 +898,10 @@ static int l_hook_info(lua_State *L)
 		push_value(L, VALUE_POINTER, (INT_PTR)hook->cave);
 		lua_setfield(L, -2, "cave");
 	}
+	if (hook->listing) {
+		lua_pushstring(L, hook->listing);
+		lua_setfield(L, -2, "listing");
+	}
 	if (hook->error[0]) {
 		lua_pushstring(L, hook->error);
 		lua_setfield(L, -2, "error");
@@ -1032,6 +1060,11 @@ void add_hooks(Text *report, lua_State *live)
 	}
 	if (shown < hook_count)
 		add_text(report, "  and %d more\n", hook_count - shown);
+}
+
+Capacity hook_capacity(void)
+{
+	return (Capacity){ hook_count, MAX_HOOKS, MAX_HOOKS };
 }
 
 static int l_hook_depth(lua_State *L)

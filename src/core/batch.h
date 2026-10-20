@@ -2,7 +2,7 @@
 
 #include "common.h"
 
-enum { MAX_BATCH_STEPS = 128, MAX_BATCH_WRITES = 2048, MAX_BATCH_SPANS = 4096, BATCH_BYTES = 64 * 1024 };
+enum { MAX_BATCH_STEPS = 1024, MAX_BATCH_WRITES = 2048, MAX_BATCH_SPANS = 4096, BATCH_BYTES = 512 * 1024 };
 
 typedef struct {
 	INT_PTR at;
@@ -52,8 +52,14 @@ const char *batch_guard(Batch *batch, INT_PTR at);
 const char *batch_write(Batch *batch, INT_PTR at, size_t size, const BYTE *old, const BYTE *wanted, BOOL write);
 
 extern const char hooked_call[];
+extern const char batch_busy[];
+
+BOOL batch_running(void);
+BOOL mark_running(BOOL on);
 
 int l_batch(lua_State *L);
+void hold_echoes(lua_State *L);
+void send_echoes(lua_State *L, int previous);
 int patcher_owner(lua_State *L);
 int run_step(lua_State *L, Batch *batch, const void *stack, int owner, int kind, const char *name, int first);
 void commit_step(lua_State *L, const Batch *batch, int owner, const Step *step);

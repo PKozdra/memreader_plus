@@ -331,8 +331,37 @@ INT32 park_frame(volatile LONG *flag);
 INT32 park_grow(volatile LONG *flag);
 INT32 park_outer(volatile LONG *flag);
 void filler_code(void);
+void mixed_code(void);
 void hop_leaf_here(void);
 void hop_leaf_pad(void);
+void asm_double(void);
+void asm_float(void);
+void asm_float_here(void);
+void asm_call(void);
+void asm_call_here(void);
+void asm_site(void);
+void asm_site_here(void);
+void asm_site_b(void);
+void asm_site_b_here(void);
+void asm_site_c(void);
+void asm_site_c_here(void);
+void asm_site_d(void);
+void asm_site_d_here(void);
+void asm_site_e(void);
+void asm_site_e_here(void);
+void asm_site_f(void);
+void asm_site_f_here(void);
+void asm_site_g(void);
+void asm_site_g_here(void);
+void asm_site_h(void);
+void asm_site_h_here(void);
+void asm_site_i(void);
+void asm_site_i_here(void);
+void asm_site_j(void);
+void asm_site_j_here(void);
+void asm_site_k(void);
+void asm_site_k_here(void);
+void many_site_0(void);
 void site_target(void);
 void site_target_here(void);
 void site_far(void);
@@ -448,6 +477,7 @@ LONG host_open_streams(void);
 void host_fail_emplace(LONG count);
 int patch_target(void);
 void register_file_edit_tests(lua_State *L);
+void register_session_tests(lua_State *L);
 
 __declspec(thread) static char host_thread_data[64];
 
@@ -526,9 +556,38 @@ static const struct {
 	{ "park_grow", park_grow },
 	{ "park_outer", park_outer },
 	{ "filler_code", filler_code },
+	{ "mixed_code", mixed_code },
 	{ "hop_leaf_here", hop_leaf_here },
 	{ "hop_leaf_pad", hop_leaf_pad },
 	{ "cave_target", cave_target },
+	{ "asm_double", asm_double },
+	{ "asm_float", asm_float },
+	{ "asm_float_here", asm_float_here },
+	{ "asm_call", asm_call },
+	{ "asm_call_here", asm_call_here },
+	{ "asm_site", asm_site },
+	{ "asm_site_here", asm_site_here },
+	{ "asm_site_b", asm_site_b },
+	{ "asm_site_b_here", asm_site_b_here },
+	{ "asm_site_c", asm_site_c },
+	{ "asm_site_c_here", asm_site_c_here },
+	{ "asm_site_d", asm_site_d },
+	{ "asm_site_d_here", asm_site_d_here },
+	{ "asm_site_e", asm_site_e },
+	{ "asm_site_e_here", asm_site_e_here },
+	{ "asm_site_f", asm_site_f },
+	{ "asm_site_f_here", asm_site_f_here },
+	{ "asm_site_g", asm_site_g },
+	{ "asm_site_g_here", asm_site_g_here },
+	{ "asm_site_h", asm_site_h },
+	{ "asm_site_h_here", asm_site_h_here },
+	{ "asm_site_i", asm_site_i },
+	{ "asm_site_i_here", asm_site_i_here },
+	{ "asm_site_j", asm_site_j },
+	{ "asm_site_j_here", asm_site_j_here },
+	{ "asm_site_k", asm_site_k },
+	{ "asm_site_k_here", asm_site_k_here },
+	{ "many_site_0", many_site_0 },
 	{ "site_target", site_target },
 	{ "site_target_here", site_target_here },
 	{ "site_far", site_far },
@@ -634,7 +693,7 @@ void fake_dlfree(void *chunk);
 static int l_test_allocator_crash(lua_State *L)
 {
 	static const WCHAR words[] = L"a tooltip text overwrote this chunk";
-	BYTE *chunk = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 256);
+	BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 768) + 256;
 
 	memcpy(chunk + 0x20, words, sizeof words);
 	fake_dlfree(chunk + 0x10);
@@ -1145,10 +1204,33 @@ static LPVOID (WINAPI *real_alloc)(LPVOID address, SIZE_T size, DWORD type, DWOR
 static volatile ULONG_PTR refused_page;
 static volatile LONG protect_refusals;
 static volatile LONG protect_skips;
+static volatile LONG restore_refusals;
 static volatile SIZE_T refused_size;
+
+static volatile ULONG_PTR counted_page;
+static volatile LONG counted_calls;
+static volatile ULONG_PTR relock_page;
+static volatile ULONG_PTR lie_page;
+static volatile ULONG_PTR also_page;
+static SIZE_T (WINAPI *real_query)(LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T size);
+static PVOID relock_handler;
+
+static ULONG_PTR page_start(const void *address)
+{
+	return (ULONG_PTR)address & ~(ULONG_PTR)0xFFF;
+}
 
 static BOOL WINAPI refusing_protect(LPVOID address, SIZE_T size, DWORD protection, PDWORD old)
 {
+	BOOL done;
+	DWORD unused;
+
+	if (page_start(address) == counted_page)
+		InterlockedIncrement(&counted_calls);
+	if ((ULONG_PTR)address == refused_page && !(protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && InterlockedDecrement(&restore_refusals) >= 0) {
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
 	if ((ULONG_PTR)address == refused_page && (protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
 		if (protect_skips > 0)
 			InterlockedDecrement(&protect_skips);
@@ -1157,7 +1239,33 @@ static BOOL WINAPI refusing_protect(LPVOID address, SIZE_T size, DWORD protectio
 			return FALSE;
 		}
 	}
-	return real_protect(address, size, protection, old);
+	done = real_protect(address, size, protection, old);
+	if (done && relock_page && page_start(address) == relock_page && (protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+		relock_page = 0;
+		real_protect(address, size, *old, &unused);
+	}
+	return done;
+}
+
+static SIZE_T WINAPI lying_query(LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T size)
+{
+	SIZE_T result = real_query(address, info, size);
+
+	if (result && lie_page && page_start(address) == lie_page)
+		info->Protect = PAGE_EXECUTE_READWRITE;
+	return result;
+}
+
+static LONG CALLBACK relock_on_fault(EXCEPTION_POINTERS *exception)
+{
+	const EXCEPTION_RECORD *record = exception->ExceptionRecord;
+	DWORD unused;
+
+	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && lie_page && page_start((void *)record->ExceptionInformation[1]) == lie_page) {
+		lie_page = 0;
+		real_protect((LPVOID)also_page, 0x1000, PAGE_EXECUTE_READ, &unused);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static LPVOID WINAPI refusing_alloc(LPVOID address, SIZE_T size, DWORD type, DWORD protection)
@@ -1184,9 +1292,64 @@ static int l_test_fail_protect(lua_State *L)
 	return 0;
 }
 
+static int l_test_fail_restore(lua_State *L)
+{
+	void *address;
+
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	find_plus(L, 2);
+	if (!real_protect)
+		replace_plus_import("VirtualProtect", (void *)refusing_protect, (void **)&real_protect);
+	refused_page = (ULONG_PTR)address & ~(ULONG_PTR)0xFFF;
+	protect_refusals = 0;
+	restore_refusals = 1;
+	return 0;
+}
+
+static int l_test_relock(lua_State *L)
+{
+	void *address, *also = NULL;
+
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	if (!lua_isnoneornil(L, 3))
+		memcpy(&also, luaL_checkstring(L, 3), sizeof also);
+	find_plus(L, 2);
+	if (!real_protect)
+		replace_plus_import("VirtualProtect", (void *)refusing_protect, (void **)&real_protect);
+	if (!real_query)
+		replace_plus_import("VirtualQuery", (void *)lying_query, (void **)&real_query);
+	if (!relock_handler)
+		relock_handler = AddVectoredExceptionHandler(1, relock_on_fault);
+	relock_page = page_start(address);
+	also_page = page_start(also);
+	lie_page = also ? relock_page : 0;
+	return 0;
+}
+
+static int l_test_count_protect(lua_State *L)
+{
+	void *address;
+
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	find_plus(L, 2);
+	if (!real_protect)
+		replace_plus_import("VirtualProtect", (void *)refusing_protect, (void **)&real_protect);
+	counted_page = page_start(address);
+	counted_calls = 0;
+	return 0;
+}
+
+static int l_test_protect_count(lua_State *L)
+{
+	lua_pushinteger(L, counted_calls);
+	return 1;
+}
+
 static DWORD (WINAPI *real_suspend)(HANDLE thread);
 static FARPROC (WINAPI *real_get_proc)(HMODULE module, LPCSTR name);
 static volatile LONG suspend_calls;
+static ULONG_PTR suspend_page;
+static DWORD suspend_protection;
 static volatile LONG spawn_at;
 static volatile LONG next_thread_denied;
 static void *change_address;
@@ -1211,10 +1374,19 @@ static void change_code_now(void)
 	change_size = 0;
 }
 
+static DWORD protection_now(ULONG_PTR page)
+{
+	MEMORY_BASIC_INFORMATION region;
+
+	return page && VirtualQuery((LPCVOID)page, &region, sizeof region) ? region.Protect : 0;
+}
+
 static DWORD WINAPI watching_suspend(HANDLE thread)
 {
 	LONG number = InterlockedIncrement(&suspend_calls);
 
+	if (number == 1)
+		suspend_protection = protection_now(suspend_page);
 	if (change_size)
 		change_code_now();
 	if (spawn_at && number == spawn_at) {
@@ -1233,7 +1405,13 @@ static FARPROC WINAPI denying_get_proc(HMODULE module, LPCSTR name)
 
 static int l_test_watch_suspend(lua_State *L)
 {
+	void *page = NULL;
+
 	find_plus(L, 1);
+	if (!lua_isnoneornil(L, 2))
+		memcpy(&page, luaL_checkstring(L, 2), sizeof page);
+	suspend_page = page_start(page);
+	suspend_protection = 0;
 	if (!real_suspend)
 		replace_plus_import("SuspendThread", (void *)watching_suspend, (void **)&real_suspend);
 	if (!spawn_event)
@@ -1245,7 +1423,8 @@ static int l_test_watch_suspend(lua_State *L)
 static int l_test_suspend_calls(lua_State *L)
 {
 	lua_pushnumber(L, (lua_Number)suspend_calls);
-	return 1;
+	lua_pushnumber(L, (lua_Number)suspend_protection);
+	return 2;
 }
 
 static int l_test_spawn_on_suspend(lua_State *L)
@@ -1331,6 +1510,195 @@ static int l_test_fail_alloc(lua_State *L)
 		replace_plus_import("VirtualAlloc", (void *)refusing_alloc, (void **)&real_alloc);
 	refused_size = (SIZE_T)luaL_checkinteger(L, 1);
 	return 0;
+}
+
+static LPVOID (WINAPI *plain_virtual_alloc)(LPVOID address, SIZE_T size, DWORD type, DWORD protection);
+static LPVOID (WINAPI *plain_heap_alloc)(HANDLE heap, DWORD flags, SIZE_T size);
+static LPVOID (WINAPI *plain_heap_realloc)(HANDLE heap, DWORD flags, LPVOID block, SIZE_T size);
+static DWORD (WINAPI *plain_suspend)(HANDLE thread);
+static DWORD (WINAPI *plain_resume)(HANDLE thread);
+static volatile LONG refuse_virtual;
+static volatile LONG refuse_heap;
+static volatile LONG refuse_private_heap;
+static volatile LONG threads_held;
+static volatile LONG window_allocations;
+static volatile LONG window_suspends;
+
+static void note_allocation(void)
+{
+	if (threads_held > 0)
+		InterlockedIncrement(&window_allocations);
+}
+
+static BOOL take_refusal(volatile LONG *counter)
+{
+	if (*counter <= 0)
+		return FALSE;
+	InterlockedDecrement(counter);
+	SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+	return TRUE;
+}
+
+static LPVOID WINAPI watched_virtual_alloc(LPVOID address, SIZE_T size, DWORD type, DWORD protection)
+{
+	note_allocation();
+	return take_refusal(&refuse_virtual) ? NULL : plain_virtual_alloc(address, size, type, protection);
+}
+
+static LPVOID WINAPI watched_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size)
+{
+	note_allocation();
+	if (heap != GetProcessHeap() && take_refusal(&refuse_private_heap))
+		return NULL;
+	return take_refusal(&refuse_heap) ? NULL : plain_heap_alloc(heap, flags, size);
+}
+
+static LPVOID WINAPI watched_heap_realloc(HANDLE heap, DWORD flags, LPVOID block, SIZE_T size)
+{
+	note_allocation();
+	return take_refusal(&refuse_heap) ? NULL : plain_heap_realloc(heap, flags, block, size);
+}
+
+static DWORD WINAPI watched_window_suspend(HANDLE thread)
+{
+	DWORD result = plain_suspend(thread);
+
+	if (result != (DWORD)-1) {
+		InterlockedIncrement(&threads_held);
+		InterlockedIncrement(&window_suspends);
+	}
+	return result;
+}
+
+static DWORD WINAPI watched_window_resume(HANDLE thread)
+{
+	DWORD result = plain_resume(thread);
+
+	if (result != (DWORD)-1 && threads_held > 0)
+		InterlockedDecrement(&threads_held);
+	return result;
+}
+
+static void watch_memory(lua_State *L, int index)
+{
+	find_plus(L, index);
+	if (plain_virtual_alloc)
+		return;
+	replace_plus_import("VirtualAlloc", (void *)watched_virtual_alloc, (void **)&plain_virtual_alloc);
+	replace_plus_import("HeapAlloc", (void *)watched_heap_alloc, (void **)&plain_heap_alloc);
+	replace_plus_import("HeapReAlloc", (void *)watched_heap_realloc, (void **)&plain_heap_realloc);
+	replace_plus_import("SuspendThread", (void *)watched_window_suspend, (void **)&plain_suspend);
+	replace_plus_import("ResumeThread", (void *)watched_window_resume, (void **)&plain_resume);
+}
+
+static int l_test_fail_memory(lua_State *L)
+{
+	const char *kind = luaL_checkstring(L, 1);
+
+	watch_memory(L, 2);
+	if (strcmp(kind, "virtual") == 0)
+		refuse_virtual = 1;
+	else if (strcmp(kind, "heap") == 0)
+		refuse_heap = 1;
+	else if (strcmp(kind, "private_heap") == 0)
+		refuse_private_heap = 1;
+	else
+		luaL_argerror(L, 1, "virtual, heap or private_heap");
+	return 0;
+}
+
+static int l_test_watch_window(lua_State *L)
+{
+	watch_memory(L, 1);
+	threads_held = 0;
+	window_allocations = 0;
+	window_suspends = 0;
+	return 0;
+}
+
+static int l_test_window_counts(lua_State *L)
+{
+	lua_pushnumber(L, (lua_Number)window_allocations);
+	lua_pushnumber(L, (lua_Number)window_suspends);
+	lua_pushnumber(L, (lua_Number)(refuse_virtual + refuse_heap + refuse_private_heap));
+	return 3;
+}
+
+static lua_CFunction report_function;
+static HANDLE report_thread;
+static volatile LONG report_stop;
+static int report_count;
+static int report_bad;
+static int report_max_items;
+static int report_max_claims;
+static char report_text[64 * 1024];
+
+static void check_report_file(const char *name)
+{
+	int owners, owner_limit, items, item_limit, claims, claim_limit;
+	const char *line;
+	FILE *file;
+	size_t size;
+
+	if (fopen_s(&file, name, "rb")) {
+		report_bad++;
+		return;
+	}
+	size = fread(report_text, 1, sizeof report_text - 1, file);
+	fclose(file);
+	report_text[size] = '\0';
+	line = strstr(report_text, "memreader Plus capacity: ");
+	if (!line || !strstr(report_text, "memreader Plus hooks: ") ||
+		sscanf_s(line, "memreader Plus capacity: owners %d/%d, items %d/%d, claims %d/%d", &owners, &owner_limit, &items, &item_limit, &claims, &claim_limit) != 6 ||
+		items > item_limit || claims > claim_limit) {
+		report_bad++;
+		return;
+	}
+	report_count++;
+	if (items > report_max_items)
+		report_max_items = items;
+	if (claims > report_max_claims)
+		report_max_claims = claims;
+}
+
+static DWORD WINAPI report_loop(LPVOID unused)
+{
+	lua_State *L = luaL_newstate();
+
+	(void)unused;
+	while (!report_stop) {
+		lua_settop(L, 0);
+		if (report_function(L) == 1 && lua_type(L, -1) == LUA_TSTRING)
+			check_report_file(lua_tostring(L, -1));
+		else
+			report_bad++;
+		Sleep(10);
+	}
+	lua_close(L);
+	return 0;
+}
+
+static int l_test_report_loop_start(lua_State *L)
+{
+	report_function = lua_tocfunction(L, 1);
+	if (!report_function)
+		luaL_argerror(L, 1, "write_runtime_report");
+	report_stop = 0;
+	report_count = report_bad = report_max_items = report_max_claims = 0;
+	report_thread = CreateThread(NULL, 0, report_loop, NULL, 0, NULL);
+	return 0;
+}
+
+static int l_test_report_loop_stop(lua_State *L)
+{
+	report_stop = 1;
+	WaitForSingleObject(report_thread, INFINITE);
+	CloseHandle(report_thread);
+	lua_pushnumber(L, report_count);
+	lua_pushnumber(L, report_bad);
+	lua_pushnumber(L, report_max_items);
+	lua_pushnumber(L, report_max_claims);
+	return 4;
 }
 
 static int l_test_microseconds(lua_State *L)
@@ -1435,6 +1803,219 @@ static int l_test_far_function(lua_State *L)
 	return 1;
 }
 
+static LPVOID (WINAPI *counted_alloc_next)(LPVOID address, SIZE_T size, DWORD type, DWORD protection);
+static BOOL (WINAPI *counted_free_next)(LPVOID address, SIZE_T size, DWORD type);
+static volatile LONG virtual_blocks;
+static struct {
+	LPVOID address;
+	DWORD protection;
+} recent_allocations[64];
+static volatile LONG allocation_count;
+
+static LPVOID WINAPI counted_alloc(LPVOID address, SIZE_T size, DWORD type, DWORD protection)
+{
+	LPVOID result = counted_alloc_next(address, size, type, protection);
+	LONG slot;
+
+	if (!result)
+		return NULL;
+	if (type & MEM_RESERVE)
+		InterlockedIncrement(&virtual_blocks);
+	slot = InterlockedIncrement(&allocation_count) % 64;
+	recent_allocations[slot].address = result;
+	recent_allocations[slot].protection = protection;
+	return result;
+}
+
+static BOOL WINAPI counted_free(LPVOID address, SIZE_T size, DWORD type)
+{
+	BOOL result = counted_free_next(address, size, type);
+
+	if (result && type == MEM_RELEASE)
+		InterlockedDecrement(&virtual_blocks);
+	return result;
+}
+
+static int l_test_virtual_blocks(lua_State *L)
+{
+	find_plus(L, 1);
+	if (!counted_alloc_next) {
+		replace_plus_import("VirtualAlloc", (void *)counted_alloc, (void **)&counted_alloc_next);
+		replace_plus_import("VirtualFree", (void *)counted_free, (void **)&counted_free_next);
+	}
+	lua_pushinteger(L, virtual_blocks);
+	return 1;
+}
+
+enum { FREED_BLOCKS = 1024 };
+
+static LPVOID (WINAPI *checked_alloc_next)(HANDLE heap, DWORD flags, SIZE_T size);
+static LPVOID (WINAPI *checked_realloc_next)(HANDLE heap, DWORD flags, LPVOID block, SIZE_T size);
+static BOOL (WINAPI *checked_free_next)(HANDLE heap, DWORD flags, LPVOID block);
+static SRWLOCK freed_lock = SRWLOCK_INIT;
+static LPVOID freed_blocks[FREED_BLOCKS];
+static int freed_next;
+static volatile LONG double_frees;
+
+static void forget_block(LPVOID block)
+{
+	int i;
+
+	AcquireSRWLockExclusive(&freed_lock);
+	for (i = 0; i < FREED_BLOCKS; i++) {
+		if (freed_blocks[i] == block)
+			freed_blocks[i] = NULL;
+	}
+	ReleaseSRWLockExclusive(&freed_lock);
+}
+
+static BOOL freed_before(LPVOID block)
+{
+	BOOL found = FALSE;
+	int i;
+
+	AcquireSRWLockExclusive(&freed_lock);
+	for (i = 0; i < FREED_BLOCKS && !found; i++)
+		found = freed_blocks[i] == block;
+	if (!found) {
+		freed_blocks[freed_next] = block;
+		freed_next = (freed_next + 1) % FREED_BLOCKS;
+	}
+	ReleaseSRWLockExclusive(&freed_lock);
+	return found;
+}
+
+static LPVOID WINAPI checked_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size)
+{
+	LPVOID block = checked_alloc_next(heap, flags, size);
+
+	if (block)
+		forget_block(block);
+	return block;
+}
+
+static LPVOID WINAPI checked_heap_realloc(HANDLE heap, DWORD flags, LPVOID old, SIZE_T size)
+{
+	LPVOID block = checked_realloc_next(heap, flags, old, size);
+
+	if (block)
+		forget_block(block);
+	return block;
+}
+
+static BOOL WINAPI checked_heap_free(HANDLE heap, DWORD flags, LPVOID block)
+{
+	if (block && freed_before(block)) {
+		InterlockedIncrement(&double_frees);
+		return TRUE;
+	}
+	return checked_free_next(heap, flags, block);
+}
+
+static int l_test_double_frees(lua_State *L)
+{
+	find_plus(L, 1);
+	if (!checked_free_next) {
+		replace_plus_import("HeapAlloc", (void *)checked_heap_alloc, (void **)&checked_alloc_next);
+		replace_plus_import("HeapReAlloc", (void *)checked_heap_realloc, (void **)&checked_realloc_next);
+		replace_plus_import("HeapFree", (void *)checked_heap_free, (void **)&checked_free_next);
+	}
+	lua_pushinteger(L, double_frees);
+	return 1;
+}
+
+static int l_test_allocated_as(lua_State *L)
+{
+	LPVOID address;
+	int i;
+
+	memcpy(&address, luaL_checkstring(L, 1), sizeof address);
+	for (i = 0; i < 64; i++) {
+		int slot = ((allocation_count - i) % 64 + 64) % 64;
+
+		if (recent_allocations[slot].address == address) {
+			lua_pushinteger(L, (lua_Integer)recent_allocations[slot].protection);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int l_test_newest_allocation(lua_State *L)
+{
+	int slot = allocation_count % 64;
+
+	lua_pushlstring(L, (const char *)&recent_allocations[slot].address, sizeof recent_allocations[slot].address);
+	lua_pushinteger(L, (lua_Integer)recent_allocations[slot].protection);
+	return 2;
+}
+
+static SIZE_T (WINAPI *counted_query_next)(LPCVOID address, PMEMORY_BASIC_INFORMATION region, SIZE_T size);
+static volatile LONG plus_queries;
+
+static SIZE_T WINAPI counted_query(LPCVOID address, PMEMORY_BASIC_INFORMATION region, SIZE_T size)
+{
+	InterlockedIncrement(&plus_queries);
+	return counted_query_next(address, region, size);
+}
+
+static int l_test_plus_queries(lua_State *L)
+{
+	find_plus(L, 1);
+	if (!counted_query_next)
+		replace_plus_import("VirtualQuery", (void *)counted_query, (void **)&counted_query_next);
+	lua_pushinteger(L, plus_queries);
+	return 1;
+}
+
+enum { FILL_REACH = 0x70010000, FILL_STEP = 0x10000 };
+
+static void **filled_blocks;
+static int filled_count;
+
+static int l_test_fill_near(lua_State *L)
+{
+	ULONG_PTR site, at, end;
+	void *block;
+
+	memcpy(&site, luaL_checkstring(L, 1), sizeof site);
+	at = (site - FILL_REACH) & ~(ULONG_PTR)(FILL_STEP - 1);
+	end = site + FILL_REACH;
+	filled_blocks = HeapAlloc(GetProcessHeap(), 0, ((end - at) / FILL_STEP + 1) * sizeof *filled_blocks);
+	filled_count = 0;
+	for (; filled_blocks && at < end; at += FILL_STEP) {
+		block = VirtualAlloc((void *)at, FILL_STEP, MEM_RESERVE, PAGE_NOACCESS);
+		if (block)
+			filled_blocks[filled_count++] = block;
+	}
+	lua_pushinteger(L, filled_count);
+	return 1;
+}
+
+static int l_test_unfill_near(lua_State *L)
+{
+	while (filled_count > 0)
+		VirtualFree(filled_blocks[--filled_count], 0, MEM_RELEASE);
+	HeapFree(GetProcessHeap(), 0, filled_blocks);
+	filled_blocks = NULL;
+	(void)L;
+	return 0;
+}
+
+static int l_test_image_size(lua_State *L)
+{
+	BYTE *image = (BYTE *)GetModuleHandleW(NULL);
+	IMAGE_NT_HEADERS *headers = (IMAGE_NT_HEADERS *)(image + ((IMAGE_DOS_HEADER *)image)->e_lfanew);
+	DWORD *size = &headers->OptionalHeader.SizeOfImage;
+	DWORD old_size = *size, protection;
+
+	VirtualProtect(size, sizeof *size, PAGE_READWRITE, &protection);
+	*size = (DWORD)luaL_checkinteger(L, 1);
+	VirtualProtect(size, sizeof *size, protection, &protection);
+	lua_pushinteger(L, (lua_Integer)old_size);
+	return 1;
+}
+
 static int l_test_force_far_hooks(lua_State *L)
 {
 	BOOL on = lua_toboolean(L, 1);
@@ -1521,6 +2102,24 @@ static int l_test_protect(lua_State *L)
 	VirtualProtect(address, (SIZE_T)luaL_checkinteger(L, 2), (DWORD)luaL_checkinteger(L, 3), &old);
 	lua_pushinteger(L, old);
 	return 1;
+}
+
+static int l_test_fill_mixed(lua_State *L)
+{
+	BYTE *at = (BYTE *)mixed_code;
+	size_t size = (size_t)luaL_checkinteger(L, 1), i;
+	UINT32 state = 0x9E3779B9;
+	DWORD old;
+
+	VirtualProtect(at, size, PAGE_EXECUTE_READWRITE, &old);
+	for (i = 0; i < size; i++) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		at[i] = (BYTE)(state >> 24);
+	}
+	VirtualProtect(at, size, old, &old);
+	return 0;
 }
 
 static int l_test_page(lua_State *L)
@@ -1645,6 +2244,7 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_fault", l_test_fault);
 	lua_register(L, "test_sleep", l_test_sleep);
 	lua_register(L, "test_protect", l_test_protect);
+	lua_register(L, "test_fill_mixed", l_test_fill_mixed);
 	lua_register(L, "test_protection", l_test_protection);
 	lua_register(L, "test_page", l_test_page);
 	lua_register(L, "test_system_address", l_test_system_address);
@@ -1667,7 +2267,16 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_park_leave_on_retry", l_test_park_leave_on_retry);
 	lua_register(L, "test_park_left", l_test_park_left);
 	lua_register(L, "test_fail_protect", l_test_fail_protect);
+	lua_register(L, "test_relock", l_test_relock);
+	lua_register(L, "test_fail_restore", l_test_fail_restore);
+	lua_register(L, "test_count_protect", l_test_count_protect);
+	lua_register(L, "test_protect_count", l_test_protect_count);
 	lua_register(L, "test_fail_alloc", l_test_fail_alloc);
+	lua_register(L, "test_fail_memory", l_test_fail_memory);
+	lua_register(L, "test_watch_window", l_test_watch_window);
+	lua_register(L, "test_window_counts", l_test_window_counts);
+	lua_register(L, "test_report_loop_start", l_test_report_loop_start);
+	lua_register(L, "test_report_loop_stop", l_test_report_loop_stop);
 	lua_register(L, "test_watch_suspend", l_test_watch_suspend);
 	lua_register(L, "test_suspend_calls", l_test_suspend_calls);
 	lua_register(L, "test_spawn_on_suspend", l_test_spawn_on_suspend);
@@ -1682,12 +2291,21 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_reader_counts", l_test_reader_counts);
 	lua_register(L, "test_reader_stop", l_test_reader_stop);
 	lua_register(L, "test_force_far_hooks", l_test_force_far_hooks);
+	lua_register(L, "test_virtual_blocks", l_test_virtual_blocks);
+	lua_register(L, "test_allocated_as", l_test_allocated_as);
+	lua_register(L, "test_newest_allocation", l_test_newest_allocation);
+	lua_register(L, "test_plus_queries", l_test_plus_queries);
+	lua_register(L, "test_fill_near", l_test_fill_near);
+	lua_register(L, "test_unfill_near", l_test_unfill_near);
+	lua_register(L, "test_image_size", l_test_image_size);
+	lua_register(L, "test_double_frees", l_test_double_frees);
 	lua_register(L, "test_far_function", l_test_far_function);
 	lua_register(L, "test_catch_site_call", l_test_catch_site_call);
 	lua_register(L, "test_heap_blocks", l_test_heap_blocks);
 	lua_register(L, "test_open_streams", l_test_open_streams);
 	lua_register(L, "exe_data_address", l_exe_data_address);
 	register_file_edit_tests(L);
+	register_session_tests(L);
 	lua_pushstring(L, argv[2]);
 	lua_setglobal(L, "ROOT");
 	lua_pushstring(L, argc > 3 ? argv[3] : "");

@@ -1,15 +1,35 @@
 #include <intrin.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "batch.h"
 #include "hook.h"
 
-enum { MAX_STEP_FIELDS = 7 };
+enum { MAX_STEP_FIELDS = 7, MAX_PAGES = 2 * MAX_BATCH_WRITES };
 
 typedef struct {
 	int kind;
 	char name[ITEM_NAME_SIZE];
 } Entry;
+
+typedef struct {
+	INT_PTR at;
+	DWORD original;
+	int write;
+} Page;
+
+typedef struct {
+	int count;
+	int first;
+} PageCount;
+
+typedef struct {
+	int freeze;
+	int busy;
+	int changed;
+	int locked;
+	int failed;
+} Outcome;
 
 static const struct {
 	const char *word;
@@ -26,8 +46,27 @@ static Range windows[MAX_BATCH_WRITES + MAX_WHOLE_RANGES];
 static const char *window_names[MAX_BATCH_WRITES + MAX_WHOLE_RANGES];
 static int leftovers[MAX_BATCH_WRITES];
 static int leftover_count;
+static Page pages[MAX_PAGES];
+static int page_count;
+static size_t page_size;
 static UINT64 window_us;
 static char reason[TAG_SIZE + 160];
+static BOOL running;
+
+const char batch_busy[] = "a batch is already running";
+
+BOOL batch_running(void)
+{
+	return running;
+}
+
+BOOL mark_running(BOOL on)
+{
+	BOOL was = running;
+
+	running = on;
+	return was;
+}
 
 void batch_begin(Batch *batch, int kind, int item, const char *name)
 {
@@ -199,6 +238,12 @@ static const char *read_entry(lua_State *L, int list, int number)
 	return why;
 }
 
+static const char *step_count_text(void)
+{
+	_snprintf_s(reason, sizeof reason, _TRUNCATE, "at most %d steps", MAX_BATCH_STEPS);
+	return reason;
+}
+
 static const char *read_entries(lua_State *L, int list, int count)
 {
 	const char *why;
@@ -207,7 +252,7 @@ static const char *read_entries(lua_State *L, int list, int count)
 	if (count == 0)
 		return "no steps";
 	if (count > MAX_BATCH_STEPS)
-		return "at most 128 steps";
+		return step_count_text();
 	for (number = 1; number <= count; number++) {
 		why = read_entry(L, list, number);
 		if (why)
@@ -342,7 +387,7 @@ static void put_back(const Batch *batch, int count)
 
 		if (!write->write || matches_old(batch, write))
 			continue;
-		patch_memory(write->at, (const char *)batch->old + write->offset, (size_t)write->size);
+		store_memory(write->at, batch->old + write->offset, (size_t)write->size);
 		if (!matches_old(batch, write))
 			leftovers[leftover_count++] = i;
 	}
@@ -355,12 +400,132 @@ static int write_all(const Batch *batch)
 	for (i = 0; i < batch->write_count; i++) {
 		const Write *write = &batch->writes[i];
 
-		if (write->write && !patch_memory(write->at, (const char *)batch->wanted + write->offset, (size_t)write->size)) {
+		if (write->write && !store_memory(write->at, batch->wanted + write->offset, (size_t)write->size)) {
 			put_back(batch, i + 1);
 			return i;
 		}
 	}
 	return -1;
+}
+
+static int compare_pages(const void *a, const void *b)
+{
+	const Page *left = a, *right = b;
+
+	if (left->at != right->at)
+		return left->at < right->at ? -1 : 1;
+	return left->write - right->write;
+}
+
+static void list_pages(const Batch *batch)
+{
+	SYSTEM_INFO system;
+	INT_PTR mask;
+	int count = 0, i;
+
+	GetSystemInfo(&system);
+	page_size = system.dwPageSize;
+	mask = (INT_PTR)page_size - 1;
+	for (i = 0; i < batch->write_count; i++) {
+		const Write *write = &batch->writes[i];
+		INT_PTR at;
+
+		if (!write->write)
+			continue;
+		for (at = write->at & ~mask; at < write->at + write->size; at += (INT_PTR)page_size) {
+			pages[count].at = at;
+			pages[count++].write = i;
+		}
+	}
+	qsort(pages, (size_t)count, sizeof pages[0], compare_pages);
+	page_count = 0;
+	for (i = 0; i < count; i++) {
+		if (page_count == 0 || pages[page_count - 1].at != pages[i].at)
+			pages[page_count++] = pages[i];
+	}
+}
+
+static BOOL can_unlock(INT_PTR at, DWORD *protection)
+{
+	MEMORY_BASIC_INFORMATION region;
+
+	if (!VirtualQuery((LPCVOID)at, &region, sizeof region) || region.State != MEM_COMMIT || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+		return FALSE;
+	*protection = region.Protect;
+	return TRUE;
+}
+
+static void count_page(PageCount *counted, int index)
+{
+	if (counted->count++ == 0)
+		counted->first = index;
+}
+
+static void note_pages(const PageCount *counted, const char *what)
+{
+	MEMORY_BASIC_INFORMATION region;
+	const Page *page;
+	DWORD kept;
+	char line[200];
+
+	if (counted->count == 0)
+		return;
+	page = &pages[counted->first];
+	kept = VirtualQuery((LPCVOID)page->at, &region, sizeof region) ? region.Protect : 0;
+	_snprintf_s(line, sizeof line, _TRUNCATE, "a batch %s %d page%s: the first, %p, has protection 0x%lx, its original was 0x%lx", what, counted->count,
+		counted->count == 1 ? "" : "s", (void *)page->at, kept, page->original);
+	note_line(line);
+}
+
+static void lock_pages(int count)
+{
+	PageCount changed = { 0, -1 }, refused = { 0, -1 };
+	DWORD unused;
+	int i;
+
+	for (i = 0; i < count; i++) {
+		if (!is_writable(pages[i].at, page_size))
+			count_page(&changed, i);
+		else if (!VirtualProtect((LPVOID)pages[i].at, page_size, pages[i].original, &unused))
+			count_page(&refused, i);
+	}
+	note_pages(&changed, "left alone (another program changed their protection meanwhile)");
+	note_pages(&refused, "could not put back");
+}
+
+static int unlock_pages(void)
+{
+	DWORD protection;
+	int i;
+
+	for (i = 0; i < page_count; i++) {
+		Page *page = &pages[i];
+
+		if (!can_unlock(page->at, &protection) || !VirtualProtect((LPVOID)page->at, page_size, writable_protection(protection), &page->original)) {
+			lock_pages(i);
+			return page->write;
+		}
+	}
+	return -1;
+}
+
+static int first_locked_page(void)
+{
+	int i;
+
+	for (i = 0; i < page_count; i++) {
+		if (!is_writable(pages[i].at, page_size))
+			return i;
+	}
+	return -1;
+}
+
+static void flush_pages(void)
+{
+	int i;
+
+	for (i = 0; i < page_count; i++)
+		FlushInstructionCache(GetCurrentProcess(), (LPCVOID)pages[i].at, page_size);
 }
 
 static void register_leftovers(const Batch *batch, int owner)
@@ -396,40 +561,71 @@ static const char *write_failed(const Batch *batch, int index)
 	return reason;
 }
 
+static void remember_writes(const Batch *batch)
+{
+	int i;
+
+	for (i = 0; i < batch->write_count; i++) {
+		if (batch->writes[i].write)
+			remember_original(batch->writes[i].at, (size_t)batch->writes[i].size);
+	}
+}
+
+static void run_window(const Batch *batch, const FreezeJob *job, Outcome *outcome)
+{
+	outcome->freeze = freeze_threads(job, &outcome->busy);
+	if (outcome->freeze != FREEZE_OK)
+		return;
+	outcome->changed = first_changed(batch);
+	if (outcome->changed < 0)
+		outcome->locked = first_locked_page();
+	if (outcome->changed < 0 && outcome->locked < 0) {
+		outcome->failed = write_all(batch);
+		flush_pages();
+	}
+	thaw_threads();
+	window_us = freeze_microseconds();
+}
+
+static const char *outcome_text(const Batch *batch, int owner, const Outcome *outcome)
+{
+	if (outcome->freeze == FREEZE_BUSY) {
+		_snprintf_s(reason, sizeof reason, _TRUNCATE, "a thread is inside %s/%s", owner_name(owner), window_names[outcome->busy]);
+		return reason;
+	}
+	if (outcome->freeze != FREEZE_OK)
+		return freeze_text(outcome->freeze);
+	if (outcome->changed >= 0) {
+		_snprintf_s(reason, sizeof reason, _TRUNCATE, "%s: unexpected bytes", batch->steps[batch->writes[outcome->changed].step].name);
+		return reason;
+	}
+	if (outcome->locked >= 0)
+		return write_failed(batch, pages[outcome->locked].write);
+	if (outcome->failed < 0)
+		return NULL;
+	register_leftovers(batch, owner);
+	return write_failed(batch, outcome->failed);
+}
+
 static const char *write_window(const Batch *batch, const void *stack, int owner)
 {
 	FreezeJob job = { windows, 0, NULL, NULL, stack };
-	int busy = -1, changed, failed = -1, result, i;
+	Outcome outcome = { FREEZE_OK, -1, -1, -1, -1 };
+	int refused;
 
 	window_us = 0;
 	leftover_count = 0;
 	job.count = collect_windows(batch);
 	if (job.count == 0)
 		return NULL;
-	for (i = 0; i < batch->write_count; i++) {
-		if (batch->writes[i].write)
-			remember_original(batch->writes[i].at, (size_t)batch->writes[i].size);
-	}
-	result = freeze_threads(&job, &busy);
-	if (result == FREEZE_BUSY) {
-		_snprintf_s(reason, sizeof reason, _TRUNCATE, "a thread is inside %s/%s", owner_name(owner), window_names[busy]);
-		return reason;
-	}
-	if (result != FREEZE_OK)
-		return freeze_text(result);
-	changed = first_changed(batch);
-	if (changed < 0)
-		failed = write_all(batch);
-	thaw_threads();
-	window_us = freeze_microseconds();
-	if (changed >= 0) {
-		_snprintf_s(reason, sizeof reason, _TRUNCATE, "%s: unexpected bytes", batch->steps[batch->writes[changed].step].name);
-		return reason;
-	}
-	if (failed < 0)
-		return NULL;
-	register_leftovers(batch, owner);
-	return write_failed(batch, failed);
+	remember_writes(batch);
+	list_pages(batch);
+	refused = unlock_pages();
+	if (refused >= 0)
+		return write_failed(batch, refused);
+	run_window(batch, &job, &outcome);
+	lock_pages(page_count);
+	return outcome_text(batch, owner, &outcome);
 }
 
 static int fail(lua_State *L, const char *why, const int *list, int count)
@@ -469,14 +665,13 @@ static BOOL holds_rewrite(int count)
 	return FALSE;
 }
 
-int l_batch(lua_State *L)
+static int run_batch(lua_State *L, const void *stack)
 {
-	const void *stack = _AddressOfReturnAddress();
 	int owner = patcher_owner(L), count;
 	const char *why;
 
 	flush_link_log(L);
-	luaL_checktype(L, 2, LUA_TTABLE);
+	running = TRUE;
 	count = (int)lua_objlen(L, 2);
 	stay_count = 0;
 	plan.guard_count = 0;
@@ -498,4 +693,35 @@ int l_batch(lua_State *L)
 	lua_pushboolean(L, 1);
 	lua_pushnumber(L, (lua_Number)window_us);
 	return 2;
+}
+
+static int protected_batch(lua_State *L)
+{
+	return run_batch(L, lua_touserdata(L, lua_upvalueindex(1)));
+}
+
+int l_batch(lua_State *L)
+{
+	int arguments = lua_gettop(L), failed;
+
+	patcher_owner(L);
+	luaL_checktype(L, 2, LUA_TTABLE);
+	if (running) {
+		lua_pushnil(L);
+		lua_pushstring(L, batch_busy);
+		return 2;
+	}
+	hold_echoes(L);
+	lua_insert(L, 1);
+	lua_pushlightuserdata(L, _AddressOfReturnAddress());
+	lua_pushcclosure(L, protected_batch, 1);
+	lua_insert(L, 2);
+	failed = lua_pcall(L, arguments, LUA_MULTRET, 0);
+	release_prepared_caves();
+	running = FALSE;
+	send_echoes(L, 1);
+	lua_remove(L, 1);
+	if (failed)
+		return lua_error(L);
+	return lua_gettop(L);
 }

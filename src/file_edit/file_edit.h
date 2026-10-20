@@ -83,6 +83,7 @@ void push_parts_off(lua_State *L);
 
 extern EditedFile **files;
 extern LONG file_count;
+Capacity file_edit_capacity(void);
 extern BOOL turned_off;
 extern LONG result_count;
 

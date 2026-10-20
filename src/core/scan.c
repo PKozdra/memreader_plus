@@ -8,8 +8,12 @@ enum {
 	MAX_PATTERN_SIZE = 256,
 	MAX_PATTERNS = 64,
 	MAX_FOUND = 8,
-	MAX_SAVED_CODE = 4096,
-	MAX_CACHED = 1024,
+	FIRST_SAVED_CODE = 4096,
+	MAX_SAVED_CODE = 65536,
+	FIRST_CACHED = 1024,
+	MAX_CACHED = 8192,
+	PIECE_SIZE = 64 * 1024,
+	PAGE_BYTES = 4096,
 	MAX_ORIGINAL_READ = 4096,
 	HEAD_SIZE = 8,
 	BLOCK_SIZE = 16,
@@ -71,12 +75,24 @@ typedef struct {
 	Matches matches;
 } CachedSearch;
 
+typedef struct {
+	INT_PTR shift;
+	BOOL original;
+	INT_PTR low;
+	INT_PTR high;
+} ScanView;
+
 static Search search;
-static SavedCode saved[MAX_SAVED_CODE];
+static ScanView view;
+static SavedCode *saved;
+static int *saved_order;
 static int saved_count;
+static int saved_room;
 static BOOL saved_full;
-static CachedSearch cache[MAX_CACHED];
+static BYTE piece[PIECE_SIZE + 2 * MAX_PATTERN_SIZE];
+static CachedSearch *cache;
 static int cache_count;
+static int cache_room;
 static INT_PTR cache_base;
 
 void capture_code(INT_PTR address, BYTE *window)
@@ -85,15 +101,37 @@ void capture_code(INT_PTR address, BYTE *window)
 		memset(window, 0, SAVED_BYTES);
 }
 
+static int first_start_from(INT_PTR address)
+{
+	int low = 0, high = saved_count;
+
+	while (low < high) {
+		int middle = (low + high) / 2;
+
+		if (saved[saved_order[middle]].start < address)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return low;
+}
+
 static int saved_index(INT_PTR address)
 {
-	int i;
+	int i, oldest = -1;
 
-	for (i = 0; i < saved_count; i++) {
-		if (address >= saved[i].start && address < saved[i].start + SAVED_BYTES)
-			return i;
+	for (i = first_start_from(address - SAVED_BYTES + 1); i < saved_count && saved[saved_order[i]].start <= address; i++) {
+		if (oldest < 0 || saved_order[i] < oldest)
+			oldest = saved_order[i];
 	}
-	return -1;
+	return oldest;
+}
+
+static BOOL overlaps_saved(INT_PTR at, size_t size)
+{
+	int i = first_start_from(at - SAVED_BYTES + 1);
+
+	return i < saved_count && saved[saved_order[i]].start < at + (INT_PTR)size;
 }
 
 static BOOL is_saved(INT_PTR address, size_t size)
@@ -116,21 +154,55 @@ static void report_full(void)
 	saved_full = TRUE;
 	_snprintf_s(line, sizeof line, _TRUNCATE,
 		"saved original code is full (%d ranges): find_pattern and read_original no longer see the original bytes of code changed from now on",
-		MAX_SAVED_CODE);
+		saved_count);
 	note_line(line);
+}
+
+static BOOL grow_saved(void)
+{
+	int room = saved_room ? saved_room * 2 : FIRST_SAVED_CODE;
+	SavedCode *bigger;
+	int *bigger_order;
+
+	if (room > MAX_SAVED_CODE)
+		return FALSE;
+	bigger = resize_block(saved, (size_t)room * sizeof *saved);
+	if (!bigger)
+		return FALSE;
+	saved = bigger;
+	bigger_order = resize_block(saved_order, (size_t)room * sizeof *saved_order);
+	if (!bigger_order)
+		return FALSE;
+	saved_order = bigger_order;
+	saved_room = room;
+	saved_full = FALSE;
+	return TRUE;
+}
+
+static void add_to_order(int index)
+{
+	int at = first_start_from(saved[index].start);
+
+	memmove(saved_order + at + 1, saved_order + at, (size_t)(saved_count - at) * sizeof *saved_order);
+	saved_order[at] = index;
+}
+
+static void save_window(INT_PTR start, const BYTE *window)
+{
+	if (saved_count == saved_room && !grow_saved()) {
+		report_full();
+		return;
+	}
+	saved[saved_count].start = start;
+	memcpy(saved[saved_count].bytes, window, SAVED_BYTES);
+	add_to_order(saved_count);
+	saved_count++;
 }
 
 void remember_code(INT_PTR address, const BYTE *window)
 {
-	if (is_saved(address, SAVED_BYTES / 2))
-		return;
-	if (saved_count == MAX_SAVED_CODE) {
-		report_full();
-		return;
-	}
-	saved[saved_count].start = address - SAVED_BYTES / 2;
-	memcpy(saved[saved_count].bytes, window, SAVED_BYTES);
-	saved_count++;
+	if (!is_saved(address, SAVED_BYTES / 2))
+		save_window(address - SAVED_BYTES / 2, window);
 }
 
 void remember_original(INT_PTR address, size_t size)
@@ -138,9 +210,13 @@ void remember_original(INT_PTR address, size_t size)
 	BYTE window[SAVED_BYTES];
 	size_t offset;
 
-	for (offset = 0; offset < size; offset += SAVED_BYTES / 2) {
-		capture_code(address + (INT_PTR)offset, window);
-		remember_code(address + (INT_PTR)offset, window);
+	for (offset = 0; offset < size; offset += SAVED_BYTES) {
+		INT_PTR at = address + (INT_PTR)offset;
+
+		if (is_saved(at, size - offset < SAVED_BYTES ? size - offset : SAVED_BYTES))
+			continue;
+		capture_code(at + SAVED_BYTES / 2, window);
+		save_window(at, window);
 	}
 }
 
@@ -245,17 +321,6 @@ static int add_pattern(const char *text)
 	return PATTERN_OK;
 }
 
-static int saved_window(INT_PTR at, size_t size)
-{
-	int i;
-
-	for (i = 0; i < saved_count; i++) {
-		if (at < saved[i].start + SAVED_BYTES && saved[i].start < at + (INT_PTR)size)
-			return i;
-	}
-	return -1;
-}
-
 static void add_match(Matches *matches, const BYTE *at)
 {
 	if (!matches->first || at < matches->first)
@@ -263,6 +328,15 @@ static void add_match(Matches *matches, const BYTE *at)
 	if (matches->count < MAX_FOUND)
 		matches->found[matches->count] = at;
 	matches->count++;
+}
+
+static BOOL wanted_match(const BYTE *at, size_t size)
+{
+	INT_PTR real = (INT_PTR)at + view.shift;
+
+	if (!view.original)
+		return !overlaps_saved(real, size);
+	return real >= view.low && real < view.high && overlaps_saved(real, size);
 }
 
 static BOOL matches_at(const BYTE *memory, const Pattern *pattern)
@@ -287,8 +361,8 @@ static void check_lead(const Lead *lead, const BYTE *at, const BYTE *end)
 			continue;
 		if (at + HEAD_SIZE <= end && (*(const UINT64 *)at & pattern->head_mask) != pattern->head)
 			continue;
-		if (matches_at(at, pattern) && saved_window((INT_PTR)at, pattern->size) < 0)
-			add_match(&search.matches[i], at);
+		if (matches_at(at, pattern) && wanted_match(at, pattern->size))
+			add_match(&search.matches[i], at + view.shift);
 	}
 }
 
@@ -381,25 +455,27 @@ static BOOL original_byte(INT_PTR address, BYTE *byte)
 	return copy_memory(byte, address, 1);
 }
 
-static void overlay_saved(const SavedCode *code, INT_PTR address, BYTE *out, size_t size)
-{
-	INT_PTR from = code->start > address ? code->start : address;
-	INT_PTR to = code->start + SAVED_BYTES;
-
-	if (to > address + (INT_PTR)size)
-		to = address + (INT_PTR)size;
-	if (from < to)
-		memcpy(out + (from - address), code->bytes + (from - code->start), (size_t)(to - from));
-}
-
 BOOL copy_original(INT_PTR address, BYTE *out, size_t size)
 {
-	int i;
+	int first, i;
+	size_t at;
 
 	if (!copy_memory(out, address, size))
 		return FALSE;
-	for (i = saved_count - 1; i >= 0; i--)
-		overlay_saved(&saved[i], address, out, size);
+	first = first_start_from(address - SAVED_BYTES + 1);
+	for (at = 0; at < size; at++) {
+		INT_PTR byte = address + (INT_PTR)at;
+		int oldest = -1;
+
+		while (first < saved_count && saved[saved_order[first]].start + SAVED_BYTES <= byte)
+			first++;
+		for (i = first; i < saved_count && saved[saved_order[i]].start <= byte; i++) {
+			if (oldest < 0 || saved_order[i] < oldest)
+				oldest = saved_order[i];
+		}
+		if (oldest >= 0)
+			out[at] = saved[oldest].bytes[byte - saved[oldest].start];
+	}
 	return TRUE;
 }
 
@@ -417,22 +493,83 @@ static BOOL matches_original(INT_PTR at, const Pattern *pattern)
 	return TRUE;
 }
 
-static void scan_saved_code(const BYTE *start, const BYTE *end)
+static INT_PTR longest_pattern(void)
 {
-	int i, p;
+	size_t longest = 1;
+	int i;
 
-	for (i = 0; i < saved_count; i++) {
-		for (p = 0; p < search.count; p++) {
-			const Pattern *pattern = &search.patterns[p];
-			INT_PTR at = saved[i].start - (INT_PTR)pattern->size + 1;
-			INT_PTR last = (INT_PTR)end - (INT_PTR)pattern->size;
+	for (i = 0; i < search.count; i++) {
+		if (search.patterns[i].size > longest)
+			longest = search.patterns[i].size;
+	}
+	return (INT_PTR)longest;
+}
 
-			for (; at < saved[i].start + SAVED_BYTES; at++) {
-				if (at >= (INT_PTR)start && at <= last && matches_original(at, pattern) && saved_window(at, pattern->size) == i)
-					add_match(&search.matches[p], (const BYTE *)at);
-			}
+static INT_PTR next_page(INT_PTR at)
+{
+	return (at | (PAGE_BYTES - 1)) + 1;
+}
+
+static void scan_readable_pages(INT_PTR from, INT_PTR last)
+{
+	INT_PTR at, page_end, readable = 0;
+
+	for (at = from; at < last; at = page_end) {
+		page_end = next_page(at) < last ? next_page(at) : last;
+		if (copy_original(at, piece + (at - from), (size_t)(page_end - at))) {
+			if (!readable)
+				readable = at;
+		} else if (readable) {
+			scan_memory(piece + (readable - from), piece + (at - from));
+			readable = 0;
 		}
 	}
+	if (readable)
+		scan_memory(piece + (readable - from), piece + (last - from));
+}
+
+static void scan_piece(INT_PTR from, INT_PTR to, INT_PTR context, INT_PTR end)
+{
+	INT_PTR last = to + context < end ? to + context : end;
+
+	view.shift = from - (INT_PTR)piece;
+	view.low = from;
+	view.high = to;
+	if (copy_original(from, piece, (size_t)(last - from)))
+		scan_memory(piece, piece + (last - from));
+	else
+		scan_readable_pages(from, last);
+}
+
+static void scan_run(INT_PTR from, INT_PTR to, INT_PTR context, const BYTE *start, const BYTE *end)
+{
+	INT_PTR at;
+
+	if (from < (INT_PTR)start)
+		from = (INT_PTR)start;
+	if (to > (INT_PTR)end)
+		to = (INT_PTR)end;
+	for (at = from; at < to; at += PIECE_SIZE)
+		scan_piece(at, at + PIECE_SIZE < to ? at + PIECE_SIZE : to, context, (INT_PTR)end);
+}
+
+static void scan_saved_code(const BYTE *start, const BYTE *end)
+{
+	INT_PTR context = longest_pattern() - 1;
+	int i = 0;
+
+	view.original = TRUE;
+	while (i < saved_count) {
+		INT_PTR run_start = saved[saved_order[i]].start, run_end = run_start + SAVED_BYTES;
+
+		for (i++; i < saved_count && saved[saved_order[i]].start < run_end + context; i++) {
+			if (saved[saved_order[i]].start + SAVED_BYTES > run_end)
+				run_end = saved[saved_order[i]].start + SAVED_BYTES;
+		}
+		scan_run(run_start - context, run_end, context, start, end);
+	}
+	view.original = FALSE;
+	view.shift = 0;
 }
 
 BOOL code_section(int index, BYTE **start, BYTE **end)
@@ -474,7 +611,7 @@ static void clear_cache(void)
 	cache_count = 0;
 }
 
-static const Matches *cached_matches(const char *text)
+static int cached_index(const char *text)
 {
 	INT_PTR base = (INT_PTR)GetModuleHandleA(NULL);
 	int i;
@@ -485,37 +622,55 @@ static const Matches *cached_matches(const char *text)
 	}
 	for (i = 0; i < cache_count; i++) {
 		if (strcmp(cache[i].text, text) == 0)
-			return &cache[i].matches;
+			return i;
 	}
-	return NULL;
+	return -1;
 }
 
-static const Matches *cache_matches(const char *text, const Matches *matches)
+static BOOL cache_has_room(void)
+{
+	int room = cache_room ? cache_room * 2 : FIRST_CACHED;
+	CachedSearch *bigger;
+
+	if (cache_count < cache_room)
+		return TRUE;
+	if (room > MAX_CACHED)
+		return FALSE;
+	bigger = resize_block(cache, (size_t)room * sizeof *cache);
+	if (!bigger)
+		return FALSE;
+	cache = bigger;
+	cache_room = room;
+	return TRUE;
+}
+
+static int cache_matches(const char *text, const Matches *matches)
 {
 	size_t size = strlen(text) + 1;
 	char *copy;
 
-	if (cache_count == MAX_CACHED || !(copy = HeapAlloc(GetProcessHeap(), 0, size)))
-		return matches;
+	if (!cache_has_room() || !(copy = resize_block(NULL, size)))
+		return -1;
 	memcpy(copy, text, size);
 	cache[cache_count].text = copy;
 	cache[cache_count].matches = *matches;
-	return &cache[cache_count++].matches;
+	return cache_count++;
 }
 
 static const Matches *search_one(const char *text, int *error)
 {
-	const Matches *cached = cached_matches(text);
+	int index = cached_index(text);
 
 	*error = PATTERN_OK;
-	if (cached)
-		return cached;
+	if (index >= 0)
+		return &cache[index].matches;
 	start_search();
 	*error = add_pattern(text);
 	if (*error != PATTERN_OK)
 		return NULL;
 	run_search();
-	return cache_matches(text, &search.matches[0]);
+	index = cache_matches(text, &search.matches[0]);
+	return index >= 0 ? &cache[index].matches : &search.matches[0];
 }
 
 int find_code_all(const char *text, const BYTE **found, int max)
@@ -621,8 +776,7 @@ static const char *pattern_at(lua_State *L, int index)
 
 static int l_find_patterns(lua_State *L)
 {
-	const Matches *results[MAX_PATTERNS];
-	int slots[MAX_PATTERNS];
+	int cached[MAX_PATTERNS], slots[MAX_PATTERNS];
 	int count, i;
 
 	luaL_checktype(L, 1, LUA_TTABLE);
@@ -634,9 +788,9 @@ static int l_find_patterns(lua_State *L)
 		const char *text = pattern_at(L, i + 1);
 		int error;
 
-		results[i] = cached_matches(text);
+		cached[i] = cached_index(text);
 		slots[i] = search.count;
-		if (results[i])
+		if (cached[i] >= 0)
 			continue;
 		error = add_pattern(text);
 		if (error != PATTERN_OK)
@@ -647,17 +801,19 @@ static int l_find_patterns(lua_State *L)
 	for (i = 0; i < count; i++) {
 		const char *text = pattern_at(L, i + 1);
 
-		if (!results[i])
-			results[i] = cached_matches(text);
-		if (!results[i])
-			results[i] = cache_matches(text, &search.matches[slots[i]]);
+		if (cached[i] < 0)
+			cached[i] = cached_index(text);
+		if (cached[i] < 0)
+			cached[i] = cache_matches(text, &search.matches[slots[i]]);
 	}
 	lua_createtable(L, count, 0);
 	lua_createtable(L, count, 0);
 	for (i = 0; i < count; i++) {
-		push_first(L, results[i], FALSE);
+		const Matches *matches = cached[i] >= 0 ? &cache[cached[i]].matches : &search.matches[slots[i]];
+
+		push_first(L, matches, FALSE);
 		lua_rawseti(L, -3, i + 1);
-		lua_pushnumber(L, (lua_Number)results[i]->count);
+		lua_pushnumber(L, (lua_Number)matches->count);
 		lua_rawseti(L, -2, i + 1);
 	}
 	return 2;
@@ -715,6 +871,12 @@ static int l_function_start(lua_State *L)
 	push_value(L, VALUE_POINTER, (INT_PTR)(base + primary_function_entry(part, base)->BeginAddress));
 	push_value(L, VALUE_POINTER, (INT_PTR)(base + part->EndAddress));
 	return 2;
+}
+
+void scan_capacity(Capacity *saved_use, Capacity *cache_use)
+{
+	*saved_use = (Capacity){ saved_count, saved_room, MAX_SAVED_CODE };
+	*cache_use = (Capacity){ cache_count, cache_room, MAX_CACHED };
 }
 
 const luaL_Reg scan_functions[] = {

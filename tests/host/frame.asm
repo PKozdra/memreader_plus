@@ -208,8 +208,12 @@ park_inner ENDP
 fillcode SEGMENT ALIGN(4096) READ EXECUTE ALIAS(".text$zz") 'CODE'
 
 filler_code PROC
-	BYTE 40960 DUP (0)
+	BYTE 1114112 DUP (0)
 filler_code ENDP
+
+mixed_code PROC
+	BYTE 163840 DUP (0)
+mixed_code ENDP
 
 fillcode ENDS
 

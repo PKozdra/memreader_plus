@@ -457,6 +457,12 @@ static void add_plus_hooks(Text *report, const CrashInput *input)
 	add_hooks(report, input->lua);
 }
 
+static void add_plus_capacity(Text *report, const CrashInput *input)
+{
+	add_capacity(report);
+	(void)input;
+}
+
 static void add_plus_changes(Text *report, const CrashInput *input)
 {
 	add_changes(report);
@@ -471,17 +477,17 @@ static void add_modules(Text *report, const CrashInput *input)
 
 static const Section crash_sections[] = {
 	add_header, add_thread, add_uptime, add_context, add_settings, add_events, add_lua_part, add_crashed_stack,
-	add_crashed_registers, add_crashed_memory, add_script_stack, add_plus_owners, add_plus_hooks, add_plus_changes, add_modules
+	add_crashed_registers, add_crashed_memory, add_script_stack, add_plus_owners, add_plus_hooks, add_plus_capacity, add_plus_changes, add_modules
 };
 
 static const Section exit_sections[] = {
 	add_exit_header, add_thread_and_log, add_uptime, add_context, add_settings, add_events, add_exit_stack, add_plus_owners,
-	add_plus_hooks, add_plus_changes, add_modules
+	add_plus_hooks, add_plus_capacity, add_plus_changes, add_modules
 };
 
 static const Section runtime_sections[] = {
 	add_runtime_header, add_thread_and_log, add_uptime, add_context, add_settings, add_events, add_plus_owners, add_plus_hooks,
-	add_plus_changes, add_modules
+	add_plus_capacity, add_plus_changes, add_modules
 };
 
 static void run_section(Text *report, const CrashInput *input, Section section)

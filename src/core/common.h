@@ -39,7 +39,7 @@ enum ItemKind { ITEM_SITE, ITEM_VALUE, ITEM_CAVE, ITEM_PATCH, ITEM_FRAME, ITEM_R
 
 enum { LINK_ERROR_SIZE = 256 };
 
-enum { SET_SLOTS = 8192, SET_MEMBERS = 4096, MAX_WHEN_READS = 4, MAX_WHEN_OFFSET = 0xFFFFFF };
+enum { SET_MEMBERS = 262144, MAX_WHEN_READS = 4, MAX_WHEN_OFFSET = 0xFFFFFF };
 
 enum FrameResult { FRAME_OK, FRAME_BAD_AMOUNT, FRAME_OUTSIDE, FRAME_NO_FUNCTION, FRAME_REFUSED };
 
@@ -77,10 +77,28 @@ typedef struct {
 	int hold;
 } Claim;
 
+enum { MAX_CHUNKS = 32, MAX_OWNERS = 256, MAX_ITEMS = 8192, MAX_CLAIMS = 32768 };
+
+typedef struct {
+	int used;
+	int room;
+	int limit;
+} Capacity;
+
+typedef struct {
+	size_t element_size;
+	int per_chunk;
+	int max_chunks;
+	BYTE *chunks[MAX_CHUNKS];
+	volatile LONG made;
+} Chunks;
+
 typedef struct {
 	BOOL all;
 	int count;
-	UINT64 slots[SET_SLOTS];
+	unsigned mask;
+	int shift;
+	UINT64 *slots;
 } PointerSet;
 
 typedef struct {
@@ -280,10 +298,17 @@ int call_crash_error(lua_State *L, const Fault *fault);
 UINT64 call_game(lua_State *L, INT_PTR function, const UINT64 *arguments, int count);
 BOOL call_native(INT_PTR function, const UINT64 *arguments, int count, UINT64 *result, Fault *fault);
 BOOL write_memory(INT_PTR address, const void *source, size_t size);
+void *resize_block(void *block, size_t size);
+int chunk_room(const Chunks *chunks);
+void *chunk_slot(const Chunks *chunks, int index);
+BOOL reserve_chunks(Chunks *chunks, int needed);
 BOOL zero_memory(INT_PTR address, size_t size);
 const IMAGE_NT_HEADERS *game_headers(void);
 BOOL in_game_image(INT_PTR address, size_t size);
 BOOL patch_memory(INT_PTR address, const char *bytes, size_t size);
+BOOL store_memory(INT_PTR address, const void *bytes, size_t size);
+BOOL is_writable(INT_PTR address, size_t size);
+DWORD writable_protection(DWORD protection);
 BOOL in_exe_code(INT_PTR address);
 BOOL is_executable(INT_PTR address);
 BOOL in_own_module(INT_PTR address);
@@ -313,6 +338,24 @@ int l_hook_site(lua_State *L);
 int l_unhook(lua_State *L);
 enum CaveResult { CAVE_OK, CAVE_NO_MEMORY, CAVE_REFUSED };
 int try_cave(lua_State *L, INT_PTR address, const char *bytes, size_t size, BYTE **start);
+typedef struct {
+	size_t code;
+	size_t total;
+	char *listing;
+} AssembledCave;
+typedef const char *(*CaveAssembler)(lua_State *L, int spec, INT_PTR site, INT_PTR address, BYTE *out, size_t room, AssembledCave *result);
+void register_cave_assembler(CaveAssembler assembler);
+int try_asm_cave(lua_State *L, INT_PTR site, int spec, const char *tag, BYTE **start);
+int prepare_asm_cave(lua_State *L, INT_PTR site, int spec);
+const char *compare_asm_cave(lua_State *L, INT_PTR site, int spec);
+void release_prepared_caves(void);
+void set_cave_listing(INT_PTR target, char *listing);
+const char *cave_listing(INT_PTR target);
+size_t cave_length(INT_PTR target);
+BOOL log_line(lua_State *L, const char *text);
+void reserve_near_caves(void);
+void log_cave_reservation(lua_State *L);
+Capacity cave_capacity(void);
 int callback_generation(void);
 void mark_callback(INT_PTR target, int item);
 int l_function_hook(lua_State *L);
@@ -370,6 +413,13 @@ int item_total(void);
 void remove_item(int index);
 void make_tag(char *out, size_t size, int owner, const char *name);
 BOOL claim_room(int claims, size_t bytes);
+void registry_capacity(Capacity *owners, Capacity *items, Capacity *claims, Capacity *held);
+void scan_capacity(Capacity *saved, Capacity *cache);
+Capacity hook_capacity(void);
+int hop_slots_left(void);
+void push_capacity(lua_State *L, const char *name, Capacity use);
+void push_core_capacity(lua_State *L);
+void add_capacity(Text *report);
 BOOL registry_room(int claims, size_t bytes);
 BOOL item_room(int needed);
 BOOL add_claim(int item, INT_PTR from, size_t size, const BYTE *held, const BYTE *wrote);

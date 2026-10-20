@@ -70,7 +70,7 @@ BOOL copy_memory(void *destination, INT_PTR address, size_t size)
 	return guarded_copy(destination, (const void *)address, size, FALSE);
 }
 
-static BOOL is_writable(INT_PTR address, size_t size)
+BOOL is_writable(INT_PTR address, size_t size)
 {
 	MEMORY_BASIC_INFORMATION region;
 	INT_PTR at = address;
@@ -92,6 +92,11 @@ BOOL write_memory(INT_PTR address, const void *source, size_t size)
 		return TRUE;
 	return patch_memory(address, (const char *)source, size) ||
 		WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, source, size, NULL);
+}
+
+BOOL store_memory(INT_PTR address, const void *bytes, size_t size)
+{
+	return guarded_copy((void *)address, bytes, size, FALSE);
 }
 
 BOOL zero_memory(INT_PTR address, size_t size)
@@ -400,7 +405,7 @@ BOOL in_game_image(INT_PTR address, size_t size)
 	return address >= start && address + (INT_PTR)size <= end;
 }
 
-static DWORD writable(DWORD protection)
+DWORD writable_protection(DWORD protection)
 {
 	if (protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
 		return PAGE_EXECUTE_READWRITE;
@@ -421,7 +426,7 @@ BOOL patch_memory(INT_PTR address, const char *bytes, size_t size)
 	for (at = first; at < address + (INT_PTR)size; at += system.dwPageSize) {
 		if (!VirtualQuery((LPCVOID)at, &page, sizeof page) || page.State != MEM_COMMIT ||
 			(page.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || pages == PATCH_PAGES ||
-			!VirtualProtect((LPVOID)at, 1, writable(page.Protect), &old[pages]))
+			!VirtualProtect((LPVOID)at, 1, writable_protection(page.Protect), &old[pages]))
 			break;
 		pages++;
 	}

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(memreader_plus VERSION 0.13.0 LANGUAGES C ASM_MASM)
+project(memreader_plus VERSION 0.14.0 LANGUAGES C ASM_MASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -19,6 +19,26 @@ add_library(minhook STATIC
 	vendor/minhook/src/hde/hde64.c)
 target_include_directories(minhook PUBLIC "${PROJECT_SOURCE_DIR}/vendor/minhook/include")
 
+add_library(zydis STATIC
+	vendor/zydis/src/Decoder.c
+	vendor/zydis/src/DecoderData.c
+	vendor/zydis/src/Encoder.c
+	vendor/zydis/src/EncoderData.c
+	vendor/zydis/src/Formatter.c
+	vendor/zydis/src/FormatterATT.c
+	vendor/zydis/src/FormatterBase.c
+	vendor/zydis/src/FormatterBuffer.c
+	vendor/zydis/src/FormatterIntel.c
+	vendor/zydis/src/MetaInfo.c
+	vendor/zydis/src/Mnemonic.c
+	vendor/zydis/src/Register.c
+	vendor/zydis/src/SharedData.c
+	vendor/zydis/src/String.c
+	vendor/zydis/src/Utils.c
+	vendor/zydis/src/Zydis.c)
+target_include_directories(zydis PUBLIC vendor/zydis/include vendor/zycore/include PRIVATE vendor/zydis/src)
+target_compile_definitions(zydis PUBLIC ZYDIS_STATIC_BUILD ZYCORE_STATIC_BUILD)
+
 add_library(memreader_plus SHARED
 	src/main.c
 	src/core/common.h
@@ -35,6 +55,7 @@ add_library(memreader_plus SHARED
 	src/core/farhook.c
 	src/core/cave.c
 	src/core/owners.c
+	src/core/growth.c
 	src/core/patcher.c
 	src/core/batch.c
 	src/core/freeze.c
@@ -60,7 +81,11 @@ add_library(memreader_plus SHARED
 	src/file_edit/registry.c
 	src/file_edit/ops.c
 	src/file_edit/xml.c
-	src/file_edit/game.c)
+	src/file_edit/game.c
+	src/asm/asm.h
+	src/asm/parse.c
+	src/asm/assemble.c
+	src/asm/lua.c)
 add_dependencies(memreader_plus game_import_lib)
 
 configure_file(src/config.h.in config.h @ONLY)
@@ -71,6 +96,13 @@ target_include_directories(memreader_plus PRIVATE
 	"${PROJECT_SOURCE_DIR}/vendor/lua-5.1"
 	"${PROJECT_SOURCE_DIR}/vendor/minhook/src")
 target_compile_definitions(memreader_plus PRIVATE LUA_BUILD_AS_DLL)
+
+add_executable(asm_check src/asm/check.c src/asm/parse.c src/asm/assemble.c)
+target_include_directories(asm_check PRIVATE
+	"${PROJECT_BINARY_DIR}"
+	"${PROJECT_SOURCE_DIR}/src/core"
+	"${PROJECT_SOURCE_DIR}/vendor/lua-5.1")
+target_link_libraries(asm_check zydis)
 
 option(MEMREADER_SYSTEM_EXIT_HOOKS "Hook ntdll!RtlExitUserProcess and kernelbase!TerminateProcess for exit reports" ON)
 if(MEMREADER_SYSTEM_EXIT_HOOKS)
@@ -85,5 +117,8 @@ if(MSVC)
 		"$<$<COMPILE_LANGUAGE:ASM_MASM>:/W3;/WX>")
 	target_link_options(memreader_plus PRIVATE /MANIFEST:NO /LTCG /NOENTRY /NODEFAULTLIB /Brepro)
 	target_compile_options(minhook PRIVATE /W3 /GS /GL /Gy /Brepro)
-	target_link_libraries(memreader_plus minhook "${GAME_IMPORT_LIB}" version.lib ucrt.lib libcmt.lib libvcruntime.lib)
+	target_compile_options(zydis PRIVATE ${C_OPTIONS})
+	target_compile_options(asm_check PRIVATE ${C_OPTIONS})
+	target_link_options(asm_check PRIVATE /LTCG /Brepro)
+	target_link_libraries(memreader_plus minhook zydis "${GAME_IMPORT_LIB}" version.lib ucrt.lib libcmt.lib libvcruntime.lib)
 endif()

@@ -80,6 +80,7 @@ static const struct {
 	{ "text\\test\\hello.txt", "hello from a pack", 17 },
 	{ "db\\test_tables\\binary", "\0\1\2\377", 4 },
 	{ "text\\test\\empty.txt", "", 0 },
+	{ "script\\test\\cave.asm", "\357\273\277imul eax, eax, {seven}\r\nadd eax, {bonus:4}\r\n", 47 },
 	{ "ui\\test\\panel.twui.xml", "<layout><panel id=\"a\" width=\"400\" height=\"20\"/><text>hello</text></layout>", 74 },
 	{ "ui\\templates\\button.twui.xml", "<template><button width=\"10\"/></template>", 41 },
 	{ "ui\\test\\twin_a.twui.xml", "<twin size=\"1\"/>", 16 },

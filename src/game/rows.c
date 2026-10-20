@@ -3,8 +3,9 @@
 #include "game.h"
 
 enum {
-	MAX_ROWS = 256,
-	MAX_EDITS = 16,
+	FIRST_ROWS = 16,
+	MAX_ROWS = 4096,
+	MAX_EDITS = 128,
 	MAX_ROW_KEY = 255,
 	MIN_RECORD_SIZE = 16,
 	MAX_RECORD_SIZE = 4096,
@@ -64,7 +65,8 @@ static const char not_a_table[] = "not a database table";
 static const char write_failed[] = "failed to write memory";
 static const char read_failed[] = "failed to read memory";
 
-static Entry entries[MAX_ROWS];
+static Entry *entries;
+static int entry_room;
 static char put_error[ERROR_SIZE];
 
 static int refuse(lua_State *L, const char *why)
@@ -78,22 +80,47 @@ static Entry *entry_of(int item)
 {
 	int i;
 
-	for (i = 0; i < MAX_ROWS; i++) {
+	for (i = 0; i < entry_room; i++) {
 		if (entries[i].used && entries[i].item == item)
 			return &entries[i];
 	}
 	return NULL;
 }
 
+static BOOL grow_entries(void)
+{
+	int room = entry_room ? entry_room * 2 : FIRST_ROWS;
+	Entry *bigger;
+
+	if (room > MAX_ROWS)
+		return FALSE;
+	bigger = resize_block(entries, (size_t)room * sizeof *entries);
+	if (!bigger)
+		return FALSE;
+	memset(bigger + entry_room, 0, (size_t)(room - entry_room) * sizeof *bigger);
+	entries = bigger;
+	entry_room = room;
+	return TRUE;
+}
+
 static Entry *free_entry(void)
 {
 	int i;
 
-	for (i = 0; i < MAX_ROWS; i++) {
+	for (i = 0; i < entry_room; i++) {
 		if (!entries[i].used)
 			return &entries[i];
 	}
-	return NULL;
+	return grow_entries() ? &entries[i] : NULL;
+}
+
+Capacity rows_capacity(void)
+{
+	int i, used = 0;
+
+	for (i = 0; i < entry_room; i++)
+		used += entries[i].used != 0;
+	return (Capacity){ used, entry_room, MAX_ROWS };
 }
 
 static BOOL read_record_size(INT_PTR vtable, UINT32 *size)
@@ -188,6 +215,14 @@ static void sort_edits(Edit *edits, int count)
 	}
 }
 
+static const char *edit_count_text(void)
+{
+	static char text[32];
+
+	_snprintf_s(text, sizeof text, _TRUNCATE, "at most %d edits", MAX_EDITS);
+	return text;
+}
+
 static const char *read_edits(lua_State *L, int index, UINT32 record_size, Edit *edits, int *count)
 {
 	const char *why;
@@ -198,7 +233,7 @@ static const char *read_edits(lua_State *L, int index, UINT32 record_size, Edit 
 		return NULL;
 	lua_pushnil(L);
 	while (lua_next(L, index)) {
-		why = *count == MAX_EDITS ? "at most 16 edits" : take_edit(L, record_size, &edits[*count]);
+		why = *count == MAX_EDITS ? edit_count_text() : take_edit(L, record_size, &edits[*count]);
 		if (why) {
 			lua_pop(L, 2);
 			return why;

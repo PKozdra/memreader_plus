@@ -28,3 +28,4 @@ const char *session_text(size_t *length);
 void write_redacted(HANDLE file, const char *data, size_t length);
 const char *game_crash_folder(void);
 void watch_crashes(lua_State *L);
+Capacity rows_capacity(void);

@@ -12,6 +12,11 @@ BOOL turned_off;
 LONG result_count;
 static SRWLOCK lock = SRWLOCK_INIT;
 
+Capacity file_edit_capacity(void)
+{
+	return (Capacity){ (int)file_count, file_capacity, MAX_EDITED_FILES };
+}
+
 BOOL grow_array(void **items, int *capacity, int needed, size_t item_size)
 {
 	int bigger = *capacity ? *capacity : 4;

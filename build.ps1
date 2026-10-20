@@ -29,7 +29,12 @@ foreach ($name in $required) {
 foreach ($name in 'agree', 'sites', 'twui', 'file_edit_switch', 'locale_guard', 'bin') {
     if (Test-Path -LiteralPath (Join-Path $stage "$plus\$name.lua")) { throw "$plus\$name.lua must live in the release folder only" }
 }
-$licenses = @(Get-Content -Raw (Join-Path $root 'LICENSE.md'); Get-Content -Raw (Join-Path $root 'vendor\minhook\LICENSE.txt'))
+$licenses = @(
+    Get-Content -Raw (Join-Path $root 'LICENSE.md')
+    Get-Content -Raw (Join-Path $root 'vendor\minhook\LICENSE.txt')
+    "Zydis 4.1.1, https://github.com/zyantific/zydis`r`n`r`n" + (Get-Content -Raw (Join-Path $root 'vendor\zydis\LICENSE'))
+    "Zycore, https://github.com/zyantific/zycore-c`r`n`r`n" + (Get-Content -Raw (Join-Path $root 'vendor\zycore\LICENSE'))
+)
 Set-Content -Encoding utf8 (Join-Path $stage "$plus\third_party_licenses.txt") ($licenses -join "`r`n`r`n")
 Copy-Item $dll $dist
 python (Join-Path $root 'tools\dll_to_lua.py') $dll --out (Join-Path $stage "$plus\$release\bin.lua")

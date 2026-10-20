@@ -36,6 +36,7 @@ typedef struct {
 	void *original;
 	void *cave;
 	size_t cave_size;
+	char *listing;
 	const char *native;
 	Signature signature;
 	Callback callbacks[MAX_CALLBACKS];

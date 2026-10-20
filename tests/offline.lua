@@ -3351,15 +3351,170 @@ elseif SCENARIO == 'hooked_code' then
 	check(counts_a[3] == 0 and found_a[3] == false, 'a missing pattern stays missing')
 
 	local filler = mr.pointer(test_function('filler_code'))
-	local zeros, nops = string.rep('\0', 4096), string.rep('\144', 4096)
-	for chunk = 0, 9 do
-		mr.patch(mr.add(filler, chunk * 4096), zeros, nops)
+	local mixed = mr.pointer(test_function('mixed_code'))
+	local PAGE, FILLER_PAGES, MIXED_PAGES, RUN_PAGES = 4096, 272, 40, 38
+	local zeros, nops = string.rep('\0', PAGE), string.rep('\144', PAGE)
+	local ZERO16 = '00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00'
+	test_fill_mixed(MIXED_PAGES * PAGE)
+	local pages = {}
+	for page = 0, MIXED_PAGES - 1 do
+		pages[#pages + 1] = mr.read(mixed, page * PAGE, PAGE)
+	end
+	local original = table.concat(pages)
+	local function original_at(offset, size)
+		return original:sub(offset + 1, offset + size)
+	end
+	local zero_first, zero_count = mr.find_pattern(ZERO16)
+	local filler_runs = FILLER_PAGES * PAGE - 15
+	check(zero_count >= filler_runs, 'the filler holds a run of 16 zero bytes at every position: ' .. zero_count)
+
+	local probes = {}
+	for _, size in ipairs({ 6, 17, 33, 100, 256 }) do
+		for _, edge in ipairs({ 65536, 131072 }) do
+			for _, context in ipairs({ size - 1, 255 }) do
+				for _, shift in ipairs({ 0, 8 }) do
+					probes[#probes + 1] = { offset = edge - context - shift - math.floor(size / 2), size = size }
+				end
+			end
+		end
+	end
+	local p = mr.patcher('expect_probe')
+	local expect_at = 65536 - 300
+	local function expect_result(expect_bytes, pad)
+		local target = { pattern = hex(original_at(expect_at, 32)) .. pad, at = 8, expect = hex(expect_bytes) }
+		local current = mr.read(mixed, expect_at + 8, 8)
+		local ok, why, found = p:patch('probe', target, current, string.rep('\204', 8))
+		if ok == true then p:remove('probe') end
+		return ok == true or (why == 'unexpected bytes' and found == nil and 'refused') or tostring(why)
+	end
+	local level_count = 0
+	local function check_level(label)
+		level_count = level_count + 1
+		local pad = string.rep(' ', 2 * level_count)
+		local first, count = mr.find_pattern(ZERO16 .. pad)
+		check(count == zero_count and mr.eq(first, zero_first), label .. ': every original run of zeros is found once, first at the same place: ' .. count)
+		local every, list = true, {}
+		for i, probe in ipairs(probes) do
+			list[i] = hex(original_at(probe.offset, probe.size)) .. pad
+			local at, found = mr.find_pattern(list[i])
+			every = every and found == 1 and mr.eq(at, mr.add(mixed, probe.offset))
+		end
+		check(every, label .. ': a pattern of distinct bytes across a 64 KB piece edge is found once at its place, each length on its own')
+		list[#list + 1] = ZERO16 .. pad .. ' '
+		local found, counts = mr.find_patterns(list)
+		local together = counts[#list] == zero_count and mr.eq(found[#list], zero_first)
+		for i, probe in ipairs(probes) do
+			together = together and counts[i] == 1 and mr.eq(found[i], mr.add(mixed, probe.offset))
+		end
+		check(together, label .. ': find_patterns of mixed lengths gives the same counts and first addresses')
+		local right, wrong = expect_result(original_at(expect_at + 8, 8), pad), expect_result(mr.read(mixed, expect_at + 8, 8), pad .. '  ')
+		local changed = mr.read(mixed, expect_at + 8, 8) ~= original_at(expect_at + 8, 8)
+		check(
+			right == true and (wrong == 'refused' or not changed),
+			label .. ': expect compares the original bytes: ' .. tostring(right) .. ', ' .. tostring(wrong)
+		)
+	end
+	check_level('before any change')
+
+	for page = 0, RUN_PAGES - 1 do
+		mr.patch(mr.add(mixed, page * PAGE), original_at(page * PAGE, PAGE), nops)
+	end
+	check(mr.read(mixed, 0, PAGE) == nops, 'the mixed bytes are patched over')
+	check_level('mixed bytes saved')
+
+	local spot = RUN_PAGES * PAGE + 512
+	local SPOT_SIZE = 600
+	local steps = { { 3, 40 }, { 20, 9 }, { 37, 30 }, { 1, 2 }, { 100, 1 }, { 101, 70 }, { 90, 200 }, { 0, 16 }, { 15, 2 }, { 299, 300 } }
+	local used_before = mr.capacity().saved_code.used
+	for i, step in ipairs(steps) do
+		local at = mr.add(mixed, spot + step[1])
+		mr.patch(at, mr.read(at, 0, step[2]), string.rep(string.char(i), step[2]))
+	end
+	local saved_by_steps = mr.capacity().saved_code.used - used_before
+	print('  saved ranges for ' .. #steps .. ' overlapping patches: ' .. saved_by_steps)
+	check(mr.read(mixed, spot, SPOT_SIZE) ~= original_at(spot, SPOT_SIZE), 'overlapping patches change the bytes')
+	check(
+		mr.read_original(mr.add(mixed, spot), 0, SPOT_SIZE) == original_at(spot, SPOT_SIZE),
+		'read_original over overlapping patches gives the oldest bytes everywhere'
+	)
+	local exact = true
+	for _, size in ipairs({ 5, 16, 33, 64, 200 }) do
+		for offset = 0, SPOT_SIZE - size, 37 do
+			local at, count = mr.find_pattern(hex(original_at(spot + offset, size)))
+			exact = exact and count == 1 and mr.eq(at, mr.add(mixed, spot + offset))
+		end
+	end
+	check(exact, 'every window of the original bytes under overlapping patches is found once at its place')
+	mr.patch(mr.add(mixed, spot), mr.read(mixed, spot, SPOT_SIZE), mr.read_original(mr.add(mixed, spot), 0, SPOT_SIZE))
+	check(mr.read(mixed, spot, SPOT_SIZE) == original_at(spot, SPOT_SIZE), 'patching back from read_original restores the bytes')
+
+	local overlap = mr.add(filler, 135 * PAGE + 64)
+	mr.patch(overlap, '\0', '\1')
+	mr.patch(mr.add(overlap, 4), '\0\0\0\0', '\2\2\2\2')
+	check(mr.read(overlap, 0, 8) == '\1\0\0\0\2\2\2\2', 'two patches whose saved ranges overlap are both written')
+	check(mr.read_original(mr.add(overlap, -8), 24) == string.rep('\0', 24), 'overlapping saved ranges keep the oldest bytes')
+	check(select(2, mr.find_pattern(ZERO16 .. string.rep(' ', 40))) == zero_count, 'a fresh scan across both ranges sees the original zeros at every position')
+	mr.patch(mr.add(overlap, 4), '\2\2\2\2', '\0\0\0\0')
+	mr.patch(overlap, '\1', '\0')
+
+	local LIMIT = 65536
+	local chunk = 0
+	local function fill_until(used)
+		while mr.capacity().saved_code.used < used and chunk < FILLER_PAGES do
+			mr.patch(mr.add(filler, chunk * PAGE), zeros, nops)
+			chunk = chunk + 1
+		end
+	end
+	fill_until(4097)
+	check(mr.capacity().saved_code.room > 4096 and count_in(log_text(), FULL_LINE) == 0, 'the saved original table grows past 4096 ranges without a full line')
+	check(mr.read_original(filler, 0, 16) == string.rep('\0', 16), 'ranges saved before the table grew keep their original bytes')
+	check_level('past 4096 ranges')
+	local near = LIMIT - 600
+	fill_until(near)
+	local newest = mr.add(filler, (chunk - 1) * PAGE + 4080)
+	check(mr.read_original(newest, 0, 16) == string.rep('\0', 16), 'and so do the newest ranges')
+	check_level('nearly full')
+	local list = {}
+	for i = 1, 64 do
+		list[i] = string.format('48 89 5C 24 %02X 48 89 74 24 %02X 57 48 83 EC %02X', i, (i * 7) % 256, (i * 13) % 256)
+	end
+	local started = mr.ticks()
+	mr.find_patterns(list)
+	local spent = mr.elapsed_us(started)
+	print(string.format('  timing: find_patterns of 64 new patterns over %d saved ranges %.0f us', mr.capacity().saved_code.used, spent))
+	check(spent < 50000, 'find_patterns of 64 new patterns with a nearly full saved table stays under 50 ms')
+	local before_full = chunk
+	while count_in(log_text(), FULL_LINE) == 0 and chunk < FILLER_PAGES do
+		mr.patch(mr.add(filler, chunk * PAGE), zeros, nops)
+		chunk = chunk + 1
 	end
 	check(count_in(log_text(), FULL_LINE) == 1, 'a full table is reported once in the log')
+	check(string.find(log_text(), 'saved original code is full (65536 ranges)', 1, true) ~= nil, 'the full line names the 65536 ranges')
 	check(mr.read_original(filler, 0, 16) == string.rep('\0', 16), 'the first ranges keep their original bytes')
-	check(mr.read_original(mr.add(filler, 9 * 4096), 0, 16) == string.rep('\144', 16), 'ranges changed after the table filled up show the new bytes')
-	mr.patch(mr.add(filler, 9 * 4096), nops, zeros)
+	local last = mr.add(filler, (chunk - 1) * PAGE + PAGE - 16)
+	check(mr.read_original(last, 0, 16) == string.rep('\144', 16), 'ranges changed after the table filled up show the new bytes')
+	mr.patch(mr.add(filler, (chunk - 1) * PAGE), nops, zeros)
 	check(count_in(log_text(), FULL_LINE) == 1, 'further changes do not repeat the report')
+	print('  filler pages patched to fill the table: ' .. before_full .. ' to nearly full, ' .. chunk .. ' to full')
+	check_level('full')
+
+	local blocked, carry = {}, 11 * PAGE
+	for i, byte in ipairs({ test_function('filler_code'):byte(1, 8) }) do
+		blocked[i] = string.char((byte + carry) % 256)
+		carry = math.floor((byte + carry) / 256)
+	end
+	blocked = table.concat(blocked)
+	local old_protect = test_protect(blocked, PAGE, 1)
+	started = mr.ticks()
+	local blocked_first, blocked_count = mr.find_pattern(ZERO16 .. string.rep(' ', 41))
+	spent = mr.elapsed_us(started)
+	test_protect(blocked, PAGE, old_protect)
+	print(string.format('  timing: a scan through saved code with one unreadable page %.0f us', spent))
+	check(
+		blocked_count == zero_count - PAGE - 15 and mr.eq(blocked_first, zero_first),
+		'a page that cannot be read loses only the matches that touch it: ' .. blocked_count .. ' of ' .. zero_count
+	)
+	check(select(2, mr.find_pattern(ZERO16 .. string.rep(' ', 42))) == zero_count, 'and every match is back once the page can be read')
 elseif
 	SCENARIO == 'fault_report'
 	or SCENARIO == 'fault_report_no_log'
@@ -3438,6 +3593,11 @@ then
 		end
 		local function crash_in_link()
 			local single = mr.pointer(test_function('hook_single'))
+			local pad = mr.patcher('pad_owner')
+			local filler = mr.pointer(test_function('filler_code'))
+			for i = 1, 3 * 256 + 8 do
+				pad:set('pad_' .. i, mr.add(filler, 0x10000 + i), 1, 0, 0, 255)
+			end
 			mr.patcher('crash_owner'):prefix(single, 'int64(int64)', 'crash_link', function()
 				test_crash()
 			end)
@@ -3914,25 +4074,53 @@ elseif SCENARIO == 'claims' then
 	check(#mr.patch_list('claim_b') == 1 and mr.patch_list('claim_b')[1].name == 'own_cave', 'only the cave of claim_b is left')
 
 	local owners = 3
-	for i = 1, 70 do
+	for i = 1, 300 do
 		if mr.patcher('limit_' .. i) then owners = owners + 1 end
 	end
-	check(owners == 64, 'at most 64 owners are accepted: ' .. owners)
-	check(select(2, mr.patcher('one_more')) == 'at most 64 owners per game session', 'the 65th owner is refused with the reason')
+	check(owners == 256, 'at most 256 owners are accepted: ' .. owners)
+	check(select(2, mr.patcher('one_more')) == 'at most 256 owners per game session', 'the 257th owner is refused with the reason')
 	check(mr.patcher('claim_a') == a, 'an owner that exists still gets its handle')
+	local last_owner = mr.patcher('limit_253')
+	check(
+		last_owner:set('last_owner', at(0x9300), 1, 1, 0, 255) == true and last_owner:info('last_owner').owner == 'limit_253',
+		'the 256th owner makes a change under its own name'
+	)
+	check(last_owner:remove('last_owner') == true and mr.capacity().owners.used == 256, 'and the owner table says 256 of 256')
 
+	local FIELDS = 0x10000
 	local existing = #mr.patch_list()
 	local made = 0
-	while a:set('field_' .. made, at(0x1000 + made), 1, 1, 0, 255) == true do
+	while a:set('field_' .. made, at(FIELDS + made), 1, 1, 0, 255) == true do
 		made = made + 1
 	end
-	check(made + existing == 2048, 'at most 2048 items are accepted: ' .. made .. ' new, ' .. existing .. ' before')
-	check(select(2, a:set('field_over', at(0x3000), 1, 1, 0, 255)) == 'full', 'the item after that is refused as full')
-	check(bytes_at(0x3000, 1) == '\0', 'and writes nothing')
+	check(made + existing == 8192, 'at most 8192 items are accepted: ' .. made .. ' new, ' .. existing .. ' before')
+	check(select(2, a:set('field_over', at(0x30000), 1, 1, 0, 255)) == 'full', 'the item after that is refused as full')
+	check(bytes_at(0x30000, 1) == '\0', 'and writes nothing')
+	local items = mr.capacity().items
+	check(items.used == 8192 and items.room == 8192 and items.limit == 8192, 'the item table says 8192 of 8192')
+	local intact = true
+	for i = 0, made - 1 do
+		local edge = i % 256 < 2 or i % 256 > 253 or i % 61 == 0
+		if edge then
+			local row = a:info('field_' .. i)
+			intact = intact and row ~= nil and row.state == 'ours' and row.kind == 'value' and bytes_at(FIELDS + i, 1) == '\1'
+		end
+	end
+	check(intact, 'items on both sides of every chunk edge keep their names, states and bytes')
+	local listed = 0
+	for _, row in ipairs(mr.patch_list('claim_a')) do
+		if row.name:sub(1, 6) == 'field_' then listed = listed + 1 end
+	end
+	check(listed == made, 'patch_list shows every one of them: ' .. listed)
+	check(a:remove('field_300') == true and a:set('field_again', at(0x30000), 1, 2, 0, 255) == true, 'a removed item frees a slot the next one takes')
+	check(a:info('field_again').state == 'ours' and bytes_at(0x30000, 1) == '\2', 'and the new item works')
+	a:remove('field_again')
 	for i = 0, made - 1 do
 		a:remove('field_' .. i)
 	end
-	check(#mr.patch_list() == existing, 'removing them frees the slots')
+	check(#mr.patch_list() == existing and bytes_at(FIELDS + 5000, 1) == '\0', 'removing them frees the slots and puts the bytes back')
+
+	local WAVES = 0x40000
 	local function site_list(base, count)
 		local list = {}
 		for i = 1, count do
@@ -3940,19 +4128,26 @@ elseif SCENARIO == 'claims' then
 		end
 		return list
 	end
-	local total = 0
-	for round = 1, 4 do
-		if a:relocate('wave_' .. round, site_list(0x4000 + (round - 1) * 0x1000, 1000)) == true then total = total + 1 end
+	local waves = 0
+	while a:relocate('wave_' .. (waves + 1), site_list(WAVES + waves * 0x1000, 1000)) == true do
+		waves = waves + 1
 	end
-	check(total == 4, 'four relocations of 1000 sites are accepted')
-	ok, why = a:relocate('wave_5', site_list(0x8000, 1000))
-	check(ok == nil and why == 'full', 'the claim table is full after 4000 sites: ' .. tostring(why))
-	check(bytes_at(0x8004, 4) == Z4, 'and nothing of the refused relocation was written')
+	local used = mr.capacity().claims.used
+	check(waves >= 32 and used > 32768 - 1000 and used <= 32768, 'relocations of 1000 sites fill the claim table: ' .. waves .. ' waves, ' .. used)
+	local rest = 32768 - used
+	check(a:relocate('wave_rest', site_list(WAVES + waves * 0x1000, rest)) == true, 'the last ' .. rest .. ' claims fit')
+	local claims = mr.capacity().claims
+	check(claims.used == 32768 and claims.room == 32768 and claims.limit == 32768, 'the claim table says 32768 of 32768')
+	local over = WAVES + (waves + 1) * 0x1000
+	ok, why = a:relocate('wave_over', site_list(over, 1))
+	check(ok == nil and why == 'full', 'the claim after that is refused as full: ' .. tostring(why))
+	check(bytes_at(over + 4, 4) == Z4, 'and nothing of the refused relocation was written')
+	check(bytes_at(WAVES + 4, 4) == ONE4 and bytes_at(WAVES + (waves - 1) * 0x1000 + 4000, 4) == ONE4, 'the first and the last wave hold their bytes')
 	check(
-		select(2, a:relocate('wave_1', site_list(0x4000, 999))) == 'the name is already used for a different change',
+		select(2, a:relocate('wave_1', site_list(WAVES, 999))) == 'the name is already used for a different change',
 		'a relocation name with other sites is refused'
 	)
-	check(a:relocate('wave_1', site_list(0x4000, 1000)) == true, 'the same relocation again is a no-op')
+	check(a:relocate('wave_1', site_list(WAVES, 1000)) == true, 'the same relocation again is a no-op')
 	check(select(2, a:relocate('too_many', site_list(0x9000, 1025))) == 'at most 1024 sites', 'more than 1024 sites are refused')
 	check(select(2, a:relocate('none', {})) == 'no sites', 'no sites are refused')
 	ok, why = a:relocate('overlap_sites', { { at(0x9100), Z4, ONE4 }, { at(0x9102), Z4, ONE4 } })
@@ -3974,10 +4169,12 @@ elseif SCENARIO == 'held_bytes' then
 	end
 	local filler = address('filler_code')
 	local zeros, nops = string.rep('\0', 4096), string.rep('\144', 4096)
-	for chunk = 0, 9 do
+	local chunk = 0
+	while chunk < 130 or (not log_has(FULL_LINE) and chunk < 272) do
 		mr.patch(mr.add(filler, chunk * 4096), zeros, nops)
+		chunk = chunk + 1
 	end
-	check(log_has(FULL_LINE), 'ten raw patches of 4096 bytes fill the saved original table')
+	check(log_has(FULL_LINE) and chunk >= 130, 'raw patches of 4096 bytes fill the saved original table: ' .. chunk)
 	local p = mr.patcher('hold_mod')
 	local site = address('patch_target')
 	check(mr.read(site, 0, 5) == '\184\1\0\0\0', 'patch_target holds mov eax, 1')
@@ -3992,34 +4189,49 @@ elseif SCENARIO == 'held_bytes' then
 	local function big(index)
 		return p:patch('big_' .. index, mr.add(filler, index * 4096), nops, zeros)
 	end
-	for index = 0, 7 do
+	check(p:patch('early', site, '\184\1\0\0\0', '\184\3\0\0\0') == true, 'a small patch made while the held bytes are small')
+	check(mr.capacity().held_bytes.room == 64 * 1024, 'the held bytes start at 64 KB')
+	for index = 0, 126 do
 		if big(index) == true then made = made + 1 end
 	end
-	check(made == 8, 'eight patches of 4096 bytes fill the 64 KB of held bytes: ' .. made)
-	local ok, why = big(8)
-	check(ok == nil and why == 'full', 'the ninth is refused as full: ' .. tostring(why))
-	check(mr.read(mr.add(filler, 8 * 4096), 0, 4096) == nops, 'and writes nothing')
+	check(made == 127, '127 patches of 4096 bytes fit next to it: ' .. made)
+	local held = mr.capacity().held_bytes
+	check(
+		held.room == 1024 * 1024 and held.limit == 1024 * 1024 and held.used == 127 * 8192 + 10,
+		'the held bytes grew to 1 MB: ' .. held.used .. ' of ' .. held.room
+	)
+	check(mr.tonumber(mr.call(site, 'int32()')) == 3 and p:remove('early') == true, 'the early patch still runs and is removed after the growth')
+	check(mr.read(site, 0, 5) == '\184\1\0\0\0' and mr.tonumber(mr.call(site, 'int32()')) == 1, 'and its held bytes put the original back')
+	check(big(127) == true, 'its freed bytes take the 128th patch of 4096 bytes')
+	local ok, why = big(128)
+	check(ok == nil and why == 'full', 'the 129th is refused as full: ' .. tostring(why))
+	check(mr.read(mr.add(filler, 128 * 4096), 0, 4096) == nops, 'and writes nothing')
 	check(p:remove('big_0') == true and mr.read(filler, 0, 4096) == nops, 'removing the first one frees its bytes and restores it')
-	for index = 1, 7 do
-		check(mr.read(mr.add(filler, index * 4096), 0, 4096) == zeros, 'chunk ' .. index .. ' keeps its patch after the held bytes moved down')
+	local kept = true
+	for index = 1, 127 do
+		kept = kept and mr.read(mr.add(filler, index * 4096), 0, 4096) == zeros
 	end
-	check(big(8) == true, 'the freed bytes take the ninth patch')
-	check(p:remove('big_4') == true and mr.read(mr.add(filler, 4 * 4096), 0, 4096) == nops, 'a middle one is restored from its own held bytes')
-	local fields = p:set('field', mr.add(filler, 9 * 4096 + 100), 1, 3, 0, 255)
-	check(fields == true and mr.read(mr.add(filler, 9 * 4096 + 100), 0, 1) == '\3', 'a value fits in the freed bytes')
-	check(p:relocate('moved', { { mr.add(filler, 9 * 4096 + 200), '\144\144\144\144', '\1\1\1\1' } }) == true, 'so does a relocation')
+	check(kept, 'the other 127 keep their patches after the held bytes moved down')
+	check(big(128) == true, 'the freed bytes take the 129th patch')
+	check(p:remove('big_64') == true and mr.read(mr.add(filler, 64 * 4096), 0, 4096) == nops, 'a middle one is restored from its own held bytes')
+	local fields = p:set('field', mr.add(filler, 129 * 4096 + 100), 1, 3, 0, 255)
+	check(fields == true and mr.read(mr.add(filler, 129 * 4096 + 100), 0, 1) == '\3', 'a value fits in the freed bytes')
+	check(p:relocate('moved', { { mr.add(filler, 129 * 4096 + 200), '\144\144\144\144', '\1\1\1\1' } }) == true, 'so does a relocation')
 	local info = { p:remove_all() }
 	check(
-		info[1] == true and info[2] == 8 and info[3] == 1,
+		info[1] == true and info[2] == 128 and info[3] == 1,
 		'remove_all restores every patch and value and counts the relocation: ' .. tostring(info[2]) .. ', ' .. tostring(info[3])
 	)
-	for index = 0, 8 do
-		check(mr.read(mr.add(filler, index * 4096), 0, 4096) == nops, 'chunk ' .. index .. ' is back to its original bytes')
+	local back = true
+	for index = 0, 128 do
+		back = back and mr.read(mr.add(filler, index * 4096), 0, 4096) == nops
 	end
+	check(back, 'every chunk is back to its original bytes')
 	check(
-		mr.read(mr.add(filler, 9 * 4096 + 100), 0, 1) == '\144' and mr.read(mr.add(filler, 9 * 4096 + 200), 0, 4) == '\1\1\1\1',
+		mr.read(mr.add(filler, 129 * 4096 + 100), 0, 1) == '\144' and mr.read(mr.add(filler, 129 * 4096 + 200), 0, 4) == '\1\1\1\1',
 		'the value is back and the relocation stays'
 	)
+	check(mr.capacity().held_bytes.used == 8, 'only the relocation holds bytes now')
 elseif SCENARIO == 'batch' then
 	run_mod(OURS)
 	local mr = _G.memreader_plus
@@ -4065,15 +4277,44 @@ elseif SCENARIO == 'batch' then
 
 	local nops, zeros = string.rep('\144', 4096), string.rep('\0', 4096)
 	local big = {}
-	for chunk = 0, 8 do
+	for chunk = 0, 128 do
 		big[#big + 1] = { 'patch', 'big_' .. chunk, at(chunk * 4096), zeros, nops }
 	end
 	local ok, why, stays = p:batch(big)
-	check(ok == nil and why == 'full' and stays == nil, 'nine patches of 4096 bytes need more held bytes than the registry has: ' .. tostring(why))
-	check(bytes_at(0, 4096) == zeros and bytes_at(8 * 4096, 4096) == zeros and #mr.patch_list('batch_mod') == 0, 'and nothing is written or registered')
-	big[9] = nil
-	check(p:batch(big) == true and bytes_at(7 * 4096, 4096) == nops, 'eight of them fit')
-	check(p:remove_all() == true and bytes_at(0, 4096) == zeros and bytes_at(7 * 4096, 4096) == zeros, 'and remove_all puts every chunk back')
+	check(
+		ok == nil and why == 'big_128: the batch writes too many bytes' and stays == nil,
+		'129 patches of 4096 bytes are more than one batch writes: ' .. tostring(why)
+	)
+	check(bytes_at(0, 4096) == zeros and bytes_at(128 * 4096, 4096) == zeros and #mr.patch_list('batch_mod') == 0, 'and nothing is written or registered')
+	big[129] = nil
+	check(q:patch('small', at(130 * 4096), Z4, ONE4) == true, 'another owner holds a few bytes')
+	ok, why = p:batch(big)
+	check(ok == nil and why == 'full', '128 patches of 4096 bytes then need more held bytes than the registry has: ' .. tostring(why))
+	check(bytes_at(0, 4096) == zeros and bytes_at(127 * 4096, 4096) == zeros and #mr.patch_list('batch_mod') == 0, 'and nothing is written or registered')
+	check(q:remove('small') == true, 'the other owner lets go')
+	test_watch_window(mr.hop_slots)
+	local done, stopped = p:batch(big)
+	check(done == true and bytes_at(127 * 4096, 4096) == nops, '128 of them fit in one batch, 512 KB of writes')
+	local allocations, suspends = test_window_counts()
+	check(
+		suspends >= 1 and allocations == 0,
+		'nothing is allocated while the threads are stopped: ' .. allocations .. ' allocations, ' .. suspends .. ' threads stopped'
+	)
+	print(string.format('  batch of 128 patches of 4096 bytes: threads stopped %.0f us', stopped))
+	check(p:remove_all() == true and bytes_at(0, 4096) == zeros and bytes_at(127 * 4096, 4096) == zeros, 'and remove_all puts every chunk back')
+	for i = 1, 250 do
+		q:set('pad_' .. i, at(0x60000 + i), 1, 0, 0, 255)
+	end
+	local edge_steps = {}
+	for i = 1, 20 do
+		edge_steps[i] = { 'set', 'edge_' .. i, at(0x61000 + i * 4), 4, 7, 0, 100 }
+	end
+	local room_before = mr.capacity().items.room
+	test_watch_window(mr.hop_slots)
+	check(p:batch(edge_steps) == true and mr.capacity().items.room > room_before, 'a batch whose items cross a chunk edge gets the chunk while it plans')
+	allocations, suspends = test_window_counts()
+	check(suspends >= 1 and allocations == 0, 'and allocates nothing while the threads are stopped: ' .. allocations)
+	check(p:remove_all() == true and q:remove_all() == true, 'both owners remove everything')
 
 	local good = {
 		{ 'patch', 'first', at(0x100), Z4, ONE4 },
@@ -4150,10 +4391,10 @@ elseif SCENARIO == 'batch' then
 	refused({ { 'patch', 'bad name', at(0x600), Z4, ONE4 } }, 'step 1: name must be 1 to 47 letters, digits or underscores', 'a bad name')
 	refused({}, 'no steps', 'an empty list')
 	local many = {}
-	for i = 1, 129 do
+	for i = 1, 1025 do
 		many[i] = { 'set', 'many_' .. i, at(0x600), 4, 1, 0, 9 }
 	end
-	refused(many, 'at most 128 steps', 'too many steps')
+	refused(many, 'at most 1024 steps', 'too many steps')
 	check(
 		not pcall(p.batch, p, 'steps') and not pcall(p.batch, p, { { 'patch', 'short' } }) and not pcall(p.batch, { { 'patch', 'x' } }),
 		'a wrong argument type raises'
@@ -4189,23 +4430,29 @@ elseif SCENARIO == 'batch' then
 	ok, why = p:batch(write_list('w_'))
 	check(ok == nil and why == 'w_d: failed to patch memory, nothing of the batch was written', 'a write that fails last: ' .. tostring(why))
 	untouched('the last write fails')
-	local pair = { { 'patch', 'pb_a', at(0x9000), Z4, ONE4 }, { 'patch', 'pb_b', at(0x9100), Z4, TWO4 } }
+	local pair = { { 'patch', 'pb_a', at(0x9000), Z4, ONE4 }, { 'patch', 'pb_b', at(0xA100), Z4, TWO4 } }
 	local listed_before = #mr.patch_list()
-	test_fail_protect(raw(at(0x9000)), 2, mr.hop_slots, 1)
+	test_relock(raw(at(0xA100)), mr.hop_slots, raw(at(0x9000)))
+	local faults_before = test_access_faults()
 	ok, why, stays = p:batch(pair)
+	check(test_access_faults() == faults_before + 2, 'the write the lie let through and its put back fault once each: ' .. test_access_faults() - faults_before)
 	check(
 		ok == nil and why == 'pb_b: failed to patch memory, and 1 write could not be put back' and stays == nil,
 		'a write that cannot be put back is counted, and one that never changed is not: ' .. tostring(why)
 	)
-	check(bytes_at(0x9000, 4) == ONE4 and bytes_at(0x9100, 4) == Z4, 'the first write is still in the code, the second was refused')
+	check(bytes_at(0x9000, 4) == ONE4 and bytes_at(0xA100, 4) == Z4, 'the first write is still in the code, the second was refused')
+	check(
+		test_protection(raw(at(0x9000))) == 0x20 and test_protection(raw(at(0xA100))) == 0x20,
+		'both pages are back to their protection after a write and a put back failed in the window'
+	)
 	listed = rows('batch_mod')
 	check(
 		listed.pb_a ~= nil and listed.pb_a.state == 'stays' and listed.pb_b == nil and #mr.patch_list() == listed_before + 1,
 		'the write that stays is registered as staying, so a report names it'
 	)
 	check(listed.pb_a.kind == 'patch', 'and under the kind of its step')
-	local value_pair = { { 'set', 'pv_a', at(0x9040), 4, 5, 0, 100 }, { 'patch', 'pv_b', at(0x9140), Z4, TWO4 } }
-	test_fail_protect(raw(at(0x9040)), 2, mr.hop_slots, 1)
+	local value_pair = { { 'set', 'pv_a', at(0x9040), 4, 5, 0, 100 }, { 'patch', 'pv_b', at(0xA140), Z4, TWO4 } }
+	test_relock(raw(at(0xA140)), mr.hop_slots, raw(at(0x9040)))
 	ok, why = p:batch(value_pair)
 	check(ok == nil and why == 'pv_b: failed to patch memory, and 1 write could not be put back', 'the same with a value first: ' .. tostring(why))
 	listed = rows('batch_mod')
@@ -4214,11 +4461,11 @@ elseif SCENARIO == 'batch' then
 	check(rows('batch_mod').w_a.state == 'ours' and rows('batch_mod').w_d.state == 'stays', 'and is owned')
 
 	local kind_mod = mr.patcher('kind_mod')
-	test_fail_protect(raw(at(0x7800)), 2, mr.hop_slots, 1)
-	ok, why = kind_mod:batch({ { 'patch', 'kp_a', at(0x7800), Z4, ONE4 }, { 'patch', 'kp_b', at(0x7900), Z4, TWO4 } })
+	test_relock(raw(at(0xB900)), mr.hop_slots, raw(at(0x7800)))
+	ok, why = kind_mod:batch({ { 'patch', 'kp_a', at(0x7800), Z4, ONE4 }, { 'patch', 'kp_b', at(0xB900), Z4, TWO4 } })
 	check(ok == nil and contains(why, 'could not be put back'), 'a patch that stays after a failed put back: ' .. tostring(why))
-	test_fail_protect(raw(at(0x7A00)), 2, mr.hop_slots, 1)
-	ok, why = kind_mod:batch({ { 'set', 'kv_a', at(0x7A00), 4, 5, 0, 100 }, { 'patch', 'kp_c', at(0x7B00), Z4, TWO4 } })
+	test_relock(raw(at(0xBB00)), mr.hop_slots, raw(at(0x7A00)))
+	ok, why = kind_mod:batch({ { 'set', 'kv_a', at(0x7A00), 4, 5, 0, 100 }, { 'patch', 'kp_c', at(0xBB00), Z4, TWO4 } })
 	check(ok == nil and contains(why, 'could not be put back'), 'and a value that stays: ' .. tostring(why))
 	ok, why = kind_mod:relocate('kp_a', { { at(0x7800), Z4, ONE4 } })
 	check(
@@ -4230,6 +4477,187 @@ elseif SCENARIO == 'batch' then
 	check(has(report_text, '  kind_mod: 1 value, 1 patch (kp_a '), 'the owner block counts a leftover patch and value under their kinds')
 	local kind_line = report_text:match('  kind_mod:[^\n]*') or ''
 	check(kind_line ~= '' and not has(kind_line, 'relocation'), 'and not as a relocation: ' .. kind_line)
+
+	local function protection_of(offset)
+		return test_protection(raw(at(offset)))
+	end
+	local function protections(offsets)
+		local list = {}
+		for i, offset in ipairs(offsets) do
+			list[i] = string.format('%X', protection_of(offset))
+		end
+		return table.concat(list, ' ')
+	end
+	local function all_read_execute(count)
+		local list = {}
+		for i = 1, count do
+			list[i] = '20'
+		end
+		return table.concat(list, ' ')
+	end
+	local guarded = mr.patcher('protect_mod')
+	local spread_offsets, spread_sites = {}, {}
+	for i = 0, 47 do
+		spread_offsets[#spread_offsets + 1] = 0xC1000 + i * 0x1000 + i * 16
+		spread_sites[#spread_sites + 1] = { at(spread_offsets[#spread_offsets]), '\0', '\1' }
+	end
+	check(protections(spread_offsets) == all_read_execute(48), 'the 48 pages start as PAGE_EXECUTE_READ')
+	test_count_protect(raw(at(spread_offsets[5])), mr.hop_slots)
+	test_watch_window(mr.hop_slots)
+	ok, why = guarded:batch({ { 'relocate', 'spread', spread_sites } })
+	local spread_allocations = test_window_counts()
+	local spread_written = true
+	for _, offset in ipairs(spread_offsets) do
+		spread_written = spread_written and bytes_at(offset, 1) == '\1'
+	end
+	check(ok == true and spread_written, 'a batch of 48 one-byte writes on 48 pages goes through: ' .. tostring(why))
+	check(protections(spread_offsets) == all_read_execute(48), 'every page is back to PAGE_EXECUTE_READ: ' .. protections(spread_offsets))
+	check(test_protect_count() == 2, 'a page gets one protection change before the freeze and one after: ' .. test_protect_count())
+	check(spread_allocations == 0, 'nothing is allocated while the threads are stopped')
+	print(('  batch of 48 writes on 48 pages: threads stopped %.0f us'):format(why))
+
+	local shared_sites = {}
+	for i = 0, 7 do
+		shared_sites[#shared_sites + 1] = { at(0xF1000 + i * 0x40), '\0', '\1' }
+	end
+	test_count_protect(raw(at(0xF1000)), mr.hop_slots)
+	ok, why = guarded:batch({
+		{ 'relocate', 'shared', shared_sites },
+		{ 'patch', 'shared_patch', at(0xF1800), Z4, ONE4 },
+		{ 'set', 'shared_value', at(0xF1900), 4, 7, 0, 100 },
+	})
+	check(
+		ok == true and bytes_at(0xF11C0, 1) == '\1' and bytes_at(0xF1800, 4) == ONE4 and number_at(0xF1900) == 7,
+		'ten writes on one page go through: ' .. tostring(why)
+	)
+	check(test_protect_count() == 2 and protection_of(0xF1000) == 0x20, 'the page is unlocked once and put back once: ' .. test_protect_count() .. ' calls')
+
+	test_watch_suspend(mr.hop_slots, raw(at(0xF2000)))
+	test_change_on_suspend(raw(at(0xF3000)), TWO4)
+	ok, why = guarded:batch({ { 'patch', 'mm_a', at(0xF2000), Z4, ONE4 }, { 'patch', 'mm_b', at(0xF3000), Z4, ONE4 } })
+	local _, at_first_stop = test_suspend_calls()
+	check(at_first_stop == 0x40 or at_first_stop == 0x80, ('a page is writable and executable when the first thread is stopped: %X'):format(at_first_stop))
+	check(ok == nil and why == 'mm_b: unexpected bytes', 'bytes changed after the pages were unlocked refuse the batch inside the window: ' .. tostring(why))
+	check(bytes_at(0xF2000, 4) == Z4 and bytes_at(0xF3000, 4) == TWO4, 'and nothing of the batch was written')
+	check(protections({ 0xF2000, 0xF3000 }) == '20 20', 'both pages are back to PAGE_EXECUTE_READ: ' .. protections({ 0xF2000, 0xF3000 }))
+
+	local partway = { 0xF4000, 0xF5000, 0xF6000, 0xF7000 }
+	local partway_steps = {}
+	for i, offset in ipairs(partway) do
+		partway_steps[i] = { 'patch', 'pw_' .. i, at(offset), Z4, ONE4 }
+	end
+	test_watch_suspend(mr.hop_slots)
+	test_fail_protect(raw(at(0xF6000)), 1, mr.hop_slots)
+	ok, why = guarded:batch(partway_steps)
+	check(
+		ok == nil and why == 'pw_3: failed to patch memory, nothing of the batch was written',
+		'a protection change that fails on the third page: ' .. tostring(why)
+	)
+	check(test_suspend_calls() == 0, 'refuses before any thread is stopped')
+	check(protections(partway) == '20 20 20 20', 'the two pages already unlocked are put back: ' .. protections(partway))
+	check(bytes_at(0xF4000, 4) == Z4 and bytes_at(0xF6000, 4) == Z4 and bytes_at(0xF7000, 4) == Z4, 'and nothing is written')
+	ok = guarded:batch(partway_steps)
+	check(ok == true and bytes_at(0xF7000, 4) == ONE4 and protections(partway) == '20 20 20 20', 'the same batch goes through afterwards')
+
+	local kinds_of_page = { 0x80, 0x04, 0x02, 0x40 }
+	local batch_pages, twin_pages, set_as, kind_steps = {}, {}, {}, {}
+	for i, protection in ipairs(kinds_of_page) do
+		batch_pages[i] = 0xF8000 + (i - 1) * 0x1000
+		twin_pages[i] = 0xFC000 + (i - 1) * 0x1000
+		test_protect(raw(at(batch_pages[i])), 4096, protection)
+		test_protect(raw(at(twin_pages[i])), 4096, protection)
+		set_as[i] = string.format('%X', protection_of(batch_pages[i]))
+		kind_steps[i] = { 'patch', 'kind_' .. i, at(batch_pages[i] + 0x10), Z4, ONE4 }
+	end
+	check(protections(batch_pages) == protections(twin_pages), 'the batch pages and their twins start alike: ' .. protections(batch_pages))
+	print('  pages set as ' .. table.concat(set_as, ' ') .. ' (asked 80 4 2 40)')
+	local kind_faults = test_access_faults()
+	ok, why = guarded:batch(kind_steps)
+	check(test_access_faults() == kind_faults, 'the copy-on-write copies are made without an access violation')
+	for i = 1, #twin_pages do
+		check(mr.patch(at(twin_pages[i] + 0x10), Z4, ONE4) == Z4, 'the twin page ' .. i .. ' takes the same write through the per-write path')
+	end
+	check(
+		ok == true and bytes_at(0xF8010, 4) == ONE4 and bytes_at(0xFB010, 4) == ONE4,
+		'a batch over pages that are not PAGE_EXECUTE_READ goes through: ' .. tostring(why)
+	)
+	check(
+		protections(batch_pages) == protections(twin_pages),
+		'each page ends with the protection the per-write path leaves: ' .. protections(batch_pages) .. ' and ' .. protections(twin_pages)
+	)
+	print('  after the writes: ' .. protections(batch_pages))
+	local private_before = protections(batch_pages)
+	for i = 1, #batch_pages do
+		kind_steps[i] = { 'patch', 'kind_again_' .. i, at(batch_pages[i] + 0x20), Z4, TWO4 }
+	end
+	ok, why = guarded:batch(kind_steps)
+	check(
+		ok == true and bytes_at(0xF9020, 4) == TWO4 and protections(batch_pages) == private_before,
+		'a second batch over the same pages, now private (PAGE_READWRITE and PAGE_EXECUTE_READWRITE among them), keeps them as they were: '
+			.. protections(batch_pages)
+	)
+	for i = 1, #batch_pages do
+		test_protect(raw(at(batch_pages[i])), 4096, 0x20)
+		test_protect(raw(at(twin_pages[i])), 4096, 0x20)
+	end
+
+	local function plus_log()
+		local file = io.open('memreader_plus_refused.txt', 'rb')
+		local text = file and file:read('*a') or ''
+		if file then file:close() end
+		return text
+	end
+	test_relock(raw(at(0x101000)), mr.hop_slots)
+	local relock_faults = test_access_faults()
+	ok, why = guarded:batch({ { 'patch', 'rl_a', at(0x100000), Z4, ONE4 }, { 'patch', 'rl_b', at(0x101000), Z4, ONE4 } })
+	check(test_access_faults() == relock_faults, 'the relocked page is found before any write, without a fault')
+	check(
+		contains(plus_log(), 'a batch left alone (another program changed their protection meanwhile) 1 page: the first, ')
+			and contains(plus_log(), 'has protection 0x20, its original was 0x20'),
+		'a page someone else set again in the gap is left as it is, with one log line'
+	)
+	check(
+		ok == nil and why == 'rl_b: failed to patch memory, nothing of the batch was written',
+		'a page made read-only again by someone else before the freeze refuses the batch inside the window: ' .. tostring(why)
+	)
+	check(bytes_at(0x100000, 4) == Z4 and bytes_at(0x101000, 4) == Z4, 'and nothing was written')
+	check(protections({ 0x100000, 0x101000 }) == '20 20', 'both pages are PAGE_EXECUTE_READ: ' .. protections({ 0x100000, 0x101000 }))
+
+	test_fail_restore(raw(at(0x105000)), mr.hop_slots)
+	ok, why = guarded:batch({ { 'patch', 'kr_a', at(0x104000), Z4, ONE4 }, { 'patch', 'kr_b', at(0x105000), Z4, ONE4 } })
+	check(
+		ok == true and bytes_at(0x104000, 4) == ONE4 and bytes_at(0x105000, 4) == ONE4,
+		'a batch whose page cannot be put back still writes: ' .. tostring(why)
+	)
+	check(
+		protections({ 0x104000, 0x105000 }) == '20 40',
+		'the other page is put back and that one keeps its unlocked protection: ' .. protections({ 0x104000, 0x105000 })
+	)
+	check(
+		contains(plus_log(), 'a batch could not put back 1 page: the first, ') and contains(plus_log(), 'has protection 0x40, its original was 0x20'),
+		'one log line names the page and the protection it kept'
+	)
+	test_protect(raw(at(0x105000)), 4096, 0x20)
+
+	local cave_site = address('asm_site_f_here')
+	local near_offset = 32
+	if mr.tostring(mr.add(cave_site, near_offset)):sub(-8, -4) ~= mr.tostring(cave_site):sub(-8, -4) then near_offset = -32 end
+	local near_cave = mr.add(cave_site, near_offset)
+	local near_old = mr.read(near_cave, 0, 1)
+	local near_new = string.char((near_old:byte() + 1) % 256)
+	ok, why = guarded:batch({
+		{ 'patch', 'mx_before', at(0x102000), Z4, ONE4 },
+		{ 'cave', 'mx_cave', cave_site, '\144' },
+		{ 'patch', 'mx_near', near_cave, near_old, near_new },
+		{ 'set', 'mx_after', at(0x103000), 4, 9, 0, 100 },
+	})
+	check(ok == true, 'a batch of a cave and writes on its page and on others goes through: ' .. tostring(why))
+	check(mr.hook_info(cave_site) and mr.hook_info(cave_site).kind == 'cave', 'the cave is hooked')
+	check(mr.read(near_cave, 0, 1) == near_new and bytes_at(0x102000, 4) == ONE4 and number_at(0x103000) == 9, 'and every write is in place')
+	check(
+		test_protection(raw(cave_site)) == 0x20 and test_protection(raw(near_cave)) == 0x20 and protections({ 0x102000, 0x103000 }) == '20 20',
+		'the cave page and the other pages are PAGE_EXECUTE_READ'
+	)
 
 	local caves = {
 		{ 'patch', 'c_pre', at(0x5000), Z4, ONE4 },
@@ -4402,6 +4830,7 @@ elseif SCENARIO == 'batch' then
 		ok == nil and why == 'a thread is inside batch_mod/pf_first' and stays == nil,
 		'a thread elsewhere in the function refuses the relocation: ' .. tostring(why)
 	)
+	check(test_protection(raw(frame_park)) == 0x20, 'a batch refused for a busy thread puts the page back')
 	check(
 		waited >= 5000 and mr.read(frame_park, 2, 4) == '\1\0\0\0' and rows('batch_mod').pf_first == nil,
 		'after the retries, with nothing written or registered: ' .. waited .. ' us'
@@ -4558,6 +4987,7 @@ elseif SCENARIO == 'batch' then
 		ok == nil and why == 'a thread could not be checked' and number_at(0x9300) == 5,
 		'a thread that can never be checked refuses the batch: ' .. tostring(why)
 	)
+	check(protection_of(0x9300) == 0x20, 'and its page is put back')
 	test_fail_context(0, mr.hop_slots)
 	check(test_park_finish() == 77, 'the thread finished')
 elseif SCENARIO == 'link_filter' then
@@ -4750,11 +5180,12 @@ elseif SCENARIO == 'link_filter' then
 		local probe_before = q:info('probe').calls
 		check(call_with(s1) == EXPECTED and q:info('probe').calls == probe_before + 1, 'f1 is in')
 		local big = {}
-		for i = 1, 4097 do
+		for i = 1, 262145 do
 			big[i] = mr.uint64(i * 16)
 		end
 		local ok, why = tiny:fill(big)
-		check(ok == nil and why == 'at most 4096 values', 'more than 4096 values are refused: ' .. tostring(why))
+		check(ok == nil and why == 'at most 262144 values', 'more than 262144 values are refused: ' .. tostring(why))
+		big = nil
 		ok, why = tiny:fill({ f2, mr.uint32(1) })
 		check(ok == nil and q:info('probe').when.members == 1, 'a refusal leaves the set as it was')
 		check(call_with(s1) == EXPECTED and q:info('probe').calls == probe_before + 2, 'and f1 is still in')
@@ -4763,25 +5194,71 @@ elseif SCENARIO == 'link_filter' then
 		local function key_of(i)
 			return string.char((i * 16) % 256, math.floor(i * 16 / 256) % 256, math.floor(i * 16 / 65536) % 256, 1, 0, 0, 0x10, 0)
 		end
+		local MEMBERS = 262144
 		local members = {}
-		for i = 1, 4096 do
+		for i = 1, MEMBERS do
 			members[i] = mr.uint64(key_of(i))
 		end
-		check(tiny:fill(members) == true and q:info('probe').when.members == 4096, 'a set of 4096 values')
+		check(tiny:fill(members) == true and q:info('probe').when.members == MEMBERS and tiny:count() == MEMBERS, 'a set of 262144 values')
 		local scratch = mr.alloc(32)
 		local before = q:info('probe').calls
-		for i = 1, 4096 do
+		for i = 1, MEMBERS do
 			mr.write(scratch, 0x10, members[i])
 			call_with(scratch)
 		end
-		check(q:info('probe').calls == before + 4096, 'every one of them is found')
+		check(q:info('probe').calls == before + MEMBERS, 'every one of them is found')
 		before = q:info('probe').filtered
 		local calls_before = q:info('probe').calls
-		for i = 4097, 8192 do
+		for i = MEMBERS + 1, MEMBERS + 4096 do
 			mr.write(scratch, 0x10, mr.uint64(key_of(i)))
 			call_with(scratch)
 		end
 		check(q:info('probe').filtered == before + 4096 and q:info('probe').calls == calls_before, 'and 4096 others are not')
+		members = nil
+		collectgarbage('collect')
+		local memory_big = collectgarbage('count')
+		check(tiny:fill({ f1 }) == true and tiny:count() == 1, 'a small fill after a big one')
+		collectgarbage('collect')
+		check(
+			memory_big - collectgarbage('count') > 3 * 1024,
+			'gives the slots of the big set back: ' .. math.floor(memory_big - collectgarbage('count')) .. ' KB'
+		)
+		check(call_with(s1) == EXPECTED and q:info('probe').calls == calls_before + 1, 'and f1 is found in the small set')
+		local function fill_with_finalizers_due()
+			local fill_runs, seen_in_fill, inside_fill = 0, nil, false
+			local function finalizer()
+				fill_runs = fill_runs + 1
+				if inside_fill then
+					local calls = q:info('probe').calls
+					call_with(s1)
+					seen_in_fill = q:info('probe').calls == calls + 1
+				end
+			end
+			local list = {}
+			for i = 1, 70000 do
+				list[i] = mr.uint64(key_of(i))
+			end
+			local keep = {}
+			for i = 1, 50 do
+				keep[i] = newproxy(true)
+				getmetatable(keep[i]).__gc = finalizer
+			end
+			local pause = collectgarbage('setpause', 0)
+			local multiplier = collectgarbage('setstepmul', 0)
+			collectgarbage('collect')
+			keep = nil
+			inside_fill = true
+			local filled = tiny:fill(list)
+			inside_fill = false
+			collectgarbage('setpause', pause)
+			collectgarbage('setstepmul', multiplier)
+			return filled, seen_in_fill, fill_runs
+		end
+		local filled, seen_in_fill, fill_runs = fill_with_finalizers_due()
+		check(filled == true and tiny:count() == 70000, 'a fill with finalizers due')
+		check(seen_in_fill == true, 'a finalizer run inside fill calls a filtered function and the old content still holds f1: ' .. fill_runs .. ' runs')
+		local filtered_before = q:info('probe').filtered
+		check(call_with(s1) == EXPECTED and q:info('probe').filtered == filtered_before + 1, 'after the fill f1 is filtered out')
 		local duplicates = { f1, f1, mr.pointer('\0\0\0\0\0\0\0\0'), mr.int64(5) }
 		check(tiny:fill(duplicates) == true and q:info('probe').when.members == 2, 'a repeated value and a NULL are one member and none')
 		q:remove_all()
@@ -4958,6 +5435,15 @@ elseif SCENARIO == 'link_filter' then
 		timing:around(target, SIGNATURE, 'timed', pass_through, nil, { arg = 2, reads = { 0x10 }, set = none })
 		local rejected_ns = least(1000000)
 		timing:remove_all()
+		local crowded, crowd = mr.pointer_set(), {}
+		for i = 1, 262144 do
+			crowd[i] = mr.uint64(i * 16)
+		end
+		crowded:fill(crowd)
+		crowd = nil
+		timing:around(target, SIGNATURE, 'timed', pass_through, nil, { arg = 2, reads = { 0x10 }, set = crowded })
+		local crowded_ns = least(1000000)
+		timing:remove_all()
 		timing:around(target, SIGNATURE, 'timed', pass_through)
 		local around_ns = least(100000)
 		timing:remove_all()
@@ -4968,10 +5454,12 @@ elseif SCENARIO == 'link_filter' then
 		timing:remove_all()
 		print(
 			string.format(
-				'  timing (ns per native call, least of rounds): detour only %.1f, filtered link saying no %.1f (+%.1f), unfiltered pass-through around %.1f (+%.1f), filtered around saying yes %.1f',
+				'  timing (ns per native call, least of rounds): detour only %.1f, filtered link saying no %.1f (+%.1f), the same with 262144 members %.1f (+%.1f), unfiltered pass-through around %.1f (+%.1f), filtered around saying yes %.1f',
 				detour_only,
 				rejected_ns,
 				rejected_ns - detour_only,
+				crowded_ns,
+				crowded_ns - detour_only,
 				around_ns,
 				around_ns - detour_only,
 				accepted_ns
@@ -4987,6 +5475,7 @@ elseif SCENARIO == 'link_filter' then
 		end
 		budget(rejected_ns - detour_only <= (around_ns - detour_only) / 10, 'a rejected call costs at most a tenth of a pass-through around')
 		budget(rejected_ns - detour_only < 60, 'and under 60 ns above the detour')
+		budget(crowded_ns - detour_only < 60, 'and still under 60 ns with 262144 members in the set')
 
 		local carry_set = mr.pointer_set()
 		carry_set:fill(true)
@@ -5234,24 +5723,50 @@ elseif SCENARIO == 'rows' then
 		check(bad_edits({ [0x10] = ('x'):rep(17) }) == 'an edit does not fit in the record', 'a long edit is refused')
 		check(bad_edits({ [8] = u.targets[1], [0xC] = mr.uint32(1) }) == 'edits overlap', 'overlapping edits')
 		check(bad_edits({ [8] = '' }) == 'an edit does not fit in the record', 'an empty edit')
-		local many = {}
-		for i = 8, 24 do
-			many[i] = 'x'
+		local wide_size = mr.game_alloc(8)
+		mr.write(wide_size, 0, '\184\0\1\0\0\195\0\0')
+		local wide_vtable = mr.game_alloc(24)
+		mr.write(wide_vtable, 16, wide_size)
+		local wide = make_table({ 'a' }, 8)
+		local wide_record = mr.game_alloc(0x100)
+		mr.write(wide_record, 0, record_vtable)
+		mr.write(wide.block, 0, wide_vtable)
+		mr.write(mr.read_pointer(wide.block, 16), 0, wide_record)
+		local edits, expected = {}, {}
+		for offset = 8, 135 do
+			edits[offset] = string.char(offset)
+			expected[#expected + 1] = string.char(offset)
 		end
-		check(bad_edits(many) == 'at most 16 edits', 'seventeen edits')
+		local wide_row = p:row('wide_row', wide.block, wide_record, 'w', edits)
+		check(wide_row ~= nil and mr.read(wide_row, 8, 128) == table.concat(expected), '128 edits are applied')
+		edits[136] = 'x'
+		check(select(2, p:row('wide_more', wide.block, wide_record, 'w2', edits)) == 'at most 128 edits', '129 edits are refused')
+		check(p:remove('wide_row') == true, 'the row with 128 edits is removed')
+		deferred = deferred + 2
 		check(snapshot(u) == before_u and #mr.patch_list('rows_a') == 0 and row_count(u) == 3, 'refusals change nothing')
 		check(p:patch('dup', mr.add(filler, 0x300), '\0\0\0\0', '\1\0\0\0') == true, 'a patch takes a name')
 		check(refusal(p:row('dup', u.block, u.records[1], 'zz')) == DIFFERENT, 'a row cannot use the name of another kind')
 		check(p:remove('dup') == true and snapshot(u) == before_u, 'removed')
 
-		local big = make_table({ 'a' }, 300)
-		local added = 0
-		for i = 1, 300 do
+		local big = make_table({ 'a' }, 4200)
+		local added, refused_growth = 0, nil
+		for i = 1, 4200 do
+			local rows = mr.capacity().rows
+			if refused_growth == nil and rows.used == rows.room and rows.room >= 16 then
+				local count_before = row_count(big)
+				test_fail_memory('heap', mr.hop_slots)
+				refused_growth = refusal(p:row('grow_' .. i, big.block, big.records[1], 'g' .. i)) == 'full'
+					and row_count(big) == count_before
+					and p:info('grow_' .. i) == nil
+			end
 			if p:row('f' .. i, big.block, big.records[1], 'f' .. i) then added = added + 1 end
 		end
-		check(added == 256 and refusal(p:row('f257', big.block, big.records[1], 'f257')) == 'full', 'at most 256 rows: ' .. added)
-		check(select(2, p:remove_all()) == 256 and row_count(big) == 1, 'and all of them come back, whatever the order of their slots')
-		deferred = deferred + 512
+		check(refused_growth == true, 'a refused growth of the row table answers full and changes nothing')
+		check(added == 4096 and refusal(p:row('f4097', big.block, big.records[1], 'f4097')) == 'full', 'at most 4096 rows: ' .. added)
+		local rows = mr.capacity().rows
+		check(rows.used == 4096 and rows.room == 4096 and rows.limit == 4096, 'the row table says 4096 of 4096')
+		check(select(2, p:remove_all()) == 4096 and row_count(big) == 1, 'and all of them come back, whatever the order of their slots')
+		deferred = deferred + 8192
 
 		local lost = make_table({ 'a' }, 8)
 		local lost_before, lost_live = snapshot(lost), live()
@@ -5424,6 +5939,8 @@ elseif SCENARIO == 'sites' then
 	local prologue = address('prologue_target')
 	local cave_at = address('cave_target')
 	local patch_name, patch_at = pick({ 'leaf_add_one', 'site_single', 'leaf_add_floats' }, 32, page_of(cave_at))
+	test_fill_mixed(163840)
+	local put_b_at = mr.add(address('mixed_code'), 0x2000)
 	local value_name, value_at, value_offset = nil, nil, 0
 	for _, name in ipairs({
 		'all_bits',
@@ -5545,10 +6062,10 @@ elseif SCENARIO == 'sites' then
 			name = 'put_b',
 			feature = 'f_put',
 			kind = 'patch',
-			pattern = hex_of(patch_at, 32),
+			pattern = hex_of(put_b_at, 32),
 			at = 18,
-			expect = hex_of(mr.add(patch_at, 18), 1),
-			bytes = flipped(patch_at, 18, 1),
+			expect = hex_of(mr.add(put_b_at, 18), 1),
+			bytes = flipped(put_b_at, 18, 1),
 		},
 		{ name = 'site_one', feature = 'f_site', kind = 'site', pattern = hex_of(here, 24), at = 0, expect = hex_of(here, 5) },
 	}
@@ -5719,7 +6236,7 @@ elseif SCENARIO == 'sites' then
 
 	local put = p:sites(entries, log)
 	local put_old = mr.read(patch_at, 16, 1)
-	test_fail_protect(raw(mr.add(patch_at, 16)), 2, mr.hop_slots, 1)
+	test_relock(raw(mr.add(put_b_at, 18)), mr.hop_slots, raw(mr.add(patch_at, 16)))
 	ok, why = put.install_feature('f_put')
 	check(
 		ok == false and contains(why, 'put_b: failed to patch memory, and 1 write could not be put back'),
@@ -7266,6 +7783,1757 @@ elseif SCENARIO == 'cpecific_bigread' then
 	_G.memreader.read(_G.memreader.base, 0, 1024)
 	print('did not crash')
 	os.exit(0)
+elseif SCENARIO == 'capacity' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local filler = mr.pointer(test_function('filler_code'))
+	local function at(offset)
+		return mr.add(filler, offset)
+	end
+	local function bytes_at(offset, size)
+		return mr.read(at(offset), 0, size)
+	end
+	local function log_text()
+		local log = io.open('memreader_plus_refused.txt', 'rb')
+		local text = log and log:read('*a') or ''
+		if log then log:close() end
+		return text
+	end
+	local Z4, ONE4 = '\0\0\0\0', '\1\0\0\0'
+
+	check(mr.supports.capacity == true, 'sites.attach sets supports.capacity')
+	local use = mr.capacity()
+	local shaped = true
+	for _, name in ipairs({ 'owners', 'items', 'claims', 'held_bytes', 'hooks', 'saved_code', 'pattern_cache', 'rows', 'file_edits', 'cave_pages' }) do
+		local row = use[name]
+		shaped = shaped and type(row) == 'table' and type(row.used) == 'number' and type(row.room) == 'number' and type(row.limit) == 'number'
+		shaped = shaped and row.used <= row.room and row.room <= row.limit
+	end
+	check(shaped, 'capacity has used, room and limit for every table')
+	check(use.hop_slots == mr.hop_slots(), 'and the hop slots left')
+	check(
+		use.owners.limit == 256
+			and use.items.limit == 8192
+			and use.claims.limit == 32768
+			and use.held_bytes.limit == 1048576
+			and use.hooks.limit == 1000
+			and use.saved_code.limit == 65536
+			and use.pattern_cache.limit == 8192
+			and use.rows.limit == 4096
+			and use.file_edits.limit == 4096
+			and (use.cave_pages or {}).limit == 1024,
+		'the limits are the documented ones'
+	)
+	check(use.items.room == 256 and use.claims.room == 4096, 'items and claims start with their first chunk')
+
+	local p = mr.patcher('cap_owner')
+	local filled = 0
+	while mr.capacity().items.used < 256 do
+		if p:set('fill_' .. filled, at(0x10000 + filled), 1, 0, 0, 255) ~= true then break end
+		filled = filled + 1
+	end
+	check(mr.capacity().items.used == 256, 'the first chunk of items is full')
+	test_fail_memory('virtual', mr.hop_slots)
+	local ok, why = p:set('needs_chunk', at(0x20000), 1, 5, 0, 255)
+	check(
+		ok == nil and why == 'full' and bytes_at(0x20000, 1) == '\0' and p:info('needs_chunk') == nil,
+		'a refused item chunk answers full and writes nothing: ' .. tostring(why)
+	)
+	check(mr.capacity().items.room == 256, 'and the item table did not grow')
+	check(p:set('needs_chunk', at(0x20000), 1, 5, 0, 255) == true and mr.capacity().items.room == 512, 'the next try gets the chunk')
+
+	local function sites(base, count)
+		local list = {}
+		for i = 1, count do
+			list[i] = { at(base + i * 4), Z4, ONE4 }
+		end
+		return list
+	end
+	local wave = 0
+	while mr.capacity().claims.used + 1024 <= 4096 do
+		wave = wave + 1
+		p:relocate('wave_' .. wave, sites(0x30000 + wave * 0x1000, 1024))
+	end
+	local rest = 4096 - mr.capacity().claims.used
+	if rest > 0 then p:relocate('wave_rest', sites(0x38000, rest)) end
+	check(mr.capacity().claims.used == 4096, 'the first chunk of claims is full')
+	test_fail_memory('virtual', mr.hop_slots)
+	ok, why = p:relocate('needs_claims', sites(0x3A000, 2))
+	check(
+		ok == nil and why == 'full' and bytes_at(0x3A004, 4) == Z4 and p:info('needs_claims') == nil,
+		'a refused claim chunk answers full and writes nothing: ' .. tostring(why)
+	)
+	check(p:relocate('needs_claims', sites(0x3A000, 2)) == true and mr.capacity().claims.room == 8192, 'the next try gets the chunk')
+
+	local nops, zeros = string.rep('\144', 4096), string.rep('\0', 4096)
+	local chunk = 0x40
+	local held = mr.capacity().held_bytes
+	while held.used + 8192 <= held.room do
+		p:patch('fill_held_' .. chunk, at(chunk * 4096), zeros, nops)
+		chunk = chunk + 1
+		held = mr.capacity().held_bytes
+	end
+	test_fail_memory('heap', mr.hop_slots)
+	ok, why = p:patch('needs_pool', at(chunk * 4096), zeros, nops)
+	check(ok == nil and why == 'full' and bytes_at(chunk * 4096, 4) == Z4, 'a refused pool growth answers full and writes nothing: ' .. tostring(why))
+	check(mr.capacity().held_bytes.room == held.room, 'and the pool did not grow')
+	local held_room = held.room
+	check(p:patch('needs_pool', at(chunk * 4096), zeros, nops) == true and mr.capacity().held_bytes.room == held_room * 2, 'the next try doubles the pool')
+	check(mr.read_original(at(0x40 * 4096), 0, 16) == string.rep('\0', 16), 'patches made before the pool grew keep their original bytes')
+	check(p:remove('fill_held_64') == true and bytes_at(0x40 * 4096, 4096) == zeros, 'and come off from the moved pool')
+
+	local saved = mr.capacity().saved_code
+	local spot = 0x60000
+	while saved.used < saved.room do
+		mr.patch(at(spot), Z4, ONE4)
+		spot = spot + 16
+		saved = mr.capacity().saved_code
+	end
+	test_fail_memory('heap', mr.hop_slots)
+	mr.patch(at(spot), Z4, ONE4)
+	check(
+		string.find(log_text(), ('saved original code is full (%d ranges)'):format(saved.room), 1, true) ~= nil,
+		'a refused growth of saved code logs the full line'
+	)
+	check(mr.read_original(at(spot), 0, 4) == ONE4 and mr.capacity().saved_code.room == saved.room, 'and that change has no original bytes')
+	mr.patch(at(spot + 16), Z4, ONE4)
+	local saved_room = saved.room
+	check(
+		mr.read_original(at(spot + 16), 0, 4) == Z4 and mr.capacity().saved_code.room == saved_room * 2,
+		'the next change grows the table and saves its original'
+	)
+	check(mr.read_original(at(0x60000), 0, 4) == Z4, 'the oldest saved range still holds its original')
+
+	local cache = mr.capacity().pattern_cache
+	local serial = 0
+	local function fresh_pattern()
+		serial = serial + 1
+		return ('C3 CC CC 90 %02X %02X 48'):format(serial % 256, math.floor(serial / 256) % 256)
+	end
+	local strings = {}
+	while mr.capacity().pattern_cache.used < 1023 do
+		local text = fresh_pattern()
+		strings[#strings + 1] = text
+		mr.find_pattern(text)
+	end
+	local list = {}
+	for i = 1, 64 do
+		list[i] = fresh_pattern()
+	end
+	local found, counts = mr.find_patterns(list)
+	local agree = mr.capacity().pattern_cache.used == 1087
+	for i = 1, 64 do
+		local first, count = mr.find_pattern(list[i] .. ' ')
+		agree = agree and counts[i] == count and (found[i] == false) == (first == nil) and (first == nil or mr.eq(found[i], first))
+	end
+	check(agree, 'find_patterns growing the cache past 1024 entries returns the same results as fresh scans')
+	cache = mr.capacity().pattern_cache
+	check(cache.room == 2048, 'the cache grew to 2048 entries: ' .. cache.room)
+	while mr.capacity().pattern_cache.used < cache.room do
+		mr.find_pattern(fresh_pattern())
+	end
+	test_fail_memory('heap', mr.hop_slots)
+	local text = fresh_pattern()
+	local first, count = mr.find_pattern(text)
+	local again_first, again_count = mr.find_pattern(text .. ' ')
+	check(
+		count == again_count and mr.capacity().pattern_cache.used == cache.room + 1,
+		'a refused cache growth still answers right and leaves that search uncached'
+	)
+	while mr.capacity().pattern_cache.used < 8192 do
+		mr.find_pattern(fresh_pattern())
+	end
+	text = fresh_pattern()
+	first, count = mr.find_pattern(text)
+	again_first, again_count = mr.find_pattern(text .. ' ')
+	cache = mr.capacity().pattern_cache
+	check(cache.used == 8192 and cache.room == 8192 and count == again_count, 'the cache stops at 8192 entries and results stay right')
+	check(select(2, mr.find_pattern(strings[1])) == select(2, mr.find_pattern(strings[1] .. ' ')), 'an early entry still answers like a fresh scan')
+	local function wave_steps(count)
+		local steps = {}
+		for step = 1, math.ceil(count / 1024) do
+			local list = {}
+			for i = 1, math.min(1024, count - (step - 1) * 1024) do
+				list[i] = { at(0x80000 + ((step - 1) * 1024 + i - 1) * 4), Z4, ONE4 }
+			end
+			steps[step] = { 'relocate', 'cap_wave_' .. step, list }
+		end
+		return steps
+	end
+	ok, why = p:batch(wave_steps(2049))
+	check(
+		ok == nil and why == 'cap_wave_3: site 1: the batch writes too many bytes' and bytes_at(0x80000, 4) == Z4,
+		'a batch of 2049 writes is refused and writes nothing: ' .. tostring(why)
+	)
+	local done, stopped = p:batch(wave_steps(2048))
+	check(done == true and bytes_at(0x80000 + 2047 * 4, 4) == ONE4, 'a batch of 2048 writes goes through')
+	print(string.format('  batch of 2048 relocation writes: threads stopped %.0f us', stopped))
+elseif SCENARIO == 'report_during_growth' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local filler = mr.pointer(test_function('filler_code'))
+	local function at(offset)
+		return mr.add(filler, offset)
+	end
+	local started = mr.ticks()
+	local p = mr.patcher('growth_owner')
+	test_report_loop_start(mr.write_runtime_report)
+	for i = 0, 2999 do
+		p:set('g' .. i, at(0x10000 + i), 1, 0, 0, 255)
+	end
+	for wave = 1, 8 do
+		local list = {}
+		for i = 1, 1024 do
+			list[i] = { at(0x20000 + (wave * 1024 + i) * 4), '\0\0\0\0', '\1\0\0\0' }
+		end
+		p:relocate('wave_' .. wave, list)
+	end
+	local peak = mr.capacity()
+	local turns = 0
+	while mr.elapsed_us(started) < 10e6 do
+		turns = turns + 1
+		for i = 0, 99 do
+			p:remove('g' .. i)
+		end
+		for i = 0, 99 do
+			p:set('g' .. i, at(0x10000 + i), 1, turns % 200, 0, 255)
+		end
+	end
+	local reports, bad, most_items, most_claims = test_report_loop_stop()
+	check(
+		peak.items.used == 3008 and peak.claims.used == 3000 + 8 * 1024,
+		'items and claims grew past several chunks: ' .. peak.items.used .. ', ' .. peak.claims.used
+	)
+	check(reports >= 10 and bad == 0, 'every runtime report written during the growth has the capacity line: ' .. reports .. ' reports, ' .. bad .. ' bad')
+	check(
+		most_items <= peak.items.used + 1 and most_claims <= peak.claims.used + 1,
+		'no report counts more than the registry held: ' .. most_items .. ', ' .. most_claims
+	)
+	check(mr.elapsed_us(started) >= 10e6 and turns > 0, 'the reports ran for 10 s while the registry changed')
+elseif SCENARIO == 'many_mods' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local name = mr.write_runtime_report()
+	local text = name and read_all(name) or ''
+	check(has(text, 'Mods in load order (2104, from the mod file on the command line)'), 'the mod count is the whole list')
+	check(has(text, '  1. first.pack  3 bytes') and has(text, '2048. extra_2044.pack  not found in any search path'), 'the first 2048 mods are listed')
+	check(not has(text, '2049. '), 'the 2049th is not')
+	check(has(text, '  and 56 more mods not listed'), 'the rest are counted')
+	check(has(text, '  80 more search paths were not searched'), 'and so are the search paths past 1024')
+	check(has(text, 'memreader Plus capacity: owners '), 'the report goes on after the list')
+elseif SCENARIO == 'many_mods_memory' then
+	test_fake_session(2100, 1100)
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local name = mr.write_runtime_report()
+	local text = name and read_all(name) or ''
+	check(has(text, 'Mods in load order (2100, from game memory)'), 'the mod count read from memory is the whole list')
+	check(has(text, '2048. extra_2048.pack  not found in any search path'), 'the first 2048 mods are listed')
+	check(not has(text, '2049. '), 'the 2049th is not')
+	check(has(text, '  and 52 more mods not listed'), 'the rest are counted')
+	check(has(text, '  76 more search paths were not searched'), 'and so are the search paths past 1024')
+	check(has(text, 'memreader Plus capacity: owners '), 'the report goes on after the list')
+elseif SCENARIO == 'mods_memory_junk' then
+	test_fake_session(16385, 4)
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local name = mr.write_runtime_report()
+	local text = name and read_all(name) or ''
+	check(
+		has(text, 'Mods in load order (4, from the mod file on the command line)'),
+		'a mod count above 16384 in memory is not a list, the mod file is read instead'
+	)
+	check(not has(text, 'extra_1.pack'), 'nothing of the memory list is shown')
+elseif SCENARIO == 'asm' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local function contains(text, part)
+		return type(text) == 'string' and string.find(text, part, 1, true) ~= nil
+	end
+	local function slot_bytes(name, size)
+		local parts = {}
+		for i = 1, size do
+			parts[i] = string.char(size == 4 and i == 4 and 0 or (#name * 37 + i * 11 + name:byte(1)) % 256)
+		end
+		return table.concat(parts)
+	end
+	local function fill(template)
+		local parts, slots, values, offset = {}, {}, {}, 0
+		for token in template:gmatch('%S+') do
+			local name, size = token:match('^{([%w_]+):(%d)}$')
+			if name then
+				size = tonumber(size)
+				values[name] = slot_bytes(name, size)
+				parts[#parts + 1] = values[name]
+				slots[#slots + 1] = name .. '@' .. offset .. ':' .. size
+				offset = offset + size
+			else
+				parts[#parts + 1] = string.char(tonumber(token, 16))
+				offset = offset + 1
+			end
+		end
+		return table.concat(parts), table.concat(slots, ' '), values
+	end
+	local function slot_list(slots)
+		local parts = {}
+		for i, slot in ipairs(slots or {}) do
+			parts[i] = slot.name .. '@' .. slot.offset .. ':' .. slot.size
+		end
+		return table.concat(parts, ' ')
+	end
+	local function first_difference(a, b)
+		if type(a) ~= 'string' or type(b) ~= 'string' then return 'no bytes' end
+		for i = 1, math.max(#a, #b) do
+			if a:byte(i) ~= b:byte(i) then return ('+%d: %s vs %s'):format(i - 1, tostring(a:byte(i)), tostring(b:byte(i))) end
+		end
+		return 'same'
+	end
+	local function le_number_of(text)
+		local number = 0
+		for i = #text, 1, -1 do
+			number = number * 256 + text:byte(i)
+		end
+		return number
+	end
+	local function hex(text)
+		return (text:gsub('.', function(ch)
+			return string.format('%02X ', ch:byte())
+		end))
+	end
+
+	local CAVES = {
+		{
+			'strength_bar',
+			[[
+push rcx
+push rdx
+push r8
+mov r8, {block:8}
+cmp dword ptr [r8], 0
+je done
+mov rcx, [rbp + {character_slot:4}]
+test rcx, rcx
+je done
+mov rcx, [rcx + 0x3b0]
+test rcx, rcx
+je done
+mov rcx, [rcx]
+test rcx, rcx
+je done
+cmp dword ptr [rbp + {shape:4}], 4
+jne unit
+mov rcx, [rcx + 0x790]
+test rcx, rcx
+je done
+unit:
+mov edx, [rcx + 8]
+cmp edx, [r8 + 8]
+jae done
+cmp dword ptr [r8 + rdx*4 + 0x10], 0
+je done
+mulss xmm0, [r8 + rdx*4 + 0x10]
+minss xmm0, [r8 + 4]
+done:
+pop r8
+pop rdx
+pop rcx
+]],
+			'51 52 41 50 49 B8 {block:8} 41 83 38 00 74 53 48 8B 8D {character_slot:4} 48 85 C9 74 47 48 8B 89 B0 03 00 00 48 85 C9 74 3B 48 8B 09 48 85 C9 74 33 83 BD {shape:4} 04 75 0C 48 8B 89 90 07 00 00 48 85 C9 74 1E 8B 51 08 41 3B 50 08 73 15 41 83 7C 90 10 00 74 0D F3 41 0F 59 44 90 10 F3 41 0F 5D 40 04 41 58 5A 59',
+		},
+		{
+			'strength_icon',
+			[[
+push rcx
+push rdx
+push r8
+mov r8, {block:8}
+cmp dword ptr [r8], 0
+je cap
+mov rcx, [rcx + {character:1}]
+test rcx, rcx
+je cap
+mov rcx, [rcx + {force:4}]
+test rcx, rcx
+je cap
+mov rcx, [rcx]
+test rcx, rcx
+je cap
+mov edx, [rcx + 8]
+cmp edx, [r8 + 8]
+jae cap
+cmp dword ptr [r8 + rdx*4 + 0x10], 0
+je cap
+mulss xmm6, [r8 + rdx*4 + 0x10]
+cap:
+minss xmm6, [r8 + 4]
+pop r8
+pop rdx
+pop rcx
+]],
+			'51 52 41 50 49 B8 {block:8} 41 83 38 00 74 35 48 8B 49 {character:1} 48 85 C9 74 2C 48 8B 89 {force:4} 48 85 C9 74 20 48 8B 09 48 85 C9 74 18 8B 51 08 41 3B 50 08 73 0F 41 83 7C 90 10 00 74 07 F3 41 0F 59 74 90 10 F3 41 0F 5D 70 04 41 58 5A 59',
+		},
+		{
+			'strength_percent',
+			[[
+push rcx
+push rdx
+push r8
+mov r8, {block:8}
+cmp dword ptr [r8], 0
+je vanilla
+mov rax, [rcx + {cco_force:4}]
+test rax, rax
+je vanilla
+mov edx, [rax + 8]
+cmp edx, [r8 + 8]
+jae vanilla
+cmp dword ptr [r8 + rdx*4 + 0x10], 0
+je vanilla
+mov eax, [rax + {force_units:4}]
+cvtsi2ss xmm0, rax
+mulss xmm0, [r8 + rdx*4 + 0x10]
+mulss xmm0, [r8 + 0xc]
+pop r8
+pop rdx
+pop rcx
+ret
+vanilla:
+pop r8
+pop rdx
+pop rcx
+]],
+			'51 52 41 50 49 B8 {block:8} 41 83 38 00 74 3A 48 8B 81 {cco_force:4} 48 85 C0 74 2E 8B 50 08 41 3B 50 08 73 25 41 83 7C 90 10 00 74 1D 8B 80 {force_units:4} F3 48 0F 2A C0 F3 41 0F 59 44 90 10 F3 41 0F 59 40 0C 41 58 5A 59 C3 41 58 5A 59',
+		},
+		{
+			'replay_tick_cave',
+			[[
+cmp byte ptr [rbx + {is_replay:4}], 0
+je done
+mov rax, [rbx + {replay:4}]
+test rax, rax
+je done
+mov ecx, [rax + 0x14]
+mov rdx, [rax + 0x18]
+test rdx, rdx
+je done
+xor r8d, r8d
+next:
+cmp ecx, r8d
+jbe done
+mov rax, [rdx + r8*8]
+test rax, rax
+je skip
+mov r9d, [rax]
+test r9d, r9d
+je skip
+lea eax, [r9 - 0x64]
+cmp eax, 0x190
+ja done
+mov rax, {period:8}
+mov [rax], r9d
+jmp done
+skip:
+inc r8d
+jmp next
+done:
+]],
+			'80 BB {is_replay:4} 00 74 50 48 8B 83 {replay:4} 48 85 C0 74 44 8B 48 14 48 8B 50 18 48 85 D2 74 38 45 31 C0 44 39 C1 76 30 4A 8B 04 C2 48 85 C0 74 22 44 8B 08 45 85 C9 74 1A 41 8D 41 9C 3D 90 01 00 00 77 14 48 B8 {period:8} 44 89 08 EB 05 41 FF C0 EB CB',
+		},
+		{
+			'load_rescale',
+			[[
+mov r11, [r15]
+test r11, r11
+je done
+mov r11, [r11 + {model:4}]
+test r11, r11
+je done
+mov r11, [r11 + {settings:4}]
+test r11, r11
+je done
+movss [r11 + {field:1}], xmm7
+done:
+]],
+			'4D 8B 1F 4D 85 DB 74 1E 4D 8B 9B {model:4} 4D 85 DB 74 12 4D 8B 9B {settings:4} 4D 85 DB 74 06 F3 41 0F 11 7B {field:1}',
+		},
+		{
+			'load_refresh_stash',
+			[[
+mov qword ptr [rsp + 0x30], 0
+cmp byte ptr [rdx + {building:4}], 0
+je done
+cmp byte ptr [rdx + {new_game:4}], 0
+jne done
+mov rax, [rsp + 0x60]
+mov eax, [rax]
+test eax, eax
+je done
+mov r10d, [r9]
+test r10d, r10d
+je done
+shl r10, 32
+or r10, rax
+mov [rsp + 0x30], r10
+done:
+]],
+			'48 C7 44 24 30 00 00 00 00 80 BA {building:4} 00 74 28 80 BA {new_game:4} 00 75 1F 48 8B 44 24 60 8B 00 85 C0 74 14 45 8B 11 45 85 D2 74 0C 49 C1 E2 20 49 09 C2 4C 89 54 24 30',
+		},
+		{
+			'load_refresh_share',
+			[[
+mov rax, {callee:8}
+call rax
+mov r10, [rsp + 0x30]
+test r10, r10
+je leave
+test al, al
+je leave
+mov r11, [rsp + 0x28]
+mov r11d, [r11]
+mov rcx, [rsp + 0x20]
+mov r8d, r10d
+test r8d, r8d
+je leave
+shr r10, 32
+mov rax, r10
+imul rax, r11
+mov rdx, r8
+shr rdx, 1
+add rax, rdx
+xor edx, edx
+div r8
+cmp rax, r11
+cmova rax, r11
+test rax, rax
+jne store
+mov eax, 1
+store:
+mov [rcx], eax
+mov eax, 1
+leave:
+add rsp, 0x38
+ret
+]],
+			'48 B8 {callee:8} FF D0 4C 8B 54 24 30 4D 85 D2 74 4A 84 C0 74 46 4C 8B 5C 24 28 45 8B 1B 48 8B 4C 24 20 45 89 D0 45 85 C0 74 31 49 C1 EA 20 4C 89 D0 49 0F AF C3 4C 89 C2 48 D1 EA 48 01 D0 31 D2 49 F7 F0 4C 39 D8 49 0F 47 C3 48 85 C0 75 05 B8 01 00 00 00 89 01 B8 01 00 00 00 48 83 C4 38 C3',
+		},
+		{
+			'result_share_cave',
+			[[
+mov r9, {block:8}
+cmp dword ptr [r9], 0
+je done
+mov rax, [rcx + {record:4}]
+cmp byte ptr [rax + {flag:4}], 0
+jne other
+mov r8d, [r10 + 0x98]
+jmp read
+other:
+mov r8d, [r10 + 0xac]
+read:
+mov r11d, [rcx + 0x27c]
+mov eax, [rcx + {current:4}]
+test eax, eax
+je done
+test r8d, r8d
+je done
+test r11d, r11d
+je done
+cmp r8d, r11d
+je done
+imul rax, r11
+mov rdx, r8
+shr rdx, 1
+add rax, rdx
+xor edx, edx
+div r8
+test rax, rax
+jne cap
+mov eax, 1
+cap:
+cmp rax, r11
+cmova rax, r11
+mov [rcx + {current:4}], eax
+done:
+]],
+			'49 B9 {block:8} 41 83 39 00 74 69 48 8B 81 {record:4} 80 B8 {flag:4} 00 75 09 45 8B 82 98 00 00 00 EB 07 45 8B 82 AC 00 00 00 44 8B 99 7C 02 00 00 8B 81 {current:4} 85 C0 74 38 45 85 C0 74 33 45 85 DB 74 2E 45 39 D8 74 29 49 0F AF C3 4C 89 C2 48 D1 EA 48 01 D0 31 D2 49 F7 F0 48 85 C0 75 05 B8 01 00 00 00 4C 39 D8 49 0F 47 C3 89 81 {current:4}',
+		},
+		{
+			'strength_bar_probe',
+			[[
+push rcx
+push rdx
+push r8
+mov r8, {block:8}
+cmp dword ptr [r8], {limit:4}
+je done
+done:
+pop r8
+pop rdx
+pop rcx
+]],
+			'51 52 41 50 49 B8 {block:8} 41 81 38 {limit:4} 74 00 41 58 5A 59',
+		},
+		{
+			'melee_ap_armour',
+			[[
+cvtsi2ss xmm1, ebx
+mulss xmm1, xmm6
+mov eax, 100.0
+movd xmm2, eax
+minss xmm1, xmm2
+mov eax, 0.01
+movd xmm2, eax
+mulss xmm1, xmm2
+mov eax, 1.0
+movd xmm2, eax
+subss xmm2, xmm1
+mulss xmm2, dword ptr [rsp+0x44]
+movss dword ptr [rsp+0x44], xmm2
+]],
+			'F3 0F 2A CB F3 0F 59 CE B8 00 00 C8 42 66 0F 6E D0 F3 0F 5D CA B8 0A D7 23 3C 66 0F 6E D0 F3 0F 59 CA B8 00 00 80 3F 66 0F 6E D0 F3 0F 5C D1 F3 0F 59 54 24 44 F3 0F 11 54 24 44',
+		},
+		{
+			'offline_counter',
+			[[
+push rax
+mov rax, {counter:8}
+inc dword ptr [rax]
+pop rax
+]],
+			'50 48 B8 {counter:8} FF 00 58',
+		},
+	}
+
+	check(type(mr.assemble) == 'function' and type(mr.disassemble) == 'function', 'assemble and disassemble are part of the API')
+	for _, row in ipairs(CAVES) do
+		local name, text, template = row[1], row[2], row[3]
+		local expected, slots_expected, values = fill(template)
+		local bytes, listing, slots, code = mr.assemble(text, nil, values)
+		check(
+			bytes == expected and code == #expected,
+			name .. ': the asm text gives the bytes the mod ships: ' .. (bytes and first_difference(bytes, expected) or tostring(listing))
+		)
+		check(slot_list(slots) == slots_expected, name .. ': the slots sit where the hex template has them: ' .. slot_list(slots))
+		local open, _, open_slots = mr.assemble(text, nil, nil, true)
+		local zeroed = expected
+		for _, slot in ipairs(open_slots or {}) do
+			zeroed = zeroed:sub(1, slot.offset) .. string.rep('\0', slot.size) .. zeroed:sub(slot.offset + slot.size + 1)
+		end
+		local all_open = #(open_slots or {}) == #(slots or {})
+		for _, slot in ipairs(open_slots or {}) do
+			all_open = all_open and slot.given == false
+		end
+		check(open == zeroed and all_open, name .. ': without values the slots are zero and marked not given')
+	end
+
+	local ROUND_TRIP = { { 'load_rescale', 'asm_site_g', 'asm_site_h' }, { 'result_share_cave', 'asm_site_i', 'asm_site_j' } }
+	local inventory = mr.patcher('asm_inventory')
+	local function hex_of(at, size)
+		local bytes, parts = mr.read_original(at, 0, size), {}
+		for i = 1, size do
+			parts[i] = string.format('%02X', bytes:byte(i))
+		end
+		return table.concat(parts, ' ')
+	end
+	local function same_value(a, b)
+		if type(a) == 'number' then return a == b end
+		return a ~= nil and b ~= nil and mr.eq(a, b)
+	end
+	for _, trip in ipairs(ROUND_TRIP) do
+		local row
+		for _, candidate in ipairs(CAVES) do
+			if candidate[1] == trip[1] then row = candidate end
+		end
+		local expected, _, values = fill(row[3])
+		local entries, sites = {}, {}
+		for i, kind in ipairs({ 'asm', 'bytes' }) do
+			local fn = mr.pointer(test_function(trip[i + 1]))
+			sites[i] = mr.add(fn, 3)
+			entries[i] = {
+				name = trip[1] .. '_' .. kind,
+				feature = trip[1] .. '_' .. kind,
+				kind = 'cave',
+				pattern = hex_of(fn, 16),
+				at = 3,
+				expect = hex_of(sites[i], 5),
+			}
+			entries[i][kind] = kind == 'asm' and row[2] or row[3]
+		end
+		local native = inventory:sites(entries, function() end)
+		local asm_ok, asm_why = native.install(entries[1].name, values)
+		local hex_ok, hex_why = native.install(entries[2].name, values)
+		check(asm_ok and hex_ok, trip[1] .. ': the asm entry and the hex entry install with the same values: ' .. tostring(asm_why) .. ' ' .. tostring(hex_why))
+		local asm_cave, hex_cave = mr.hook_info(sites[1]).cave, mr.hook_info(sites[2]).cave
+		check(mr.read(asm_cave, 0, #expected) == expected and mr.read(hex_cave, 0, #expected) == expected, trip[1] .. ': both caves hold the same bytes')
+		local all_same = true
+		for name, value in pairs(values) do
+			local from_asm, from_hex = native.cave_value(entries[1].name, name), native.cave_value(entries[2].name, name)
+			all_same = all_same and same_value(from_asm, from_hex)
+			if #value == 4 then all_same = all_same and from_asm == le_number_of(value) end
+		end
+		check(all_same, trip[1] .. ': cave_value reads every slot back the same from the asm cave and the hex cave')
+	end
+
+	local strength = fill(CAVES[1][3])
+	local _, listing = mr.assemble(CAVES[1][2], nil, select(3, fill(CAVES[1][3])))
+	check(
+		contains(listing, '  +04 49 B8 ')
+			and contains(listing, '{block:8} at +06')
+			and contains(listing, 'mulss xmm0, dword ptr [r8+rdx*4+0x10]')
+			and contains(listing, 'jump back'),
+		'the listing shows offsets, instructions, slots and the jump back'
+	)
+	check(#strength == 107, 'the strength bar cave is 107 bytes')
+
+	local at = mr.pointer(test_function('asm_site'))
+	local shown = mr.disassemble(at, 3)
+	check(
+		contains(shown, 'mov eax, ecx') and contains(shown, 'imul eax, eax, 0x3') and select(2, shown:gsub('\n', '')) == 2,
+		'disassemble shows the host code, one line per instruction'
+	)
+	check(contains(mr.disassemble(at), mr.tostring(at):lower():gsub('^0+', '')), 'one line names its address')
+
+	local data_code, _, _, data_size = mr.assemble('movss xmm0, dword ptr [rip + one]\n.data\none: dd 1.0', mr.pointer(test_function('asm_float')))
+	check(
+		data_size == 8
+			and #data_code == 8 + 14 + 4
+			and data_code:sub(1, 8) == '\243\15\16\5\14\0\0\0'
+			and data_code:sub(9, 22) == string.rep('\0', 14)
+			and data_code:sub(23) == '\0\0\128\63',
+		'.data goes after the 14 bytes of the jump back and rip + label reaches it: ' .. hex(data_code or '')
+	)
+	local folded = mr.assemble('MOV EAX, 0x10 ; comment\n// line comment\n\nlabel: Nop\nJMP label')
+	check(folded == '\184\16\0\0\0\144\235\253', 'mnemonics and registers in any case, ; and // comments, a backward jump: ' .. hex(folded or ''))
+	check(mr.assemble('mov al, {small}', nil, { small = '\255' }) == '\176\255', 'a 1-byte string value is used as its byte')
+	check(mr.assemble('mov rax, {wide}', nil, { wide = '\255\255\255\255' }) == '\72\199\192\255\255\255\255', 'a 4-byte string value is sign-extended')
+	check(mr.assemble('mov eax, {byte}', nil, { byte = '\200' }) == '\184\200\0\0\0', 'a 1-byte string value is zero-extended')
+	local UNSIGNED = {
+		{ 'mov eax, 0xffffffff', '\184\255\255\255\255' },
+		{ 'cmp byte ptr [rax], 0xff', '\128\56\255' },
+		{ 'mov ax, 0xffff', '\102\184\255\255' },
+		{ 'and eax, 0x80000000', '\37\0\0\0\128' },
+		{ 'mov eax, -1.0', '\184\0\0\128\191' },
+		{ 'mov rax, 0xffffffff', '\72\184\255\255\255\255\0\0\0\0' },
+	}
+	for _, case in ipairs(UNSIGNED) do
+		local code, why = mr.assemble(case[1])
+		check(code == case[2], case[1] .. ' takes the value as written for the operand size: ' .. (code and hex(code) or tostring(why)))
+	end
+	local wide, wide_why = mr.assemble('add rax, 0x80000000')
+	check(
+		wide == nil and wide_why == "asm:1:1: no encoding for 'add rax, 0x80000000'",
+		'a value a 64-bit operation would sign-extend is refused, not folded: ' .. tostring(wide_why)
+	)
+	check(mr.assemble('db 1, 2\ndw 0x0304\ndd -1\ndq 2.0\nalign 4\nnop') ~= nil, 'data and align lines assemble')
+	local N1, N2, N3 = '\144', '\102\144', '\15\31\0'
+	local N4, N5, N6 = '\15\31\64\0', '\15\31\68\0\0', '\102\15\31\68\0\0'
+	local N7, N8, N9 = '\15\31\128\0\0\0\0', '\15\31\132\0\0\0\0\0', '\102\15\31\132\0\0\0\0\0'
+	local PADS = { N1, N2, N3, N4, N5, N6, N7, N8, N9, N9 .. N1, N9 .. N2, N9 .. N3, N9 .. N4, N9 .. N5, N9 .. N6 }
+	for pad, wanted in ipairs(PADS) do
+		local aligned = mr.assemble('align 16\nnop', mr.pointer(string.char(16 - pad) .. '\0\1\0\0\0\0\0'))
+		check(aligned == wanted .. '\144', ('align 16 pads %d bytes of code with the nops of the table: %s'):format(pad, hex(aligned or '')))
+	end
+	local data_aligned = mr.assemble('nop\n.data\ndb 1\ndb 1\nalign 4\ndb 2')
+	check(data_aligned and data_aligned:sub(-6) == '\1\1\0\0\0\2', 'align pads .data with zeros: ' .. hex(data_aligned or ''))
+	local SIGN_CASES = {
+		{ 'add eax, {x:1}', { x = 200 }, '\131\192\200', 'a 1-byte field in add eax takes 200 as -56' },
+		{ 'mov rax, {x:4}', { x = 1 }, '\72\199\192\1\0\0\0', 'a 4-byte field in mov rax is the sign-extended imm32 form' },
+		{ 'mov eax, 1.5', nil, '\184\0\0\192\63', 'a float literal loads its bits' },
+		{ 'xchg eax, eax', nil, '\144', 'xchg eax, eax encodes as the one-byte nop' },
+	}
+	for _, case in ipairs(SIGN_CASES) do
+		local code = mr.assemble(case[1], nil, case[2])
+		check(code == case[3], case[4] .. ': ' .. hex(code or ''))
+	end
+
+	local function relaxed(text)
+		local code = mr.assemble(text)
+		return code and code:byte(1), code and #code
+	end
+	local function nops(count)
+		return string.rep('nop\n', count)
+	end
+	local op, size = relaxed('jz t\n' .. nops(127) .. 't: nop')
+	check(op == 0x74 and size == 2 + 127 + 1, 'a forward jump of 127 stays short')
+	op, size = relaxed('jz t\n' .. nops(128) .. 't: nop')
+	check(op == 0x0F and size == 6 + 128 + 1, 'a forward jump of 128 becomes near')
+	local back = mr.assemble('t: ' .. nops(126) .. 'jz t')
+	check(back and #back == 128 and back:byte(127) == 0x74 and back:byte(128) == 0x80, 'a backward jump of -128 stays short')
+	back = mr.assemble('t: ' .. nops(127) .. 'jz t')
+	check(back and #back == 133 and back:byte(128) == 0x0F and back:sub(130) == '\123\255\255\255', 'a backward jump of -129 becomes near')
+	local chain = mr.assemble('jz far_a\njz far_b\n' .. nops(123) .. 'far_a: nop\n' .. nops(5) .. 'far_b: nop')
+	check(
+		chain and chain:sub(1, 6) == '\15\132\129\0\0\0' and chain:sub(7, 12) == '\15\132\129\0\0\0',
+		'widening one jump pushes the other out of reach and both become near: ' .. hex((chain or ''):sub(1, 12))
+	)
+	check(relaxed('jmp short t\nt: nop') == 0xEB, 'short forces a short jump')
+	check(relaxed('jmp near t\nt: nop') == 0xE9, 'near forces a near jump')
+	check(relaxed('call {f}', nil) == nil, 'a call to a value needs the value')
+	local far_call = mr.assemble('call {f}', mr.pointer('\0\0\1\0\0\0\0\0'), { f = mr.pointer('\0\0\2\0\0\0\0\0') })
+	check(far_call == '\232\251\255\0\0', 'a call to a value is rel32 from the cave address: ' .. hex(far_call or ''))
+
+	local ERRORS = {
+		{ 'nop\n  mulls xmm0, xmm1', nil, "asm:2:3: unknown mnemonic 'mulls'" },
+		{ 'mulss xmn0, xmm1', nil, "asm:1:7: unknown register 'xmn0'" },
+		{ 'add [rax], 1', nil, 'asm:1:1: say byte, word, dword or qword ptr: more than one size fits' },
+		{ 'movss xmm0, rax', nil, "asm:1:1: no encoding for 'movss xmm0, rax'" },
+		{ 'jmp done', nil, "asm:1:5: label 'done' is not defined" },
+		{ 'a:\nnop\n a: nop', nil, "asm:3:2: label 'a' is defined twice" },
+		{ 'mov rax, {block:8}', nil, 'asm:1:10: {block:8} has no value' },
+		{ 'mov eax, {plain}', nil, 'asm:1:10: {plain} has no value' },
+		{ 'mov byte ptr [rax + {field:1}], 0', { field = 500 }, 'asm:1:5: {field:1} does not fit 0x1f4' },
+		{ 'mov al, {record:4}', { record = 1 }, 'asm:1:9: {record:4} cannot be a 4-byte field in this instruction' },
+		{ 'call {f}', { f = mr.pointer('\0\0\0\0\0\128\0\0') }, 'asm:1:6: call target 0x800000000000 is out of rel32 reach of the cave' },
+		{ 'mov eax, [rip + 0x10]', nil, 'asm:1:10: [rip + number] is not supported: use [rip + label] or [rip + {name}]' },
+		{ string.rep('mov r8, 0x1122334455667788\n', 410), nil, 'asm:1:1: the cave is larger than 4096 bytes' },
+		{ 'jmp short t\n' .. nops(200) .. 't: nop', nil, "asm:1:5: the short jump to 't' is out of range" },
+		{ 'push 1.5', nil, 'asm:1:6: a float needs a 32-bit or 64-bit operand next to it' },
+		{ 'align 3', nil, 'asm:1:1: align takes a power of two up to 256' },
+		{ '.data\n.data', nil, 'asm:2:1: .data is given twice' },
+		{ 'jmp ' .. string.rep('a', 48), nil, 'asm:1:5: a name is longer than 47 characters' },
+		{ 'mov eax, [rax + rcx*3]', nil, 'asm:1:17: the scale must be 1, 2, 4 or 8' },
+		{ 'rax: nop', nil, "asm:1:1: label 'rax' is a register name" },
+		{ 'mov eax,, 1', nil, "asm:1:9: unexpected ','" },
+		{ 'mov eax,', nil, 'asm:1:9: the line ends too early' },
+		{ 'mov eax, short t\nt:', nil, 'asm:1:10: short and near go with jumps and calls' },
+		{ 'jmp {t:4}', nil, 'asm:1:5: a jump target cannot be a slot' },
+		{ 'mov eax, {x}', { x = 'abc' }, 'asm:1:10: {x} as a string must be 1, 2, 4 or 8 bytes' },
+		{ 'mov eax, {x}', { x = 1.5 }, 'asm:1:10: {x} must be a whole number, a pointer value or a string of bytes' },
+		{ 'dd 5\n.data', nil, nil },
+		{ '', nil, 'asm:1:1: no instructions' },
+		{ 'mov rax, 99999999999999999999', nil, 'asm:1:10: the number is too large' },
+		{ 'mov eax, [rax - rcx]', nil, 'asm:1:17: a register cannot be subtracted' },
+		{ 'mov eax, [rcx + {a:4} + 8]', nil, 'asm:1:10: a slot is the whole displacement: no number next to it' },
+		{ 'mov eax, [rax + t]\nt:', nil, 'asm:1:10: a label in an address needs rip: [rip + label]' },
+		{ 'db {x:4}', { x = 1 }, 'asm:1:4: {x:4} does not match db' },
+		{ 'db 300', nil, 'asm:1:4: 0x12c does not fit db' },
+		{ 'nop\n\255', nil, 'asm:2:1: unexpected character' },
+		{ string.rep('a', 262145), nil, 'asm:1:1: the text is longer than 262144 bytes' },
+	}
+	for _, case in ipairs(ERRORS) do
+		local ok, bytes, why = pcall(mr.assemble, case[1], nil, case[2])
+		if case[3] then
+			check(ok and bytes == nil and why == case[3], ('%s is refused: %s'):format(case[1]:sub(1, 40):gsub('\n', ' / '), tostring(why)))
+		else
+			check(ok and bytes ~= nil, ('%s assembles'):format(case[1]:sub(1, 40):gsub('\n', ' / ')))
+		end
+	end
+	check(not pcall(mr.assemble, 5 > 4), 'text that is not a string raises')
+	check(not pcall(mr.assemble, 'nop', nil, 5), 'values that are not a table raise')
+
+	local seed = 7
+	local function random(count)
+		seed = (seed * 75 + 74) % 65537
+		return seed % count + 1
+	end
+	local PIECES = {
+		'[',
+		']',
+		'{',
+		'}',
+		':',
+		',',
+		'+',
+		'-',
+		'*',
+		';',
+		'.',
+		'0x',
+		'9',
+		'a',
+		'Z',
+		' ',
+		'\n',
+		'\t',
+		'\0',
+		'\255',
+		'rax',
+		'ptr',
+		'dword',
+		'1.5',
+		'{x:8}',
+		'jmp',
+		'e',
+	}
+	local function mutate(text)
+		local kind, at = random(6), random(#text)
+		if kind == 1 then return text:sub(1, at - 1) .. text:sub(at + 1) end
+		if kind == 2 then return text:sub(1, at - 1) .. PIECES[random(#PIECES)] .. text:sub(at) end
+		if kind == 3 then return text:sub(1, at - 1) .. PIECES[random(#PIECES)] .. text:sub(at + 1) end
+		if kind == 4 then return text:sub(1, at) end
+		if kind == 5 then return text:sub(at) .. text:sub(1, at - 1) end
+		return text .. text:sub(at)
+	end
+	local decode_cell = mr.alloc(8192)
+	local cell_low = tonumber(mr.tostring(decode_cell):match('(%x%x%x%x)$'), 16)
+	local function code_starts(listing)
+		local starts = {}
+		for line in listing:gmatch('[^\n]+') do
+			if contains(line, ' jump back') then break end
+			starts[#starts + 1] = tonumber(line:match('^  %+(%x+) '), 16)
+		end
+		return starts
+	end
+	local function only_instructions(text)
+		local lower = text:lower()
+		return not (contains(lower, 'align') or lower:match('%f[%w]d[bwdq]%f[%W]'))
+	end
+	local function decodes_back(bytes, listing, code)
+		local starts = code_starts(listing)
+		starts[#starts + 1] = code
+		mr.write(decode_cell, 0, bytes:sub(1, code) .. '\144')
+		local index = 0
+		for line in mr.disassemble(decode_cell, #starts):gmatch('[^\n]+') do
+			index = index + 1
+			local low = tonumber(line:match('^0x%x-(%x%x%x%x)  '), 16)
+			if not low or (low - cell_low) % 65536 ~= starts[index] or contains(line, '(cannot be decoded)') then return false end
+		end
+		return index == #starts
+	end
+	local raised, odd, built, refused, decoded, undecoded = 0, 0, 0, 0, 0, 0
+	for round = 1, 2400 do
+		local row = CAVES[(round - 1) % #CAVES + 1]
+		local text = row[2]
+		for _ = 1, random(3) do
+			text = mutate(text)
+		end
+		local ok, bytes, why, _, code = pcall(mr.assemble, text, nil, select(3, fill(row[3])))
+		if not ok then
+			raised = raised + 1
+			print('  raised: ' .. tostring(bytes))
+		elseif bytes then
+			built = built + 1
+			if only_instructions(text) and decodes_back(bytes, why, code) then
+				decoded = decoded + 1
+			elseif only_instructions(text) then
+				undecoded = undecoded + 1
+				print(('  decodes differently: %q'):format(text))
+			end
+		elseif type(why) == 'string' and why:match('^asm:%d+:%d+: ') then
+			refused = refused + 1
+		else
+			odd = odd + 1
+			print('  odd: ' .. tostring(why))
+		end
+	end
+	print(('  fuzz: %d assembled, %d refused, %d decoded back'):format(built, refused, decoded))
+	check(raised == 0 and odd == 0 and refused > 1000, 'mutated cave texts either assemble or are refused with a line and column, never raise')
+	check(undecoded == 0 and decoded > 50, 'every assembled text without data decodes back to the same instructions at the same offsets: ' .. decoded)
+elseif SCENARIO == 'asm_cave' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local function contains(text, part)
+		return type(text) == 'string' and string.find(text, part, 1, true) ~= nil
+	end
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local cell = mr.alloc(8)
+	local function raw(pointer)
+		mr.write(cell, 0, pointer)
+		return mr.read(cell, 0, 8)
+	end
+	local function hex_of(at, size)
+		local bytes, parts = mr.read_original(at, 0, size), {}
+		for i = 1, size do
+			parts[i] = string.format('%02X', bytes:byte(i))
+		end
+		return table.concat(parts, ' ')
+	end
+	local function unique(pattern)
+		local _, count = mr.find_pattern(pattern)
+		return count == 1
+	end
+	local echoed = {}
+	mr.set_log(function(message)
+		echoed[#echoed + 1] = message
+	end)
+	local function echo_has(part)
+		for _, line in ipairs(echoed) do
+			if contains(line, part) then return true end
+		end
+		return false
+	end
+	local function blocks()
+		return test_virtual_blocks(mr.hop_slots)
+	end
+	local PAGE_READWRITE, PAGE_EXECUTE_READ = 4, 0x20
+	local p = mr.patcher('asm_mod')
+
+	local call_site = address('asm_call_here')
+	local hits = mr.pointer(cave_count_address())
+	local double_spec = { asm = 'inc dword ptr [rip + {hits}]\nmov ecx, eax\ncall {double}', values = { hits = hits, double = address('asm_double') } }
+	local before = blocks()
+	local hits_before = cave_count()
+	local cave, why = p:cave('double_call', call_site, double_spec)
+	check(cave ~= nil, 'a table cave with asm installs: ' .. tostring(why))
+	check(blocks() == before, 'and takes a page of the cave memory reserved at load')
+	check(
+		mr.tonumber(mr.call(address('asm_call'), 'int32(int32)', 5)) == 1010,
+		'the cave calls the host helper through call {double} and the original code runs after it'
+	)
+	check(cave_count() == hits_before + 1, 'inc dword ptr [rip + {hits}] reached the host counter')
+	local info = mr.hook_info(call_site)
+	check(info and info.kind == 'cave' and mr.eq(info.cave, cave), 'hook_info names the cave')
+	check(test_allocated_as(raw(cave)) == PAGE_READWRITE, 'the cave memory was allocated read-write, not executable')
+	check(test_protection(raw(cave)) == PAGE_EXECUTE_READ, 'and is execute-read once installed')
+	check(
+		contains(info.listing, 'cave double_call at 0x') and contains(info.listing, 'call 0x') and contains(info.listing, 'jump back: original 05 E8 03 00 00'),
+		'hook_info has the listing'
+	)
+	check(echo_has('[asm_mod] cave double_call at 0x'), 'the install echoes the listing through set_log')
+	local again = p:cave('double_call', call_site, double_spec)
+	check(again ~= nil and mr.eq(again, cave) and blocks() == before, 'the same cave again is a no-op')
+	local other, other_why = p:cave('double_call', call_site, { asm = 'nop' })
+	check(other == nil and other_why == 'the name is already used for a different change', 'other text under the same name is refused: ' .. tostring(other_why))
+	local aligned_site = address('asm_site_k_here')
+	local aligned_cave = p:cave('aligned', aligned_site, { asm = 'add eax, 1\nalign 16\nadd eax, 2', echo = false })
+	check(aligned_cave ~= nil and not contains(mr.read(aligned_cave, 0, 16), '\204'), 'an aligned cave pads with nops, not int3')
+	check(mr.tonumber(mr.call(address('asm_site_k'), 'int32(int32)', 1)) == 14 + 3 + 12001, 'and runs through the padding into the next instruction')
+
+	local seal_site = address('asm_site_i_here')
+	local hops_before = mr.hop_slots()
+	test_fail_memory('private_heap', mr.hop_slots)
+	local sealed, sealed_why = p:cave('double_seal', seal_site, { asm = 'add eax, 1', echo = false })
+	local _, _, refusals_left = test_window_counts()
+	check(refusals_left == 0, 'the thread list MinHook allocates while it enables the hook was refused')
+	check(sealed ~= nil and mr.hop_slots() == hops_before - 1, 'the cave then takes the far path, sealed a second time: ' .. tostring(sealed_why))
+	check(test_protection(raw(sealed)) == PAGE_EXECUTE_READ, 'and stays execute-read')
+	check(mr.tonumber(mr.call(address('asm_site_i'), 'int32(int32)', 4)) == 15 + 1 + 10001, 'and jumps back into the far trampoline')
+
+	local quiet_count = #echoed
+	local quiet = p:cave('quiet_cave', address('asm_site_d_here'), { asm = 'nop', echo = false })
+	check(quiet ~= nil and #echoed == quiet_count, 'echo = false installs without the echo')
+
+	local float_site = address('asm_float_here')
+	local AP_DATA = [[
+cvtsi2ss xmm1, ebx
+mulss xmm1, xmm6
+minss xmm1, dword ptr [rip + hundred]
+mulss xmm1, dword ptr [rip + percent]
+movss xmm2, dword ptr [rip + one]
+subss xmm2, xmm1
+mulss xmm2, dword ptr [rsp+0x44]
+movss dword ptr [rsp+0x44], xmm2
+.data
+hundred: dd 100.0
+percent: dd 0.01
+one: dd 1.0
+]]
+	local float_target = address('asm_float')
+	local function ap(armour, low, damage)
+		return mr.tonumber(mr.call(float_target, 'float(int32, float, float)', armour, low, damage))
+	end
+	check(ap(50, 0.5, 200) == 200, 'the host function returns the damage before the cave')
+	local data_cave = p:cave('ap_data', float_site, { asm = AP_DATA, source = 'script/test/ap.asm' })
+	check(data_cave ~= nil, 'the AP armour cave with .data constants installs')
+	check(
+		math.abs(ap(50, 0.5, 200) - 150) < 0.01 and math.abs(ap(0, 0.5, 200) - 200) < 0.01 and math.abs(ap(400, 0.5, 200)) < 0.01,
+		'and reduces the damage by the armour roll: ' .. ap(50, 0.5, 200)
+	)
+	local _, _, _, ap_code = mr.assemble(AP_DATA, data_cave)
+	check(ap_code == 48 and mr.read(data_cave, ap_code + 14, 4) == '\0\0\200\66', 'the constants sit after the jump back')
+
+	local near_site = address('asm_site_c_here')
+	before = blocks()
+	check(test_force_far_hooks(true, mr.hop_slots), 'near memory is made unreachable')
+	local far, far_why = p:cave('far_try', near_site, { asm = 'nop' })
+	test_force_far_hooks(false, mr.hop_slots)
+	check(far == nil and far_why == "no free memory near the game's code for the cave", 'without near memory the asm cave is refused: ' .. tostring(far_why))
+	check(mr.hook_info(near_site) == nil and blocks() == before, 'and nothing is installed or left allocated')
+
+	local site_bytes = mr.read(near_site, 0, 5)
+	local function listed(name)
+		for _, row in ipairs(mr.patch_list('asm_mod')) do
+			if row.name == name then return true end
+		end
+		return false
+	end
+	local function untouched(what)
+		check(
+			mr.hook_info(near_site) == nil and mr.read(near_site, 0, 5) == site_bytes and blocks() == before,
+			what .. ' leaves the code, the hooks and the memory as they were'
+		)
+	end
+	local bad, bad_why = p:cave('bad_text', near_site, { asm = 'nop\nmulls xmm0, xmm1', source = 'script/test/bad.asm' })
+	check(
+		bad == nil and bad_why == "script/test/bad.asm:2:1: unknown mnemonic 'mulls'",
+		'a bad text is refused with its source, line and column: ' .. tostring(bad_why)
+	)
+	untouched('a bad text')
+	local mismatch, mismatch_why = p:cave('mismatch', near_site, { asm = 'nop\nnop', bytes = '\144\204' })
+	check(mismatch == nil and mismatch_why == 'asm and bytes differ at +0x1', 'asm and bytes that differ are refused: ' .. tostring(mismatch_why))
+	untouched('a mismatch')
+	local raising = setmetatable({ asm = 'nop' }, {
+		__index = function(_, key)
+			if key == 'values' then error('values boom') end
+		end,
+	})
+	local raised, raised_why = p:cave('raising', near_site, raising)
+	check(raised == nil and contains(raised_why, 'values boom'), 'a cave table that raises while it is read is refused: ' .. tostring(raised_why))
+	untouched('a table that raises after the memory was taken')
+	local thrown = setmetatable({ asm = 'nop' }, {
+		__index = function(_, key)
+			if key == 'source' then error({}) end
+		end,
+	})
+	local _, thrown_why = p:cave('thrown', near_site, thrown)
+	check(thrown_why == 'the cave table raised an error', 'an error that is not a string gets a plain text: ' .. tostring(thrown_why))
+	untouched('an error object')
+	local done, batch_why = p:batch({ { 'cave', 'meta_step', near_site, raising } })
+	check(
+		done == nil and contains(batch_why, 'meta_step: ') and contains(batch_why, 'values boom'),
+		'the same table in a batch is refused: ' .. tostring(batch_why)
+	)
+	untouched('that batch')
+
+	local prologue = address('prologue_target')
+	local prologue_bytes = mr.read(prologue, 5, 4)
+	done, batch_why = p:batch({
+		{ 'patch', 'batch_patch', mr.add(prologue, 5), '\1\0\0\0', '\2\0\0\0' },
+		{ 'cave', 'batch_bad', near_site, { asm = 'jmp nowhere' } },
+	})
+	check(done == nil and batch_why == "batch_bad: asm:1:5: label 'nowhere' is not defined", 'a batch with a bad asm cave is refused: ' .. tostring(batch_why))
+	check(mr.read(prologue, 5, 4) == prologue_bytes and not listed('batch_patch') and not listed('batch_bad'), 'and writes or registers no step')
+	untouched('the refused batch')
+	local prepared_site = address('asm_site_f_here')
+	local thrown_ok = pcall(p.batch, p, { { 'cave', 'prepared_first', prepared_site, { asm = 'nop' } }, { 'patch', 'raises', mr.add(prologue, 5), {}, {} } })
+	check(not thrown_ok, 'a batch whose second step raises raises')
+	check(mr.hook_info(prepared_site) == nil and blocks() == before, 'and frees the cave it prepared')
+	local fresh = p:cave('prepared_first', prepared_site, { asm = 'nop\nnop\nnop' })
+	check(fresh ~= nil and mr.read(fresh, 0, 3) == '\144\144\144', 'a later cave at that address gets its own code, not the one the raised batch prepared')
+	done = p:batch({
+		{ 'patch', 'batch_patch', mr.add(prologue, 5), '\1\0\0\0', '\2\0\0\0' },
+		{ 'cave', 'batch_good', address('asm_site_e_here'), { asm = 'add eax, 1' } },
+	})
+	check(done == true and mr.tonumber(mr.call(address('asm_site_e'), 'int32(int32)', 1)) == 6010, 'a batch of a patch and an asm cave installs both')
+	check(mr.read(prologue, 5, 4) == '\2\0\0\0' and listed('batch_patch') and listed('batch_good'), 'and the patch is written and both are listed')
+	p:remove('batch_patch')
+
+	local late_inner = nil
+	local late_target = setmetatable({ at = 3 }, {
+		__index = function(_, key)
+			if key == 'pattern' then
+				late_inner = late_inner or { p:patch('reenter_patch', mr.add(prologue, 5), '\1\0\0\0', '\2\0\0\0') }
+				return hex_of(address('asm_site_c'), 16)
+			end
+		end,
+	})
+	done, batch_why = p:batch({
+		{ 'cave', 'double_call', call_site, double_spec },
+		{ 'patch', 'late_patch', late_target, '\255\255\255\255', '\255\255\255\255' },
+	})
+	check(done == nil and batch_why == 'late_patch: unexpected bytes', 'a batch of a repeat cave and a patch is refused on the patch: ' .. tostring(batch_why))
+	check(
+		late_inner ~= nil and late_inner[1] == nil and late_inner[2] == 'a batch is already running',
+		'a repeat cave step puts the batch flag back, so the next step still sees a batch running: ' .. tostring(late_inner and late_inner[2])
+	)
+	p:remove('reenter_patch')
+	check(mr.read(prologue, 5, 4) == prologue_bytes and not listed('late_patch') and not listed('reenter_patch'), 'and nothing was written or listed')
+
+	local seed = 11
+	local function random(count)
+		seed = (seed * 75 + 74) % 65537
+		return seed % count + 1
+	end
+	local PIECES = { '[', ']', '{', '}', ':', ',', '+', '-', '*', ';', '.', '0x', '9', ' ', '\n', 'eax', 'ptr', 'jmp', 'ret', '{v:4}' }
+	local BASE = 'add eax, 7\ncmp eax, 0x40\njz skip\nimul eax, eax, 3\nskip:\nlea eax, [rax + rax*2 + 1]'
+	local WRONG = '\255\255\255\255'
+	local assembled, refused = 0, 0
+	before = blocks()
+	for _ = 1, 300 do
+		local at = random(#BASE)
+		local text = BASE:sub(1, at - 1) .. PIECES[random(#PIECES)] .. BASE:sub(at + 1)
+		local ok, made, fuzz_why =
+			pcall(p.batch, p, { { 'cave', 'fuzz', near_site, { asm = text, echo = false } }, { 'patch', 'fuzz_stop', mr.add(prologue, 5), WRONG, WRONG } })
+		if ok and made == nil and fuzz_why == 'fuzz_stop: unexpected bytes' then
+			assembled = assembled + 1
+		elseif ok and made == nil and type(fuzz_why) == 'string' and fuzz_why:match('^fuzz: asm:%d+:%d+: ') then
+			refused = refused + 1
+		else
+			check(false, ('a mutated cave gave %s, %s: %q'):format(tostring(made), tostring(fuzz_why), text))
+			break
+		end
+		if mr.hook_info(near_site) ~= nil or mr.read(near_site, 0, 5) ~= site_bytes or blocks() ~= before or listed('fuzz') then
+			check(false, 'a mutated cave left something behind: ' .. text)
+			break
+		end
+	end
+	print(('  install fuzz: %d assembled then refused by the next step, %d refused at assembly'):format(assembled, refused))
+	check(assembled > 0 and refused > 0, 'mutated texts in a batch were both assembled and refused, and none wrote or kept anything')
+
+	local nested = nil
+	local h_value = mr.add(address('asm_site_h'), 4)
+	mr.set_log(function(message)
+		echoed[#echoed + 1] = message
+		if nested == nil and contains(message, 'cave echo_batch at') then
+			nested = { p:batch({ { 'patch', 'from_sink', h_value, '\41\35\0\0', '\42\35\0\0' } }) }
+		end
+	end)
+	done, batch_why = p:batch({
+		{ 'cave', 'echo_batch', address('asm_site_g_here'), { asm = 'add eax, 1' } },
+		{ 'patch', 'echo_patch', mr.add(prologue, 5), '\1\0\0\0', '\2\0\0\0' },
+	})
+	check(
+		done == true and nested and nested[1] == true,
+		'a log sink can run a batch on the echo of a batch cave: ' .. tostring(batch_why) .. ', ' .. tostring(nested and nested[2])
+	)
+	check(
+		mr.read(prologue, 5, 4) == '\2\0\0\0' and listed('echo_patch') and listed('from_sink') and listed('echo_batch'),
+		'the outer batch wrote its patch before the echo, and both batches are listed'
+	)
+	check(
+		mr.tonumber(mr.call(address('asm_site_g'), 'int32(int32)', 0)) == 9 + 1 + 8001
+			and mr.tonumber(mr.call(address('asm_site_h'), 'int32(int32)', 0)) == 10 + 9002,
+		'the cave and the nested patch both run'
+	)
+	p:remove('echo_patch')
+	p:remove('from_sink')
+
+	local flush_target, FLUSH_SIGNATURE = address('hook_target'), 'int32(int32, int32)'
+	local inner_done, in_sink, inner_lines, early_lines = nil, false, 0, 0
+	mr.set_log(function(message)
+		echoed[#echoed + 1] = message
+		if contains(message, 'cave inner_echo at') then
+			inner_lines = inner_lines + 1
+			early_lines = early_lines + (in_sink and 1 or 0)
+		end
+		if inner_done == nil and contains(message, 'flush trigger') then
+			in_sink = true
+			inner_done = p:batch({ { 'cave', 'inner_echo', address('asm_site_j_here'), { asm = 'add eax, 1' } } })
+			in_sink = false
+		end
+	end)
+	p:postfix(flush_target, FLUSH_SIGNATURE, 'flush_trigger', function()
+		error('flush trigger')
+	end)
+	mr.call(flush_target, FLUSH_SIGNATURE, 1, 2)
+	done, batch_why = p:batch({ { 'patch', 'outer_stop', mr.add(prologue, 5), WRONG, WRONG } })
+	check(inner_done == true, 'a batch run by the log sink while an outer batch flushes the link log installs its cave')
+	check(done == nil and batch_why == 'outer_stop: unexpected bytes', 'and the outer batch is refused on its own step: ' .. tostring(batch_why))
+	check(
+		inner_lines == 1 and early_lines == 0,
+		('the inner batch hands its echo to the outer one, which sends it when it ends: %d sent, %d early'):format(inner_lines, early_lines)
+	)
+	check(mr.tonumber(mr.call(address('asm_site_j'), 'int32(int32)', 0)) == 12 + 1 + 11001, 'and the inner cave runs')
+	p:remove('flush_trigger')
+	mr.set_log(function(message)
+		echoed[#echoed + 1] = message
+	end)
+
+	local p2 = mr.patcher('asm_sites')
+	local site_fn, site_here = address('asm_site'), address('asm_site_here')
+	local b_fn, b_here = address('asm_site_b'), address('asm_site_b_here')
+	local c_fn = address('asm_site_c')
+	check(
+		mr.eq(mr.add(site_fn, 5), site_here) and mr.eq(mr.add(b_fn, 10), b_here) and mr.eq(mr.add(c_fn, 3), near_site),
+		'the host sites sit at the offsets the entries use'
+	)
+	check(unique(hex_of(site_fn, 24)) and unique(hex_of(b_fn, 24)) and unique(hex_of(c_fn, 16)), 'and their patterns are unique')
+	local lines = {}
+	local function said(part)
+		for _, line in ipairs(lines) do
+			if contains(line, part) then return true end
+		end
+		return false
+	end
+	local entries = {
+		{
+			name = 'inline_cave',
+			feature = 'f_inline',
+			kind = 'cave',
+			pattern = hex_of(site_fn, 24),
+			at = 5,
+			expect = hex_of(site_here, 5),
+			reads = { three = { at = 4, type = 'uint8' } },
+			asm = [[
+imul eax, eax, {three}
+add eax, {bonus:4}
+]],
+			bytes = '6B C0 03 05 {bonus:4}',
+		},
+		{
+			name = 'file_cave',
+			feature = 'f_file',
+			kind = 'cave',
+			pattern = hex_of(b_fn, 24),
+			at = 10,
+			expect = hex_of(b_here, 5),
+			reads = { seven = { at = 3, type = 'uint8' } },
+			asm_file = 'script/test/cave.asm',
+		},
+		{
+			name = 'mismatch_cave',
+			feature = 'f_mismatch',
+			kind = 'cave',
+			pattern = hex_of(c_fn, 16),
+			at = 3,
+			expect = hex_of(near_site, 5),
+			asm = 'nop\nnop',
+			bytes = '90 CC',
+		},
+		{ name = 'lost_file', feature = 'f_lost', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm_file = 'script/test/none.asm' },
+		{ name = 'ui_file', feature = 'f_ui_file', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm_file = 'ui/test/cave.asm' },
+		{ name = 'text_file', feature = 'f_text_file', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm_file = 'script/test/cave.txt' },
+		{ name = 'up_file', feature = 'f_up_file', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm_file = 'script/../ui/cave.asm' },
+		{ name = 'tail_file', feature = 'f_tail_file', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm_file = 'script/test/cave.asm.txt' },
+		{ name = 'dots_file', feature = 'f_dots_file', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm_file = 'script/test/cave.asm../../ui/x' },
+		{ name = 'both_texts', feature = 'f_both', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm = 'nop', asm_file = 'script/test/cave.asm' },
+		{ name = 'not_text', feature = 'f_not_text', kind = 'cave', pattern = hex_of(c_fn, 16), at = 3, asm = 5 },
+	}
+	local native = p2:sites(entries, function(line)
+		lines[#lines + 1] = line
+	end)
+	check(mr.supports.cave_asm == true, 'supports.cave_asm is set')
+	check(
+		native.found('inline_cave') and native.found('file_cave') and native.found('mismatch_cave'),
+		'asm, asm_file and asm with bytes entries are found: ' .. tostring(native.why('file_cave'))
+	)
+	check(
+		not native.found('lost_file') and native.why('lost_file') == 'asm file not found: script/test/none.asm',
+		'a missing asm file turns its entry off: ' .. tostring(native.why('lost_file'))
+	)
+	for _, name in ipairs({ 'ui_file', 'text_file', 'up_file', 'tail_file', 'dots_file' }) do
+		check(
+			not native.found(name) and native.why(name) == 'asm_file must be a script/<mod>/<name>.asm path',
+			'an asm_file outside script/**.asm is refused before it is read: ' .. tostring(native.why(name))
+		)
+	end
+	native.log_missing()
+	check(said('both_texts not found (bad entry: asm and asm_file both given)'), 'asm and asm_file together are a bad entry')
+	check(said('not_text not found (bad entry: asm, asm_file and bytes must be strings)'), 'asm that is not a string is a bad entry')
+	check(native.install('inline_cave', { bonus = 10 }) == true, 'an asm entry with matching bytes installs')
+	check(mr.tonumber(mr.call(site_fn, 'int32(int32)', 2)) == 2 * 9 + 2011, 'and runs: x*3, then *3 from the read, +10, +2001')
+	check(native.cave_value('inline_cave', 'bonus') == 10, 'cave_value reads the slot back')
+	check(said('cave inline_cave at 0x') and said('imul eax, eax, 0x3'), 'the site log has the echo')
+	check(contains(native.listing('inline_cave'), 'cave inline_cave at 0x'), 'listing gives the echo text')
+	local echo_lines = #lines
+	check(native.install('inline_cave', { bonus = 10 }) == true and #lines == echo_lines, 'installing again is a no-op without a second echo')
+	check(native.install('file_cave', { bonus = 20 }) == true, 'an asm_file entry installs: ' .. tostring(native.why('file_cave')))
+	check(mr.tonumber(mr.call(b_fn, 'int32(int32)', 2)) == 2 * 49 + 3021, 'and runs the file text: x*7*7, +20, +3001')
+	check(native.cave_value('file_cave', 'bonus') == 20 and native.cave_value('file_cave', 'seven') == nil, 'cave_value reads slots, not plain values')
+	local ok, mismatch_reason = native.install('mismatch_cave')
+	check(
+		ok == false and contains(mismatch_reason, 'asm and bytes differ at +0x1'),
+		'asm and bytes that differ refuse the entry: ' .. tostring(mismatch_reason)
+	)
+	check(mr.hook_info(near_site) == nil, 'and install nothing')
+	local again_native = p2:sites(entries, function() end)
+	check(
+		again_native.cave_value('inline_cave', 'bonus') == 10 and again_native.cave_value('file_cave', 'bonus') == 20,
+		'a second object recognises both caves as ours'
+	)
+	check(again_native.install('file_cave', { bonus = 20 }) == true, 'and installing through it changes nothing')
+	local interrupted_object = p2:sites(entries, function() end)
+	local raised = false
+	debug.sethook(function()
+		if not raised then
+			raised = true
+			error('the chunk ran longer than its budget')
+		end
+	end, '', 100)
+	local interrupted = interrupted_object.cave_value('inline_cave', 'bonus')
+	debug.sethook()
+	check(raised and interrupted == nil, 'an error raised by a debug hook inside cave_value answers nil, as the budget hook did in the wave (F2)')
+	check(interrupted_object.cave_value('inline_cave', 'bonus') == 10, 'and the next call on the same object reads the value')
+	local plain_assemble, assembled_count = mr.assemble, 0
+	mr.assemble = function(...)
+		assembled_count = assembled_count + 1
+		return plain_assemble(...)
+	end
+	local third = p2:sites(entries, function() end)
+	local first_count = assembled_count
+	check(first_count == 2, 'a new object assembles each installed asm cave once to recognise it: ' .. first_count)
+	check(
+		third.cave_value('inline_cave', 'bonus') == 10 and third.cave_value('inline_cave', 'bonus') == 10 and assembled_count == first_count,
+		'cave_value then compares bytes without assembling again'
+	)
+	local inline_code = mr.hook_info(site_here).cave
+	local imul_byte = mr.read(inline_code, 2, 1)
+	test_protect(raw(inline_code), 4096, 0x40)
+	mr.write(inline_code, 2, '\4')
+	check(third.cave_value('inline_cave', 'bonus') == nil, 'a cave whose bytes changed is no longer recognised as ours')
+	check(third.cave_value('inline_cave', 'bonus') == nil and assembled_count == first_count, 'and asking again does not assemble again')
+	mr.write(inline_code, 2, imul_byte)
+	test_protect(raw(inline_code), 4096, PAGE_EXECUTE_READ)
+	check(third.cave_value('inline_cave', 'bonus') == 10 and assembled_count == first_count, 'the original bytes are ours again')
+	mr.assemble = plain_assemble
+
+	local BUSY = 'a batch is already running'
+	local inner_site = address('asm_site_h_here')
+	local frees_before = test_double_frees(mr.hop_slots)
+	local prologue_pattern = hex_of(prologue, 9)
+	check(unique(prologue_pattern), 'the prologue pattern is unique')
+
+	local sink_results = nil
+	local sink_spec = { asm = 'nop', echo = false }
+	mr.set_log(function(message)
+		echoed[#echoed + 1] = message
+		if sink_results == nil and contains(message, 'sink trigger') then
+			sink_results = {
+				{ p:cave('sink_cave', inner_site, sink_spec) },
+				{ p:batch({ { 'cave', 'sink_batch', inner_site, sink_spec } }) },
+				{ p:patch('sink_patch', mr.add(prologue, 5), '\1\0\0\0', '\3\0\0\0') },
+				{ p:postfix(flush_target, FLUSH_SIGNATURE, 'sink_link', function() end) },
+				{ p:set('sink_set', nil, 4, 3, 0, 9) },
+				{ p:frame('sink_frame', nil, 0x100) },
+				{ p:relocate('sink_relocate', { { nil, '\1', '\3' } }) },
+				{ p:site('sink_site', nil, function() end) },
+				{ p:row('sink_row', nil, nil, 'sink_key') },
+				{ p:remove('sink_trigger') },
+				{ p:remove_all() },
+				{ select(2, pcall(p.relocate, p, 'sink_relocate_arg', 5)) },
+			}
+		end
+	end)
+	p:postfix(flush_target, FLUSH_SIGNATURE, 'sink_trigger', function()
+		error('sink trigger')
+	end)
+	local flushing_target = setmetatable({}, {
+		__index = function(_, key)
+			if key == 'pattern' then
+				mr.call(flush_target, FLUSH_SIGNATURE, 1, 2)
+				mr.flush_log()
+				return prologue_pattern
+			end
+			if key == 'at' then return 5 end
+		end,
+	})
+	done, batch_why = p:batch({ { 'patch', 'flushing_patch', flushing_target, '\1\0\0\0', '\2\0\0\0' } })
+	check(sink_results ~= nil, 'the log sink ran while a batch read its target table')
+	for i, call in ipairs({
+		'p:cave',
+		'p:batch',
+		'p:patch',
+		'p:postfix',
+		'p:set',
+		'p:frame',
+		'p:relocate',
+		'p:site',
+		'p:row',
+		'p:remove',
+		'p:remove_all',
+		'p:relocate with a number',
+	}) do
+		local result = sink_results and sink_results[i] or {}
+		check(result[1] == nil and result[2] == BUSY, call .. ' from the sink during a batch is refused: ' .. tostring(result[2]))
+	end
+	check(done == true and mr.read(prologue, 5, 4) == '\2\0\0\0', 'the batch writes its own patch: ' .. tostring(batch_why))
+	check(
+		mr.hook_info(inner_site) == nil and not listed('sink_cave') and not listed('sink_batch') and not listed('sink_patch') and not listed('sink_link'),
+		'and nothing the sink asked for was made'
+	)
+	p:remove('flushing_patch')
+	p:remove('sink_trigger')
+	mr.set_log(function(message)
+		echoed[#echoed + 1] = message
+	end)
+
+	local inner_spec = { asm = 'add eax, 1', echo = false }
+	local blocks_before = blocks()
+	local inner = nil
+	local function nested_spec(after_inner)
+		return setmetatable({ echo = false }, {
+			__index = function(_, key)
+				if key == 'asm' then
+					inner = { p:batch({ { 'cave', 'inner_cave', inner_site, inner_spec } }) }
+					return after_inner()
+				end
+			end,
+		})
+	end
+	done, batch_why = p:batch({
+		{ 'cave', 'outer_cave', near_site, nested_spec(function()
+			error('outer boom')
+		end) },
+	})
+	check(
+		inner and inner[1] == nil and inner[2] == BUSY,
+		'a batch started from a cave table that a running batch reads is refused: ' .. tostring(inner and inner[2])
+	)
+	check(
+		done == nil and contains(batch_why, 'outer_cave: ') and contains(batch_why, 'outer boom'),
+		'the table raising after that refusal refuses the outer batch on its own step: ' .. tostring(batch_why)
+	)
+	check(test_double_frees(mr.hop_slots) == frees_before, 'and no cave listing is freed twice')
+	check(
+		mr.hook_info(near_site) == nil
+			and mr.hook_info(inner_site) == nil
+			and blocks() == blocks_before
+			and not listed('outer_cave')
+			and not listed('inner_cave'),
+		'and nothing is installed, listed or left allocated'
+	)
+	inner = nil
+	done, batch_why = p:batch({
+		{ 'cave', 'outer_cave', near_site, nested_spec(function()
+			return 'add eax, 1'
+		end) },
+		{ 'patch', 'outer_patch', mr.add(prologue, 5), '\1\0\0\0', '\2\0\0\0' },
+	})
+	check(inner and inner[1] == nil and inner[2] == BUSY, 'the same refusal when the table does not raise: ' .. tostring(inner and inner[2]))
+	check(done == true, 'the outer batch goes on with its own plan: ' .. tostring(batch_why))
+	check(
+		mr.read(prologue, 5, 4) == '\2\0\0\0'
+			and listed('outer_cave')
+			and listed('outer_patch')
+			and not listed('inner_cave')
+			and mr.hook_info(inner_site) == nil,
+		'and writes and lists its own steps only'
+	)
+	check(mr.tonumber(mr.call(address('asm_site_c'), 'int32(int32)', 0)) == 5 + 1 + 4001, 'and its cave runs')
+	check(test_double_frees(mr.hop_slots) == frees_before, 'and no cave listing is freed twice')
+	p:remove('outer_patch')
+
+	local old_byte = mr.read(inner_site, 2, 1)
+	local new_byte = old_byte == '\0' and '\1' or '\0'
+	local reentered = {}
+	local function reentering_spec(change)
+		return setmetatable({ echo = false }, {
+			__index = function(_, key)
+				if key == 'asm' then
+					reentered[#reentered + 1] = { change() }
+					return 'nop'
+				end
+			end,
+		})
+	end
+	local function patch_inside()
+		return p:patch('reenter_patch', mr.add(inner_site, 2), old_byte, new_byte)
+	end
+	local function batch_inside()
+		reentered.batch = { p:batch({ { 'patch', 'reenter_patch', mr.add(inner_site, 2), old_byte, new_byte } }) }
+		return patch_inside()
+	end
+	check(p:cave('reenter_cave', inner_site, reentering_spec(batch_inside)) ~= nil, 'a single cave whose table changes something installs its own cave')
+	check(
+		reentered[1] and reentered[1][1] == nil and reentered[1][2] == BUSY,
+		'a patch from the cave table is refused: ' .. tostring(reentered[1] and reentered[1][2])
+	)
+	check(
+		reentered.batch and reentered.batch[1] == nil and reentered.batch[2] == BUSY,
+		'a batch from the cave table is refused: ' .. tostring(reentered.batch and reentered.batch[2])
+	)
+	check(listed('reenter_cave') and not listed('reenter_patch'), 'and the patch is not listed next to the cave')
+	check(p:cave(
+		'reenter_cave',
+		inner_site,
+		reentering_spec(function()
+			return p:remove('reenter_cave')
+		end)
+	) ~= nil, 'the same cave again compares and answers its start')
+	check(
+		reentered[2] and reentered[2][2] == BUSY and listed('reenter_cave'),
+		'a remove from the table it compares is refused: ' .. tostring(reentered[2] and reentered[2][2])
+	)
+	local reading_site = setmetatable({}, {
+		__index = function(_, key)
+			if key == 'pattern' then
+				reentered[3] = { patch_inside() }
+				return prologue_pattern
+			end
+			if key == 'at' then return 5 end
+		end,
+	})
+	local moved, moved_why = p:relocate('reenter_relocate', { { reading_site, '\9\9\9\9', '\4\0\0\0' } })
+	check(moved == nil and not listed('reenter_relocate'), 'a relocation with wrong bytes is refused: ' .. tostring(moved_why))
+	check(
+		reentered[3] and reentered[3][2] == BUSY and not listed('reenter_patch'),
+		'a patch from a relocation site table is refused: ' .. tostring(reentered[3] and reentered[3][2])
+	)
+elseif SCENARIO == 'cave_near' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local function address(name)
+		return mr.pointer(test_function(name))
+	end
+	local cell = mr.alloc(8)
+	local function raw(pointer)
+		mr.write(cell, 0, pointer)
+		return mr.read(cell, 0, 8)
+	end
+	local function blocks()
+		return test_virtual_blocks(mr.hop_slots)
+	end
+	local function queries()
+		return test_plus_queries(mr.hop_slots)
+	end
+	local function granule(pointer)
+		return mr.tostring(pointer):sub(1, -5)
+	end
+	local function page(pointer)
+		return mr.tostring(pointer):sub(1, -4)
+	end
+	local PAGE_READWRITE, PAGE_EXECUTE_READ = 4, 0x20
+	local NO_MEMORY = "no free memory near the game's code for the cave"
+	local CAVE = { asm = 'add eax, 1', echo = false }
+	local first = address('many_site_0')
+	local function site(i)
+		return mr.add(first, 16 * i + 3)
+	end
+	local function run(i)
+		return mr.tonumber(mr.call(mr.add(first, 16 * i), 'int32(int32)', 0))
+	end
+	local p = mr.patcher('near_mod')
+	local function cave_pages()
+		local row = mr.capacity().cave_pages or {}
+		return ('%s/%s/%s'):format(tostring(row.used), tostring(row.room), tostring(row.limit))
+	end
+	check(cave_pages() == '0/64/1024', 'capacity shows 64 cave pages reserved at load, none used: ' .. cave_pages())
+	local fill_site = address('asm_site_c_here')
+	local filled = test_fill_near(raw(fill_site))
+	check(filled > 50000, ('the near range is filled after load: %d granules reserved'):format(filled))
+	local before = blocks()
+	queries()
+
+	local caves, made, ran, reuse_queries = {}, 0, 0, 0
+	for i = 0, 62 do
+		local queries_before = queries()
+		caves[i] = p:cave('many_' .. i, site(i), CAVE)
+		if i == 1 then reuse_queries = queries() - queries_before end
+		if caves[i] then made = made + 1 end
+		if run(i) == i + 1 + 1000 + 1 then ran = ran + 1 end
+	end
+	print(('  queries of a cave in a block with room: %d'):format(reuse_queries))
+	check(made == 63 and ran == 63, ('63 asm caves near one site install and run: %d made, %d ran'):format(made, ran))
+	check(blocks() == before, ('from the blocks reserved at load, nothing reserved now: %d'):format(blocks() - before))
+
+	local prologue = address('prologue_target')
+	local WRONG = '\255\255\255\255'
+	local seen = nil
+	local watching = setmetatable({ echo = false }, {
+		__index = function(_, key)
+			if key ~= 'asm' then return nil end
+			local start, protection = test_newest_allocation()
+			local live = true
+			for i = 48, 62 do
+				live = live and test_protection(raw(caves[i])) == PAGE_EXECUTE_READ and run(i) == i + 1002
+			end
+			seen = { start = mr.pointer(start), allocated = protection, now = test_protection(start), live = live }
+			return 'add eax, 1'
+		end,
+	})
+	local done, batch_why = p:batch({ { 'cave', 'many_63', site(63), watching }, { 'patch', 'stop', mr.add(prologue, 5), WRONG, WRONG } })
+	check(done == nil and batch_why == 'stop: unexpected bytes', 'a batch that prepares a 64th cave is refused on its patch: ' .. tostring(batch_why))
+	check(
+		seen ~= nil and seen.allocated == PAGE_READWRITE and seen.now == PAGE_READWRITE,
+		'the prepared cave is committed read-write: ' .. tostring(seen and seen.allocated) .. ', ' .. tostring(seen and seen.now)
+	)
+	check(seen ~= nil and granule(seen.start) == granule(caves[48]), 'and shares its 64 KB block with caves that are already installed')
+	local own_page = true
+	for i = 0, 62 do
+		own_page = own_page and not (seen and page(seen.start) == page(caves[i]))
+	end
+	check(own_page, 'but has a page of its own')
+	check(seen ~= nil and seen.live, 'while it is read-write, the installed caves on its block stay execute-read and run')
+	check(seen ~= nil and test_protection(raw(seen.start)) == 0, 'the refused batch gives the page back')
+	local still = true
+	for i = 0, 62 do
+		still = still and test_protection(raw(caves[i])) == PAGE_EXECUTE_READ
+	end
+	check(still and blocks() == before, 'and every installed cave is execute-read, no block released or added')
+	local last = p:cave('many_63', site(63), CAVE)
+	check(last ~= nil and seen ~= nil and mr.eq(last, seen.start), 'the 64th cave then takes the page that was given back')
+	check(last ~= nil and test_protection(raw(last)) == PAGE_EXECUTE_READ and run(63) == 63 + 1002, 'is execute-read and runs')
+	caves[63] = last
+	local granules, pages, granule_count, page_count = {}, {}, 0, 0
+	for i = 0, 63 do
+		if caves[i] and not granules[granule(caves[i])] then
+			granules[granule(caves[i])] = true
+			granule_count = granule_count + 1
+		end
+		if caves[i] and not pages[page(caves[i])] then
+			pages[page(caves[i])] = true
+			page_count = page_count + 1
+		end
+	end
+	check(granule_count == 4 and page_count == 64 and blocks() == before, ('64 caves: %d blocks, %d pages'):format(granule_count, page_count))
+	check(cave_pages() == '64/64/1024', 'capacity shows all 64 reserved pages used: ' .. cave_pages())
+
+	local blocks_filled = blocks()
+	local walk_start = queries()
+	local started = mr.ticks()
+	local refused, refused_why = p:cave('after_fill', fill_site, CAVE)
+	local spent = mr.elapsed_us(started)
+	local walked = queries() - walk_start
+	print(('  near search with the range filled (%d granules reserved): %d queries, %.0f us'):format(filled, walked, spent))
+	check(refused == nil and refused_why == NO_MEMORY, 'with no free memory in reach the cave is refused: ' .. tostring(refused_why))
+	check(spent < 100000, ('and answers within 100 ms: %.0f us'):format(spent))
+	check(mr.hook_info(fill_site) == nil and blocks() == blocks_filled, 'nothing is installed or reserved')
+	walk_start = queries()
+	started = mr.ticks()
+	local again, again_why = p:cave('after_fill', fill_site, CAVE)
+	local again_spent = mr.elapsed_us(started)
+	local again_walked = queries() - walk_start
+	print(('  the same cave again: %d queries, %.0f us'):format(again_walked, again_spent))
+	check(again == nil and again_why == NO_MEMORY, 'a retry gets the same answer: ' .. tostring(again_why))
+	check(again_walked <= reuse_queries, ('without searching again: %d queries'):format(again_walked))
+	check(walked - again_walked <= 1024, ('the search stops after at most 1024 queries: %d'):format(walked - again_walked))
+	test_unfill_near()
+	walk_start = queries()
+	local later, later_why = p:cave('later', address('asm_site_f_here'), CAVE)
+	check(
+		later == nil and later_why == NO_MEMORY and queries() - walk_start <= reuse_queries,
+		'after the memory is free again a cave near the same code still answers at once for this session: ' .. tostring(later_why)
+	)
+	local all_run = true
+	for i = 0, 63 do
+		all_run = all_run and run(i) == i + 1002
+	end
+	check(all_run, 'the 64 caves still run')
+elseif SCENARIO == 'cave_near_image_size' then
+	local NEAR_REACH = 0x70000000
+	local old_size = test_image_size(NEAR_REACH)
+	run_mod(OURS)
+	test_image_size(old_size)
+	local mr = _G.memreader_plus
+	local first = mr.pointer(test_function('many_site_0'))
+	local first_text = mr.tostring(first)
+	local above, ran = 0, 0
+	for i = 0, 63 do
+		local cave = mr.patcher('image_mod'):cave('many_' .. i, mr.add(first, 16 * i + 3), { asm = 'add eax, 1', echo = false })
+		local text = cave and mr.tostring(cave) or ''
+		if #text == #first_text and text > first_text then above = above + 1 end
+		if mr.tonumber(mr.call(mr.add(first, 16 * i), 'int32(int32)', 0)) == i + 1002 then ran = ran + 1 end
+	end
+	local row = mr.capacity().cave_pages or {}
+	check(
+		row.used == 64 and row.room == 64,
+		('a game image as long as the reach still gets 4 blocks at load: %s/%s'):format(tostring(row.used), tostring(row.room))
+	)
+	check(above == 64, ('every block lies above the image start, in reach of its end: %d of 64 caves'):format(above))
+	check(ran == 64, ('and the caves run: %d of 64'):format(ran))
+elseif SCENARIO == 'cave_near_unreserved' then
+	local logged = collect_log()
+	local NOTE = "[memreader Plus] cave memory near the game's code: 0 of 4 blocks reserved at load, later asm caves search for more"
+	local function pages(mr)
+		local row = mr.capacity().cave_pages or {}
+		return ('%s/%s/%s'):format(tostring(row.used), tostring(row.room), tostring(row.limit))
+	end
+	if PASS == 1 then
+		local filled = test_fill_near(test_function('asm_site_c_here'))
+		check(filled > 50000, ('the near range is filled before Plus loads: %d granules reserved'):format(filled))
+		run_mod(OURS)
+		local mr = _G.memreader_plus
+		check(mr ~= nil and type(mr.plus_version) == 'string', 'Plus loads without cave memory near the game')
+		check(count_logged(logged, NOTE) == 1, 'and logs once that it reserved none')
+		check(mr ~= nil and pages(mr) == '0/0/1024', 'capacity shows no cave pages reserved: ' .. (mr and pages(mr) or '?'))
+		mr.set_log(function(message)
+			logged[#logged + 1] = message
+		end)
+		check(count_logged(logged, NOTE) == 1, 'a second log sink does not get the line again')
+		test_unfill_near()
+		local cave, why = mr.patcher('late_mod'):cave('late', mr.pointer(test_function('asm_site_c_here')), { asm = 'add eax, 1', echo = false })
+		check(cave ~= nil, 'once memory near the game is free an asm cave finds a block by the search: ' .. tostring(why))
+		check(pages(mr) == '1/16/1024', 'and reserves one block for it: ' .. pages(mr))
+		NEXT_PASS = failures == 0
+	else
+		run_mod(OURS)
+		local mr = _G.memreader_plus
+		check(mr ~= nil, 'Plus loads again in a new Lua state')
+		check(count_logged(logged, NOTE) == 0, 'without logging the line again')
+		check(mr ~= nil and string.sub(pages(mr), -8) == '/16/1024', 'and keeps the block of the session: ' .. (mr and pages(mr) or '?'))
+	end
 else
 	error('unknown scenario ' .. tostring(SCENARIO))
 end

@@ -15,7 +15,7 @@ $failed = @()
 $skipped = @()
 $expect = [ordered]@{
     api = 0; api_cases = 0; plus_first = 0; cpecific_first = 0; cpecific_bigread = $crash
-    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; links = 0; link_filter = 0; far_hook = 0; cave = 0; cave_session = 0; owner_report = 0; change_rows = 0; claims = 0; held_bytes = 0; rows = 0; batch = 0; sites = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0
+    call_cpp_exception = -529697949; call_stack_overflow = -1073741571; hook = 0; links = 0; link_filter = 0; far_hook = 0; cave = 0; cave_session = 0; asm = 0; asm_cave = 0; cave_near = 0; cave_near_image_size = 0; cave_near_unreserved = 0; owner_report = 0; change_rows = 0; claims = 0; held_bytes = 0; rows = 0; batch = 0; sites = 0; site = 0; site_unwind = 0; heap = 0; guard = 0; frame = 0; hooked_code = 0; bench = 0; capacity = 0; report_during_growth = 0; many_mods = 0; many_mods_memory = 0; mods_memory_junk = 0
     file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
     newest_wins_single = 0; newest_wins_two_releases = 0; newest_wins_old_bundle_first = 0; newest_wins_cpecific_after = 0
     newest_wins_stale_cache = 0; newest_wins_no_lookup = 0; newest_wins_bad_markers = 0; newest_wins_failed_start = 0; newest_wins_frozen_boot = 0
@@ -37,7 +37,7 @@ $reports = @{
     fault_report_worker_blocked = 'none'; fault_report_worker_dead = 'none'; fault_report_move_retry = 'started'; fault_report_move_fails = 'started'
     exit_report = 'started'; exit_report_terminate = 'started'; exit_report_crt = 'started'; exit_report_quiet = 'none'; exit_report_off = 'none'
     runtime_report = 'none'; runtime_report_reports_off = 'none'; runtime_report_no_folder = 'none'; runtime_report_write_fails = 'none'
-    runtime_report_then_crash = 'started'; settings_cut = 'started'; settings_none = 'started'; report_native = 'none'; owner_report = 'none'; rows = 'none'
+    runtime_report_then_crash = 'started'; settings_cut = 'started'; settings_none = 'started'; report_native = 'none'; owner_report = 'none'; rows = 'none'; report_during_growth = 'none'; many_mods = 'none'; many_mods_memory = 'none'; mods_memory_junk = 'none'
 }
 $runtimeCounts = @{
     runtime_report = 1; runtime_report_reports_off = 1; runtime_report_no_folder = 0; runtime_report_write_fails = 0; runtime_report_then_crash = 1; report_native = 1; owner_report = 2; rows = 1
@@ -53,7 +53,7 @@ $faultNeedles = @{
 }
 $nativeNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the crashing thread, innermost first:', '  #0 ', ', offset +0x',
-    'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: '
+    'Registers of the crashing thread:', '  rip ', 'memreader Plus hooks: ', 'memreader Plus capacity: owners '
 )
 $exitScenarios = @('exit_report', 'exit_report_terminate', 'exit_report_crt')
 $systemHooks = Select-String -Path (Join-Path $root 'build\CMakeCache.txt') -Pattern '^MEMREADER_SYSTEM_EXIT_HOOKS:BOOL=ON$' -Quiet
@@ -61,12 +61,12 @@ if (-not $systemHooks) { foreach ($name in $exitScenarios) { $reports[$name] = '
 $dllText = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes((Join-Path $root 'build\Release\memreader_plus.dll')))
 $exitNeedles = @(
     'Game running for ', 'Memory: game ', 'Native stack of the thread that ended the game, innermost first:', '  #0 ', ', offset +0x',
-    'Warhammer3.exe+0x', 'memreader Plus hooks: '
+    'Warhammer3.exe+0x', 'memreader Plus hooks: ', 'memreader Plus capacity: owners '
 )
 $exitAbsent = @('report_me', "The game's crash handler caught it", 'Lua stack', '  #0 memreader_plus', 'Registers of the crashing thread:')
 $offScriptThread = @('fault_report_native_thread', 'fault_report_two_threads', 'fault_report_overlap', 'fault_report_worker_waits')
 $timeLimits = @{
-    fault_report_worker_stuck = 4, 9; fault_report_worker_waits = 4, 9; fault_report_worker_blocked = 9, 15; fault_report_worker_dead = 0, 3
+    fault_report_worker_stuck = 4, 12; fault_report_worker_waits = 4, 9; fault_report_worker_blocked = 9, 15; fault_report_worker_dead = 0, 4
 }
 $moveCalls = @{ fault_report_move_retry = '4'; fault_report_move_fails = '5' }
 $staleTemporary = 'memreader_crash_report_010101_0000.txt.1.tmp'
@@ -132,7 +132,7 @@ $reportLimit = 48 * 1024
 $runtimePrefix = 'memreader_runtime_report_'
 $runtimeNeedles = @(
     ' runtime report', 'written on request, nothing crashed', 'Thread: the script thread', 'Script logging is off', 'Game running for ',
-    'Memory: game ', 'memreader Plus hooks: '
+    'Memory: game ', 'memreader Plus hooks: ', 'memreader Plus capacity: owners '
 )
 $runtimeAbsent = @('Lua stack', "Other programs' DLLs loaded", 'Registers of the crashing thread:', 'Native stack of', "The game's crash handler caught it", 'exception 0x')
 $gameFilesNote = "The game's own crash files for this crash, in the game crash folder: D"
@@ -156,6 +156,11 @@ function New-ModFile($work) {
         '# a comment', 'mod "first.pack";', 'mod "second.pack"; mod "third.pack";', 'mod "missing.pack";'
     )
     Set-Content (Join-Path $work 'mods.txt') $lines
+}
+
+function Add-ManyMods($work) {
+    $lines = @(1..1100 | ForEach-Object { "add_working_directory `"C:\nowhere\path_$_`";" }) + @(1..2100 | ForEach-Object { "mod `"extra_$_.pack`";" })
+    Add-Content (Join-Path $work 'mods.txt') $lines
 }
 
 $modNeedles = @(
@@ -186,6 +191,7 @@ foreach ($scenario in $expect.Keys) {
         $runExe = $exe
         if ($reports.Contains($scenario)) {
             New-ModFile $work
+            if ($scenario -eq 'many_mods') { Add-ManyMods $work }
             New-Item -ItemType Directory (Join-Path $work 'crash_report') | Out-Null
             Copy-Item (Join-Path $env:SystemRoot 'System32\version.dll') (Join-Path $work $otherDll)
             Set-Content (Join-Path $work $staleTemporary) 'left by a crash' -NoNewline

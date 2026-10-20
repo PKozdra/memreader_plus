@@ -175,6 +175,15 @@ static int open_method(lua_State *L, Patcher **self, const char **name)
 	return refuse(L, "name must be 1 to 47 letters, digits or underscores");
 }
 
+static int open_change(lua_State *L, Patcher **self, const char **name)
+{
+	int refused = open_method(L, self, name);
+
+	if (!refused && batch_running())
+		return refuse(L, batch_busy);
+	return refused;
+}
+
 static const char *check_change(const CodeChange *change, size_t bytes_size)
 {
 	if (change->size != bytes_size)
@@ -287,7 +296,7 @@ static int l_patch(lua_State *L)
 {
 	Patcher *self;
 	const char *name;
-	int refused = open_method(L, &self, &name);
+	int refused = open_change(L, &self, &name);
 
 	return refused ? refused : patch_step(L, self->owner, name, 3, NULL);
 }
@@ -405,26 +414,100 @@ static int l_set(lua_State *L)
 {
 	Patcher *self;
 	const char *name;
-	int refused = open_method(L, &self, &name);
+	int refused = open_change(L, &self, &name);
 
 	return refused ? refused : set_step(L, self->owner, name, 3, NULL);
 }
 
-static int plan_cave(lua_State *L, Batch *batch, const char *name, INT_PTR at, size_t copied)
+static int refuse_with_message(lua_State *L)
+{
+	lua_pushnil(L);
+	lua_insert(L, -2);
+	return 2;
+}
+
+static int plan_cave(lua_State *L, Batch *batch, const char *name, INT_PTR at, size_t copied, int spec)
 {
 	const char *why;
 
-	if (!check_cave(L, at)) {
-		lua_pushnil(L);
-		lua_insert(L, -2);
-		return 2;
-	}
+	if (!check_cave(L, at))
+		return refuse_with_message(L);
+	if (spec && prepare_asm_cave(L, at, spec) != CAVE_OK)
+		return refuse_with_message(L);
 	batch_begin(batch, ITEM_CAVE, -1, name);
 	why = batch_span(batch, at, copied);
 	return why ? refuse(L, why) : succeed(L);
 }
 
-static int new_cave(lua_State *L, int owner, const char *name, INT_PTR at, const char *bytes, size_t size, Batch *batch)
+static const char echo_key = 0;
+
+static void echo_line(lua_State *L, const char *text)
+{
+	lua_pushlightuserdata(L, (void *)&echo_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if (lua_istable(L, -1)) {
+		lua_pushstring(L, text);
+		lua_rawseti(L, -2, (int)lua_objlen(L, -2) + 1);
+		lua_pop(L, 1);
+		return;
+	}
+	lua_pop(L, 1);
+	log_line(L, text);
+}
+
+void hold_echoes(lua_State *L)
+{
+	lua_pushlightuserdata(L, (void *)&echo_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	lua_pushlightuserdata(L, (void *)&echo_key);
+	lua_newtable(L);
+	lua_rawset(L, LUA_REGISTRYINDEX);
+}
+
+void send_echoes(lua_State *L, int previous)
+{
+	int count, i;
+
+	lua_pushlightuserdata(L, (void *)&echo_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	lua_pushlightuserdata(L, (void *)&echo_key);
+	lua_pushvalue(L, previous);
+	lua_rawset(L, LUA_REGISTRYINDEX);
+	count = lua_istable(L, -1) ? (int)lua_objlen(L, -1) : 0;
+	for (i = 1; i <= count; i++) {
+		lua_rawgeti(L, -1, i);
+		echo_line(L, lua_tostring(L, -1));
+		lua_pop(L, 1);
+	}
+	lua_pop(L, 1);
+}
+
+static void echo_cave(lua_State *L, int owner, INT_PTR at, int spec)
+{
+	const char *listing = cave_listing(at);
+	BOOL quiet;
+
+	lua_pushliteral(L, "echo");
+	lua_rawget(L, spec);
+	quiet = lua_isboolean(L, -1) && !lua_toboolean(L, -1);
+	lua_pop(L, 1);
+	if (quiet || !listing)
+		return;
+	lua_pushfstring(L, "[%s] %s", owner_name(owner), listing);
+	echo_line(L, lua_tostring(L, -1));
+	lua_pop(L, 1);
+}
+
+static int make_cave(lua_State *L, INT_PTR at, const char *name, const CodeChange *code, int spec, BYTE **start)
+{
+	if (!spec)
+		return try_cave(L, at, code->bytes, code->size, start);
+	if (!check_cave(L, at))
+		return CAVE_REFUSED;
+	return try_asm_cave(L, at, spec, name, start);
+}
+
+static int new_cave(lua_State *L, int owner, const char *name, INT_PTR at, const CodeChange *code, int spec, Batch *batch)
 {
 	char holder[TAG_SIZE];
 	size_t copied = (size_t)copied_length(at);
@@ -436,54 +519,63 @@ static int new_cave(lua_State *L, int owner, const char *name, INT_PTR at, const
 	if (!registry_room(1, 0))
 		return refuse(L, full_message);
 	if (batch)
-		return plan_cave(L, batch, name, at, copied);
-	if (try_cave(L, at, bytes, size, &start) != CAVE_OK) {
-		lua_pushnil(L);
-		lua_insert(L, -2);
-		return 2;
-	}
+		return plan_cave(L, batch, name, at, copied, spec);
+	if (make_cave(L, at, name, code, spec, &start) != CAVE_OK)
+		return refuse_with_message(L);
 	item = add_item(owner, name, ITEM_CAVE, at);
 	add_claim(item, at, copied, NULL, NULL);
+	if (spec)
+		echo_cave(L, owner, at, spec);
 	push_value(L, VALUE_POINTER, (INT_PTR)start);
 	return 1;
 }
 
-static int repeat_cave(lua_State *L, int item, INT_PTR at, const char *bytes, size_t size)
+static int repeat_cave(lua_State *L, int item, INT_PTR at, const CodeChange *code, int spec)
 {
 	const BYTE *start = cave_start(at);
+	const char *why = NULL;
 
-	if (item_at(item)->kind != ITEM_CAVE || item_at(item)->at != at || !start || memcmp(start, bytes, size) != 0)
+	if (item_at(item)->kind != ITEM_CAVE || item_at(item)->at != at || !start)
 		return refuse(L, different_change);
+	if (spec)
+		why = compare_asm_cave(L, at, spec);
+	else if (memcmp(start, code->bytes, code->size) != 0)
+		why = different_change;
+	if (why)
+		return refuse(L, why);
 	push_value(L, VALUE_POINTER, (INT_PTR)start);
 	return 1;
 }
 
 static int cave_step(lua_State *L, int owner, const char *name, int first, Batch *batch)
 {
-	const char *bytes, *why;
+	CodeChange code = { 0, 0, NULL, NULL };
+	int spec = lua_istable(L, first + 1) ? first + 1 : 0;
+	const char *why;
 	INT_PTR at;
-	size_t size;
 	int item;
 
-	bytes = luaL_checklstring(L, first + 1, &size);
+	if (!spec)
+		code.bytes = luaL_checklstring(L, first + 1, &code.size);
 	why = target_at(L, first, &at);
 	if (why)
 		return refuse(L, why);
 	if (!at)
 		return refuse(L, "address is NULL");
-	if (size == 0)
+	if (!spec && code.size == 0)
 		return refuse(L, "no cave bytes");
+	code.at = at;
 	item = find_item(owner, name);
 	if (item >= 0)
-		return repeat_cave(L, item, at, bytes, size);
-	return new_cave(L, owner, name, at, bytes, size, batch);
+		return repeat_cave(L, item, at, &code, spec);
+	return new_cave(L, owner, name, at, &code, spec, batch);
 }
 
 static int l_cave(lua_State *L)
 {
 	Patcher *self;
 	const char *name;
-	int refused = open_method(L, &self, &name);
+	int refused = open_change(L, &self, &name);
 
 	return refused ? refused : cave_step(L, self->owner, name, 3, NULL);
 }
@@ -551,7 +643,7 @@ static int l_frame(lua_State *L)
 {
 	Patcher *self;
 	const char *name;
-	int refused = open_method(L, &self, &name);
+	int refused = open_change(L, &self, &name);
 
 	if (refused)
 		return refused;
@@ -769,7 +861,7 @@ static int l_relocate(lua_State *L)
 {
 	Patcher *self;
 	const char *name;
-	int refused = open_method(L, &self, &name);
+	int refused = open_change(L, &self, &name);
 
 	if (refused)
 		return refused;
@@ -894,7 +986,7 @@ static int l_site(lua_State *L)
 	INT_PTR at;
 	int refused, priority, item;
 
-	refused = open_method(L, &self, &name);
+	refused = open_change(L, &self, &name);
 	if (refused)
 		return refused;
 	luaL_checktype(L, 4, LUA_TFUNCTION);
@@ -1043,6 +1135,8 @@ static int add_link(lua_State *L, int kind)
 			return refuse(L, why);
 		filter = &when;
 	}
+	if (batch_running())
+		return refuse(L, batch_busy);
 	flush_link_log(L);
 	if (!valid_name(name, length, ITEM_NAME_SIZE - 1))
 		return refuse(L, "name must be 1 to 47 letters, digits or underscores");
@@ -1142,7 +1236,7 @@ static int l_remove(lua_State *L)
 	const char *name, *why;
 	int refused, item;
 
-	refused = open_method(L, &self, &name);
+	refused = open_change(L, &self, &name);
 	if (refused)
 		return refused;
 	item = find_item(self->owner, name);
@@ -1173,8 +1267,11 @@ static int remove_owner_rows(lua_State *L, int owner)
 static int l_remove_all(lua_State *L)
 {
 	Patcher *self = check_self(L);
-	int item, removed = remove_owner_rows(L, self->owner), stayed = 0, failed = 0;
+	int item, removed, stayed = 0, failed = 0;
 
+	if (batch_running())
+		return refuse(L, batch_busy);
+	removed = remove_owner_rows(L, self->owner);
 	for (item = 0; item < item_total(); item++) {
 		const char *why;
 
@@ -1237,7 +1334,7 @@ static int l_row(lua_State *L)
 {
 	Patcher *self;
 	const char *name;
-	int refused = open_method(L, &self, &name);
+	int refused = open_change(L, &self, &name);
 
 	if (refused)
 		return refused;
@@ -1360,7 +1457,7 @@ static int l_patcher(lua_State *L)
 		return refuse(L, "owner must be 1 to 63 letters, digits or underscores");
 	index = add_owner(owner);
 	if (index < 0)
-		return refuse(L, "at most 64 owners per game session");
+		return refuse(L, lua_pushfstring(L, "at most %d owners per game session", MAX_OWNERS));
 	push_handle(L, index);
 	return 1;
 }

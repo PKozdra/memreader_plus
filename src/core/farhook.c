@@ -198,6 +198,11 @@ static int padding_slots_left(void)
 	return count;
 }
 
+int hop_slots_left(void)
+{
+	return padding_slots_left();
+}
+
 static int l_hop_slots(lua_State *L)
 {
 	lua_pushnumber(L, (lua_Number)padding_slots_left());

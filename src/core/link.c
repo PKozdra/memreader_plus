@@ -918,6 +918,7 @@ int l_set_log(lua_State *L)
 	lua_pushlightuserdata(L, (void *)&sink_key);
 	lua_insert(L, 1);
 	lua_rawset(L, LUA_REGISTRYINDEX);
+	log_cave_reservation(L);
 	return 0;
 }
 
@@ -927,6 +928,22 @@ static void log_error(lua_State *L, const Item *entry)
 	lua_pushfstring(L, "[memreader Plus] %s/%s (%s): %s", owner_name(entry->owner), entry->name, item_kind_name(entry->kind), entry->error);
 	if (lua_pcall(L, 1, 0, 0))
 		lua_pop(L, 1);
+}
+
+BOOL log_line(lua_State *L, const char *text)
+{
+	if (callback_depth > 0)
+		return FALSE;
+	lua_pushlightuserdata(L, (void *)&sink_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if (!lua_isfunction(L, -1)) {
+		lua_pop(L, 1);
+		return FALSE;
+	}
+	lua_pushstring(L, text);
+	if (lua_pcall(L, 1, 0, 0))
+		lua_pop(L, 1);
+	return TRUE;
 }
 
 void flush_link_log(lua_State *L)

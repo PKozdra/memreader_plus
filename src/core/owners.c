@@ -3,13 +3,17 @@
 #include "common.h"
 
 enum {
-	MAX_OWNERS = 64,
-	MAX_ITEMS = 2048,
-	MAX_CLAIMS = 4096,
-	HELD_POOL_SIZE = 64 * 1024,
+	ITEMS_PER_CHUNK = 256,
+	CLAIMS_PER_CHUNK = 4096,
+	FIRST_POOL_SIZE = 64 * 1024,
+	MAX_POOL_SIZE = 1024 * 1024,
 	MAX_ANONYMOUS = 64,
 	MAX_LISTED_NAMES = 8
 };
+
+_Static_assert(MAX_OWNERS <= 256, "Item.owner is a BYTE");
+_Static_assert(MAX_ITEMS % ITEMS_PER_CHUNK == 0 && MAX_ITEMS / ITEMS_PER_CHUNK <= MAX_CHUNKS, "items fit the chunk directory");
+_Static_assert(MAX_CLAIMS % CLAIMS_PER_CHUNK == 0 && MAX_CLAIMS / CLAIMS_PER_CHUNK <= MAX_CHUNKS, "claims fit the chunk directory");
 
 typedef struct {
 	INT_PTR address;
@@ -27,13 +31,16 @@ static const char *const kind_names[ITEM_KIND_COUNT] = {
 
 static const RowKind *row_handler;
 static char owners[MAX_OWNERS][OWNER_SIZE];
-static int owner_count;
-static Item items[MAX_ITEMS];
-static int item_count;
-static Claim claims[MAX_CLAIMS];
-static int claim_count;
-static BYTE pool[HELD_POOL_SIZE];
+static volatile LONG owner_count;
+static Item first_items[ITEMS_PER_CHUNK];
+static Chunks item_chunks = { sizeof(Item), ITEMS_PER_CHUNK, MAX_ITEMS / ITEMS_PER_CHUNK, { (BYTE *)first_items }, 1 };
+static volatile LONG item_count;
+static Claim first_claims[CLAIMS_PER_CHUNK];
+static Chunks claim_chunks = { sizeof(Claim), CLAIMS_PER_CHUNK, MAX_CLAIMS / CLAIMS_PER_CHUNK, { (BYTE *)first_claims }, 1 };
+static volatile LONG claim_count;
+static BYTE *pool;
 static int pool_used;
+static int pool_room;
 static AnonymousCave anonymous[MAX_ANONYMOUS];
 static int anonymous_count;
 static int anonymous_unlisted;
@@ -72,7 +79,7 @@ int find_owner(const char *name)
 {
 	int i;
 
-	for (i = 0; i < owner_count; i++) {
+	for (i = 0; i < (int)owner_count; i++) {
 		if (strcmp(owners[i], name) == 0)
 			return i;
 	}
@@ -88,7 +95,8 @@ int add_owner(const char *name)
 	if (owner_count == MAX_OWNERS)
 		return -1;
 	strcpy_s(owners[owner_count], OWNER_SIZE, name);
-	return owner_count++;
+	_WriteBarrier();
+	return (int)owner_count++;
 }
 
 const char *owner_name(int owner)
@@ -96,12 +104,34 @@ const char *owner_name(int owner)
 	return owners[owner];
 }
 
+Item *item_at(int index)
+{
+	return chunk_slot(&item_chunks, index);
+}
+
+int item_total(void)
+{
+	return (int)item_count;
+}
+
+Claim *claim_at(int index)
+{
+	return chunk_slot(&claim_chunks, index);
+}
+
+int claim_total(void)
+{
+	return (int)claim_count;
+}
+
 int find_item(int owner, const char *name)
 {
 	int i;
 
 	for (i = 0; i < item_count; i++) {
-		if (items[i].used && items[i].owner == owner && strcmp(items[i].name, name) == 0)
+		const Item *item = item_at(i);
+
+		if (item->used && item->owner == owner && strcmp(item->name, name) == 0)
 			return i;
 	}
 	return -1;
@@ -112,10 +142,10 @@ static int free_item_slot(void)
 	int i;
 
 	for (i = 0; i < item_count; i++) {
-		if (!items[i].used)
+		if (!item_at(i)->used)
 			return i;
 	}
-	return item_count < MAX_ITEMS ? item_count : -1;
+	return item_count < chunk_room(&item_chunks) ? (int)item_count : -1;
 }
 
 int add_item(int owner, const char *name, int kind, INT_PTR at)
@@ -125,36 +155,17 @@ int add_item(int owner, const char *name, int kind, INT_PTR at)
 
 	if (slot < 0)
 		return -1;
-	item = &items[slot];
+	item = item_at(slot);
 	memset(item, 0, sizeof *item);
 	item->kind = (BYTE)kind;
 	item->owner = (BYTE)owner;
 	item->at = at;
 	strcpy_s(item->name, ITEM_NAME_SIZE, name);
+	_WriteBarrier();
 	item->used = TRUE;
 	if (slot == item_count)
 		item_count++;
 	return slot;
-}
-
-Item *item_at(int index)
-{
-	return &items[index];
-}
-
-int item_total(void)
-{
-	return item_count;
-}
-
-Claim *claim_at(int index)
-{
-	return &claims[index];
-}
-
-int claim_total(void)
-{
-	return claim_count;
 }
 
 int first_claim(int item)
@@ -162,7 +173,7 @@ int first_claim(int item)
 	int i;
 
 	for (i = 0; i < claim_count; i++) {
-		if (claims[i].item == item)
+		if (claim_at(i)->item == item)
 			return i;
 	}
 	return -1;
@@ -180,19 +191,20 @@ BYTE *wrote_bytes(const Claim *claim)
 
 static void drop_claim(int index)
 {
-	int hold = claims[index].hold;
-	int length = hold < 0 ? 0 : 2 * claims[index].size;
+	int hold = claim_at(index)->hold;
+	int length = hold < 0 ? 0 : 2 * claim_at(index)->size;
 	int i;
 
 	if (length) {
 		memmove(pool + hold, pool + hold + length, (size_t)(pool_used - hold - length));
 		pool_used -= length;
 		for (i = 0; i < claim_count; i++) {
-			if (claims[i].hold > hold)
-				claims[i].hold -= length;
+			if (claim_at(i)->hold > hold)
+				claim_at(i)->hold -= length;
 		}
 	}
-	claims[index] = claims[--claim_count];
+	*claim_at(index) = *claim_at(claim_count - 1);
+	claim_count--;
 }
 
 void remove_item(int index)
@@ -200,10 +212,10 @@ void remove_item(int index)
 	int i;
 
 	for (i = claim_count - 1; i >= 0; i--) {
-		if (claims[i].item == index)
+		if (claim_at(i)->item == index)
 			drop_claim(i);
 	}
-	items[index].used = FALSE;
+	item_at(index)->used = FALSE;
 }
 
 void make_tag(char *out, size_t size, int owner, const char *name)
@@ -211,31 +223,51 @@ void make_tag(char *out, size_t size, int owner, const char *name)
 	_snprintf_s(out, size, _TRUNCATE, "%s/%s", owners[owner], name);
 }
 
+static BOOL pool_fits(size_t needed)
+{
+	size_t room = pool_room ? (size_t)pool_room : FIRST_POOL_SIZE;
+	BYTE *bigger;
+
+	if (needed <= (size_t)pool_room)
+		return TRUE;
+	if (needed > MAX_POOL_SIZE)
+		return FALSE;
+	while (room < needed)
+		room *= 2;
+	bigger = resize_block(pool, room);
+	if (!bigger)
+		return FALSE;
+	pool = bigger;
+	pool_room = (int)room;
+	return TRUE;
+}
+
 BOOL claim_room(int claim_needed, size_t bytes_needed)
 {
-	return claim_count + claim_needed <= MAX_CLAIMS && (size_t)pool_used + bytes_needed <= HELD_POOL_SIZE;
+	return reserve_chunks(&claim_chunks, claim_count + claim_needed) && pool_fits((size_t)pool_used + bytes_needed);
 }
 
 BOOL item_room(int needed)
 {
-	int i, free_slots = MAX_ITEMS - item_count;
+	int i, free_slots = 0;
 
 	for (i = 0; i < item_count; i++)
-		free_slots += !items[i].used;
-	return free_slots >= needed;
+		free_slots += !item_at(i)->used;
+	return free_slots >= needed || reserve_chunks(&item_chunks, item_count + needed - free_slots);
 }
 
 BOOL registry_room(int claim_needed, size_t bytes_needed)
 {
-	return free_item_slot() >= 0 && claim_room(claim_needed, bytes_needed);
+	return item_room(1) && claim_room(claim_needed, bytes_needed);
 }
 
 BOOL add_claim(int item, INT_PTR from, size_t size, const BYTE *held, const BYTE *wrote)
 {
-	Claim *claim = &claims[claim_count];
+	Claim *claim;
 
 	if (!claim_room(1, held ? 2 * size : 0))
 		return FALSE;
+	claim = claim_at(claim_count);
 	claim->from = from;
 	claim->size = (int)size;
 	claim->item = item;
@@ -246,6 +278,7 @@ BOOL add_claim(int item, INT_PTR from, size_t size, const BYTE *held, const BYTE
 		memcpy(pool + pool_used + size, wrote, size);
 		pool_used += 2 * (int)size;
 	}
+	_WriteBarrier();
 	claim_count++;
 	return TRUE;
 }
@@ -255,11 +288,11 @@ BOOL claim_holder(INT_PTR from, size_t size, int except, char *holder, size_t ho
 	int i;
 
 	for (i = 0; i < claim_count; i++) {
-		const Claim *claim = &claims[i];
+		const Claim *claim = claim_at(i);
 
 		if (claim->item == except || claim->from >= from + (INT_PTR)size || from >= claim->from + claim->size)
 			continue;
-		make_tag(holder, holder_size, items[claim->item].owner, items[claim->item].name);
+		make_tag(holder, holder_size, item_at(claim->item)->owner, item_at(claim->item)->name);
 		return TRUE;
 	}
 	return FALSE;
@@ -270,8 +303,10 @@ BOOL frame_holder(INT_PTR function, int except, char *holder, size_t holder_size
 	int i;
 
 	for (i = 0; i < item_count; i++) {
-		if (items[i].used && items[i].kind == ITEM_FRAME && items[i].at == function && i != except) {
-			make_tag(holder, holder_size, items[i].owner, items[i].name);
+		const Item *item = item_at(i);
+
+		if (item->used && item->kind == ITEM_FRAME && item->at == function && i != except) {
+			make_tag(holder, holder_size, item->owner, item->name);
 			return TRUE;
 		}
 	}
@@ -289,13 +324,15 @@ const char *item_state(int index)
 	int at = first_claim(index);
 	const Claim *claim;
 
-	if (is_detached(&items[index]))
+	const Item *item = item_at(index);
+
+	if (is_detached(item))
 		return "detached";
-	if (items[index].kind == ITEM_ROW)
+	if (item->kind == ITEM_ROW)
 		return row_handler ? row_handler->state(index) : "missing";
-	if ((items[index].kind != ITEM_PATCH && items[index].kind != ITEM_VALUE) || at < 0)
+	if ((item->kind != ITEM_PATCH && item->kind != ITEM_VALUE) || at < 0)
 		return "stays";
-	claim = &claims[at];
+	claim = claim_at(at);
 	if (in_hooked_prologue(claim->from, (size_t)claim->size))
 		return "copied";
 	if (!copy_memory(current, claim->from, (size_t)claim->size))
@@ -329,12 +366,14 @@ static void add_tag(char *out, size_t size, const Item *item)
 
 int describe_owner(INT_PTR address, char *out, size_t size)
 {
-	int i;
+	int i, count = item_count;
 
 	out[0] = '\0';
-	for (i = 0; i < item_count; i++) {
-		if (items[i].used && items[i].at == address && (is_link_kind(items[i].kind) || items[i].kind == ITEM_CAVE) && !is_detached(&items[i]))
-			add_tag(out, size, &items[i]);
+	for (i = 0; i < count; i++) {
+		const Item *item = item_at(i);
+
+		if (item->used && item->at == address && (is_link_kind(item->kind) || item->kind == ITEM_CAVE) && !is_detached(item))
+			add_tag(out, size, item);
 	}
 	if (out[0])
 		return OWNER_NAMED;
@@ -349,19 +388,21 @@ int describe_owner(INT_PTR address, char *out, size_t size)
 
 int count_claims(int item)
 {
-	int i, count = 0;
+	int i, total = claim_count, count = 0;
 
-	for (i = 0; i < claim_count; i++)
-		count += claims[i].item == item;
+	for (i = 0; i < total; i++)
+		count += claim_at(i)->item == item;
 	return count;
 }
 
 static int count_kind(int owner, int kind)
 {
-	int i, count = 0;
+	int i, total = item_count, count = 0;
 
-	for (i = 0; i < item_count; i++) {
-		if (items[i].used && items[i].owner == owner && row_kind(shown_kind(&items[i])) == kind && !is_detached(&items[i]))
+	for (i = 0; i < total; i++) {
+		const Item *item = item_at(i);
+
+		if (item->used && item->owner == owner && row_kind(shown_kind(item)) == kind && !is_detached(item))
 			count += kind == ITEM_RELOCATE ? count_claims(i) : 1;
 	}
 	return count;
@@ -369,10 +410,13 @@ static int count_kind(int owner, int kind)
 
 static int count_detached(int owner)
 {
-	int i, count = 0;
+	int i, total = item_count, count = 0;
 
-	for (i = 0; i < item_count; i++)
-		count += items[i].used && items[i].owner == owner && is_detached(&items[i]);
+	for (i = 0; i < total; i++) {
+		const Item *item = item_at(i);
+
+		count += item->used && item->owner == owner && is_detached(item);
+	}
 	return count;
 }
 
@@ -384,15 +428,17 @@ static void cut_text(Text *report, size_t used)
 
 static void add_names(Text *report, int owner, int kind)
 {
-	int i, listed = 0, count = 0;
+	int i, total = item_count, listed = 0, count = 0;
 
-	for (i = 0; i < item_count; i++) {
-		if (!items[i].used || items[i].owner != owner || shown_kind(&items[i]) != kind)
+	for (i = 0; i < total; i++) {
+		const Item *item = item_at(i);
+
+		if (!item->used || item->owner != owner || shown_kind(item) != kind)
 			continue;
 		count++;
 		if (listed < MAX_LISTED_NAMES) {
-			add_text(report, "%s%s ", listed ? ", " : " (", items[i].name);
-			add_address(report, (ULONG_PTR)items[i].at);
+			add_text(report, "%s%s ", listed ? ", " : " (", item->name);
+			add_address(report, (ULONG_PTR)item->at);
 			listed++;
 		}
 	}
@@ -444,13 +490,25 @@ static void add_anonymous_rows(Text *report)
 void add_owners(Text *report)
 {
 	size_t start = report->used, header;
-	int i;
+	int i, count = owner_count;
 
 	add_text(report, "memreader Plus changes by owner:\n");
 	header = report->used;
-	for (i = 0; i < owner_count; i++)
+	for (i = 0; i < count; i++)
 		add_owner_row(report, i);
 	add_anonymous_rows(report);
 	if (report->used == header)
 		cut_text(report, start);
+}
+
+void registry_capacity(Capacity *owners_use, Capacity *items_use, Capacity *claims_use, Capacity *held_use)
+{
+	int i, count = item_count, used = 0;
+
+	for (i = 0; i < count; i++)
+		used += item_at(i)->used != 0;
+	*owners_use = (Capacity){ owner_count, MAX_OWNERS, MAX_OWNERS };
+	*items_use = (Capacity){ used, chunk_room(&item_chunks), MAX_ITEMS };
+	*claims_use = (Capacity){ claim_count, chunk_room(&claim_chunks), MAX_CLAIMS };
+	*held_use = (Capacity){ pool_used, pool_room, MAX_POOL_SIZE };
 }

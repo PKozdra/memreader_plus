@@ -6,6 +6,7 @@ local MAX_EXACT = 16777215
 local MAX_PATTERNS = 64
 local MAX_PATTERN_BYTES = 256
 local CALL_SIZE = 5
+local JUMP_BACK_SIZE = 14
 local READ_SIZES = { uint8 = 1, int32 = 4, call = 8, rip = 8 }
 local ARG_LIMITS = { [1] = { -128, 255 }, [4] = { -MAX_EXACT, MAX_EXACT }, [8] = { 0, MAX_EXACT } }
 local HOOK_KINDS = { hook = 'function', prefix = 'function', postfix = 'function', around = 'function', site = 'site' }
@@ -17,6 +18,7 @@ local MUST_BE_INSTALLED = { frame = true, relocate = true }
 local KINDS = { anchor = true, patch = true, value = true, cave = true, frame = true, relocate = true, site = true }
 local NOTHING = {}
 local IN_CALL = 'not from inside a hooked call'
+local asm_files = {}
 
 for kind in pairs(LINK_METHODS) do
 	KINDS[kind] = true
@@ -133,6 +135,16 @@ local function make_candidates(entry)
 	return list
 end
 
+local function cave_text_problem(entry, spec)
+	local asm, file, bytes = spec.asm or entry.asm, spec.asm_file or entry.asm_file, spec.bytes or entry.bytes
+	for _, text in ipairs({ asm or false, file or false, bytes or false }) do
+		if text and type(text) ~= 'string' then return 'asm, asm_file and bytes must be strings' end
+	end
+	if asm and file then return 'asm and asm_file both given' end
+	if not (asm or file or bytes) then return 'no bytes, asm or asm_file' end
+	return nil
+end
+
 local function shape_problem(entry, by_name)
 	if type(entry) ~= 'table' then return 'not a table' end
 	if type(entry.name) ~= 'string' or entry.name == '' then return 'no name' end
@@ -151,6 +163,8 @@ local function shape_problem(entry, by_name)
 		local pattern = type(spec) == 'table' and (spec.pattern or entry.pattern) or nil
 		local bytes = type(pattern) == 'string' and parse_hex(pattern) or nil
 		if not bytes or #bytes == 0 or #bytes > MAX_PATTERN_BYTES or bytes[1] == false then return 'bad pattern' end
+		local cave = entry.kind == 'cave' and type(spec) == 'table' and cave_text_problem(entry, spec) or nil
+		if cave then return cave end
 	end
 	return nil
 end
@@ -221,13 +235,56 @@ local function expand(rec, args)
 	return list, missing
 end
 
+local function asm_values(rec, args)
+	local values = {}
+	if type(args) == 'table' then
+		for name, value in pairs(args) do
+			values[name] = value
+		end
+	end
+	for name, read in pairs(rec.reads) do
+		values[name] = read.pointer or read.raw
+	end
+	return values
+end
+
+local function asm_template(rec, cave)
+	local bytes, _, slots, code = plus.assemble(rec.asm, cave, asm_values(rec, nil), true)
+	if not bytes then return nil end
+	local list = {}
+	for i = 1, #bytes do
+		local in_jump = i > code and i <= code + JUMP_BACK_SIZE
+		list[i] = not in_jump and bytes:byte(i)
+	end
+	for _, slot in ipairs(slots) do
+		if not slot.given then
+			for i = slot.offset + 1, slot.offset + slot.size do
+				list[i] = false
+			end
+		end
+	end
+	return list, slots
+end
+
+local function cave_template(rec, cave)
+	if rec.asm then return asm_template(rec, cave) end
+	return expand(rec, nil)
+end
+
 local function cave_is_ours(self, rec)
 	local info = plus.hook_info(rec.address)
 	if not info or info.kind ~= 'cave' then return false end
 	local owned = self.handle:info(rec.name)
 	if not owned or owned.kind ~= 'cave' then return false end
-	local list = expand(rec, nil)
-	return fits(plus.read(info.cave, 0, #list), list)
+	local at = plus.tostring(info.cave)
+	if rec.template_at ~= at then
+		rec.template, rec.template_slots = cave_template(rec, info.cave)
+		rec.template_at = at
+	end
+	local list = rec.template
+	if not list or not fits(plus.read(info.cave, 0, #list), list) then return false end
+	rec.slots = rec.asm and rec.template_slots or nil
+	return true
 end
 
 local function held_reason(self, rec)
@@ -322,8 +379,30 @@ local function adopt(rec, found)
 	rec.expect = found.spec.expect and parse_hex(found.spec.expect) or nil
 	rec.expect_target = found.spec.expect_target and parse_hex(found.spec.expect_target) or nil
 	rec.target = owned_target(rec, found.spec)
-	if rec.kind == 'cave' then rec.items = parse_template(found.spec.bytes) end
+	rec.template_at = nil
+	if rec.kind == 'cave' then
+		rec.items = found.spec.bytes and parse_template(found.spec.bytes) or nil
+		rec.asm = found.spec.asm
+		rec.asm_file = found.spec.asm_file
+		rec.source = found.spec.asm_file or 'asm'
+	end
 	if rec.kind == 'patch' then rec.bytes = to_bytes(parse_hex(found.spec.bytes)) end
+end
+
+local function read_asm_file(path)
+	if asm_files[path] == nil then
+		local ok, text = pcall(plus.read_pack_file, path)
+		asm_files[path] = ok and type(text) == 'string' and text or false
+	end
+	return asm_files[path] or nil
+end
+
+local function cave_source(rec)
+	if rec.kind ~= 'cave' or not rec.asm_file then return nil end
+	if not rec.asm_file:match('^script/[%w_/%-]+%.asm$') then return 'asm_file must be a script/<mod>/<name>.asm path' end
+	rec.asm = read_asm_file(rec.asm_file)
+	if not rec.asm then return 'asm file not found: ' .. rec.asm_file end
+	return nil
 end
 
 local function resolve_now(self, rec)
@@ -332,8 +411,8 @@ local function resolve_now(self, rec)
 		local found, why = check_candidate(self, spec)
 		if found then
 			adopt(rec, found)
-			local held = held_reason(self, rec)
-			if held then mark_missing(rec, held) end
+			local problem = cave_source(rec) or held_reason(self, rec)
+			if problem then mark_missing(rec, problem) end
 			return
 		end
 		reasons[#reasons + 1] = why
@@ -435,10 +514,25 @@ local function cave_problem(self, rec)
 	return nil
 end
 
+local function asm_spec(rec, args)
+	local spec = { asm = rec.asm, values = asm_values(rec, args), source = rec.source, echo = false }
+	if not rec.items then return spec end
+	local list, missing = expand(rec, args)
+	if missing then return nil, 'missing argument ' .. missing end
+	spec.bytes = to_bytes(list)
+	return spec
+end
+
 function PLANNERS.cave(self, rec, args)
 	local held = held_reason(self, rec)
 	if held then return nil, held end
 	if cave_is_ours(self, rec) then return NOTHING end
+	if rec.asm then
+		local spec, why = asm_spec(rec, args)
+		local problem = why or cave_problem(self, rec)
+		if problem then return nil, problem end
+		return { step = { 'cave', rec.name, rec.target, spec } }
+	end
 	local list, missing = expand(rec, args)
 	if missing then return nil, 'missing argument ' .. missing end
 	local problem = cave_problem(self, rec)
@@ -631,6 +725,13 @@ local function attach_links(self, plans)
 	return true
 end
 
+local function echo_caves(self, plans)
+	for _, entry in ipairs(plans) do
+		local info = entry.plan.step and entry.rec.asm and plus.hook_info(entry.rec.address)
+		if info and info.listing then write_line(self, info.listing) end
+	end
+end
+
 local function install_set(self, items)
 	if plus.hook_depth() > 0 then return false, IN_CALL end
 	local plans = {}
@@ -647,6 +748,7 @@ local function install_set(self, items)
 	for _, entry in ipairs(plans) do
 		if PLANNERS[entry.rec.kind] then entry.rec.installed = true end
 	end
+	echo_caves(self, plans)
 	return #plans > 0
 end
 
@@ -662,7 +764,8 @@ local function set_value(self, rec, number)
 	if rec.kind ~= 'value' then return false, 'not a value' end
 	local spec = rec.spec
 	if not whole(number, spec.low, spec.high) then return false, 'number outside low and high' end
-	local guard = plus.read(plus.add(rec.site, 0 - rec.before), 0, #rec.expect)
+	local before = rec.before
+	local guard = plus.read(plus.add(rec.site, -before), 0, #rec.expect)
 	if not fits(guard, rec.expect) then return mark_missing(rec, 'unexpected bytes') end
 	local done, why = self.handle:set(rec.name, rec.target, spec.size, number, spec.low, spec.high)
 	if not done then return mark_missing(rec, why) end
@@ -679,17 +782,29 @@ local function remove(self, rec)
 	return true
 end
 
+local function slot_number(cave, offset, size)
+	local raw = plus.read(cave, offset, size)
+	if size == 8 then return plus.pointer(raw) end
+	return le_number(raw, false)
+end
+
+local function asm_slot_value(rec, cave, placeholder)
+	for _, slot in ipairs(rec.slots or NOTHING) do
+		if slot.name == placeholder then return slot_number(cave, slot.offset, slot.size) end
+	end
+	return nil
+end
+
 local function cave_value(self, rec, placeholder)
 	if not rec.found or rec.kind ~= 'cave' or not cave_is_ours(self, rec) then return nil end
 	local cave = plus.hook_info(rec.address).cave
+	if rec.asm then return asm_slot_value(rec, cave, placeholder) end
 	local offset = 0
 	for _, item in ipairs(rec.items) do
 		if type(item) == 'number' then
 			offset = offset + 1
 		elseif item.name == placeholder then
-			local raw = plus.read(cave, offset, item.size)
-			if item.size == 8 then return plus.pointer(raw) end
-			return le_number(raw, false)
+			return slot_number(cave, offset, item.size)
 		else
 			offset = offset + item.size
 		end
@@ -697,8 +812,14 @@ local function cave_value(self, rec, placeholder)
 	return nil
 end
 
+local function cave_listing(self, rec)
+	if not rec.found or rec.kind ~= 'cave' or not cave_is_ours(self, rec) then return nil end
+	return plus.hook_info(rec.address).listing
+end
+
 local function value_problem(rec)
-	local guard = plus.read(plus.add(rec.site, 0 - rec.before), 0, #rec.expect)
+	local before = rec.before
+	local guard = plus.read(plus.add(rec.site, -before), 0, #rec.expect)
 	if not fits(guard, rec.expect) then return 'unexpected bytes' end
 	local current = le_number(plus.read(rec.site, 0, rec.spec.size), rec.spec.size == 4)
 	if current < rec.spec.low or current > rec.spec.high then return 'the current value is outside low and high' end
@@ -893,6 +1014,11 @@ local function build_api(self)
 		if ok then return value end
 		return nil
 	end
+	function api.listing(name)
+		local ok, text = pcall(cave_listing, self, lookup(self, name))
+		if ok then return text end
+		return nil
+	end
 	function api.log_missing()
 		log_missing(self)
 	end
@@ -934,6 +1060,8 @@ function sites.attach()
 	plus.supports.links_without_expect = true
 	plus.supports.link_when = true
 	plus.supports.rows = true
+	plus.supports.capacity = true
+	plus.supports.cave_asm = true
 end
 
 sites.parse_hex = parse_hex
