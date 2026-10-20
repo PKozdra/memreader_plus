@@ -35,8 +35,10 @@ typedef struct {
 	void *trampoline;
 	void *original;
 	void *cave;
+	size_t cave_code;
 	size_t cave_size;
 	char *listing;
+	CaveLine *volatile lines;
 	const char *native;
 	Signature signature;
 	Callback callbacks[MAX_CALLBACKS];

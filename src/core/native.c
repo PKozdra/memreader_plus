@@ -138,7 +138,7 @@ static const Module *module_of(ULONG_PTR address)
 void add_address(Text *text, ULONG_PTR address)
 {
 	const Module *module = module_of(address);
-	char hook_code[TAG_SIZE * 4 + 96];
+	char hook_code[HOOK_CODE_TEXT];
 
 	if (module)
 		add_text(text, "%s+0x%llx", module->name, (unsigned long long)(address - module->base));

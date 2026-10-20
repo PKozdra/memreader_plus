@@ -6,7 +6,7 @@
 #include "buffer.h"
 #include "hde/hde64.h"
 
-enum { TRAMPOLINE_SIZE = 64, MAX_REPORTED_HOOKS = 24, SITE_JUMP = 5, PROLOGUE_READ = 32 };
+enum { TRAMPOLINE_SIZE = 64, MAX_REPORTED_HOOKS = 24, SITE_JUMP = 5, PROLOGUE_READ = 32, LONGEST_INSTRUCTION = 15 };
 
 #pragma pack(push, 1)
 typedef struct {
@@ -23,6 +23,7 @@ static const char state_watch_key = 0;
 
 static Hook hooks[MAX_HOOKS];
 static int hook_count;
+static InstructionFormatter format_code;
 static HookStub *stubs;
 static LPVOID memory_near_game;
 static DWORD script_thread;
@@ -229,7 +230,7 @@ static Hook *install_hook(lua_State *L, INT_PTR target, int kind, void *detour, 
 	return hook;
 }
 
-void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t size, FinishHook finish, void *context)
+void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t code, size_t total, FinishHook finish, void *context)
 {
 	Hook *hook = find_hook(target);
 
@@ -237,7 +238,8 @@ void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t size, 
 		luaL_error(L, "%p already holds a %s", (void *)target, kind_name(hook->kind));
 	hook = install_hook(L, target, KIND_CAVE, detour, finish, context);
 	hook->cave = detour;
-	hook->cave_size = size;
+	hook->cave_code = code;
+	hook->cave_size = total;
 }
 
 static int check_cave_target(lua_State *L)
@@ -267,7 +269,7 @@ void mark_callback(INT_PTR target, int item)
 		hook->callbacks[hook->callback_count - 1].item = item;
 }
 
-void set_cave_listing(INT_PTR target, char *listing)
+void set_cave_listing(INT_PTR target, char *listing, CaveLine *lines)
 {
 	Hook *hook = find_hook(target);
 
@@ -275,6 +277,15 @@ void set_cave_listing(INT_PTR target, char *listing)
 		hook->listing = listing;
 	else if (listing)
 		HeapFree(GetProcessHeap(), 0, listing);
+	if (hook && !hook->lines)
+		InterlockedExchangePointer((void *volatile *)&hook->lines, lines);
+	else if (lines)
+		HeapFree(GetProcessHeap(), 0, lines);
+}
+
+void register_instruction_formatter(InstructionFormatter formatter)
+{
+	format_code = formatter;
 }
 
 const char *cave_listing(INT_PTR target)
@@ -941,6 +952,59 @@ static BOOL describe_hook(char *out, size_t size, const char *what, const Hook *
 	return TRUE;
 }
 
+static const CaveLine *line_at(const CaveLine *lines, size_t offset)
+{
+	for (; lines && lines->size; lines++) {
+		if (offset >= lines->offset && offset < (size_t)lines->offset + lines->size)
+			return lines;
+	}
+	return NULL;
+}
+
+static void add_instruction_text(char *out, size_t size, const BYTE *code, size_t length)
+{
+	char text[INSTRUCTION_TEXT];
+	size_t used = strlen(out);
+
+	if (format_code && format_code(code, length, (ULONG_PTR)code, text, sizeof text))
+		_snprintf_s(out + used, size - used, _TRUNCATE, ": %s", text);
+}
+
+static BOOL describe_cave(char *out, size_t size, const Hook *hook, ULONG_PTR address)
+{
+	size_t offset = address - (ULONG_PTR)hook->cave, used;
+	const CaveLine *line = line_at(hook->lines, offset);
+
+	if (!out)
+		return TRUE;
+	describe_hook(out, size, "Plus code cave for", hook);
+	used = strlen(out);
+	_snprintf_s(out + used, size - used, _TRUNCATE, ", cave +0x%llx", (unsigned long long)offset);
+	used = strlen(out);
+	if (line && line->data)
+		_snprintf_s(out + used, size - used, _TRUNCATE, ", .data line %d", line->line);
+	else if (line) {
+		_snprintf_s(out + used, size - used, _TRUNCATE, ", line %d", line->line);
+		add_instruction_text(out, size, (const BYTE *)hook->cave + line->offset, line->size);
+	} else if (offset >= hook->cave_code && offset < hook->cave_code + JUMP_BACK_SIZE)
+		_snprintf_s(out + used, size - used, _TRUNCATE, ", the jump back");
+	return TRUE;
+}
+
+static BOOL describe_trampoline(char *out, size_t size, const Hook *hook, ULONG_PTR address)
+{
+	size_t offset = address - (ULONG_PTR)hook->trampoline, used;
+	size_t left = TRAMPOLINE_SIZE - offset;
+
+	if (!out)
+		return TRUE;
+	describe_hook(out, size, "trampoline of the Plus hook on", hook);
+	used = strlen(out);
+	_snprintf_s(out + used, size - used, _TRUNCATE, ", +0x%llx", (unsigned long long)offset);
+	add_instruction_text(out, size, (const BYTE *)address, left < LONGEST_INSTRUCTION ? left : LONGEST_INSTRUCTION);
+	return TRUE;
+}
+
 BOOL describe_hook_code(ULONG_PTR address, char *out, size_t size)
 {
 	ULONG_PTR stub_start = (ULONG_PTR)stubs, original;
@@ -954,10 +1018,10 @@ BOOL describe_hook_code(ULONG_PTR address, char *out, size_t size)
 	}
 	for (i = 0; i < hook_count; i++) {
 		if (hooks[i].cave && address >= (ULONG_PTR)hooks[i].cave && address < (ULONG_PTR)hooks[i].cave + hooks[i].cave_size)
-			return describe_hook(out, size, "Plus code cave for", &hooks[i]);
+			return describe_cave(out, size, &hooks[i], address);
 		original = (ULONG_PTR)hooks[i].trampoline;
 		if (original && address >= original && address < original + TRAMPOLINE_SIZE)
-			return describe_hook(out, size, "trampoline of the Plus hook on", &hooks[i]);
+			return describe_trampoline(out, size, &hooks[i], address);
 	}
 	return FALSE;
 }

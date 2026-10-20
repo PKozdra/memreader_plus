@@ -2,13 +2,11 @@ local plus, agree = ...
 
 local sites = {}
 
-local MAX_EXACT = 16777215
 local MAX_PATTERNS = 64
 local MAX_PATTERN_BYTES = 256
 local CALL_SIZE = 5
 local JUMP_BACK_SIZE = 14
 local READ_SIZES = { uint8 = 1, int32 = 4, call = 8, rip = 8 }
-local ARG_LIMITS = { [1] = { -128, 255 }, [4] = { -MAX_EXACT, MAX_EXACT }, [8] = { 0, MAX_EXACT } }
 local HOOK_KINDS = { hook = 'function', prefix = 'function', postfix = 'function', around = 'function', site = 'site' }
 local LINK_METHODS = { hook = 'around', prefix = 'prefix', postfix = 'postfix', around = 'around' }
 local WHEN_KINDS = { prefix = true, postfix = true, around = true }
@@ -209,7 +207,7 @@ end
 
 local function arg_bytes(value, size)
 	local kind = type(value)
-	if kind == 'number' and whole(value, ARG_LIMITS[size][1], ARG_LIMITS[size][2]) then return le_bytes(value, size) end
+	if kind == 'number' and plus.slot_fits(value, size) then return le_bytes(value, size) end
 	if kind == 'string' and #value == size then return value end
 	if kind == 'userdata' and size == 8 and plus.type(value) == 'pointer' then return address_bytes(value) end
 	return nil

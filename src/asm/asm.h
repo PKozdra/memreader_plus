@@ -13,7 +13,8 @@ enum {
 	ASM_MAX_CAVE = 4096,
 	ASM_NAME_SIZE = 48,
 	ASM_ERROR_SIZE = 256,
-	ASM_ROUNDS = 16
+	ASM_ROUNDS = 16,
+	MAX_EXACT_NUMBER = 16777215
 };
 
 enum OperandKind { OPERAND_REGISTER = 1, OPERAND_MEMORY, OPERAND_IMMEDIATE, OPERAND_TARGET };
@@ -110,8 +111,13 @@ extern const luaL_Reg asm_functions[];
 BOOL asm_fail(Program *p, int line, int column, const char *format, ...);
 BOOL parse_program(Program *p);
 BOOL build_program(Program *p);
+BOOL plain_slot_range(int size, INT64 *low, INT64 *high);
+BOOL plain_slot_fits(lua_Number number, int size);
 size_t listing_size(const Program *p);
 void write_listing(const Program *p, Text *out);
+void prepare_asm_tools(void);
 int disassemble_one(INT_PTR address, Text *out);
+CaveLine *make_line_map(const Program *p);
+BOOL format_instruction(const BYTE *code, size_t size, ULONG_PTR address, char *out, size_t room);
 BOOL is_branch(ZydisMnemonic mnemonic);
 const char *assemble_cave(lua_State *L, int spec, INT_PTR site, INT_PTR address, BYTE *out, size_t room, AssembledCave *result);

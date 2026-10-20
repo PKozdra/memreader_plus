@@ -32,6 +32,7 @@ enum { SAVED_BYTES = 16, DEBUG_RECORD_SIZE = 0x400, MAX_HOOKS = 1000, JUMP_BACK_
 enum HookKind { KIND_FUNCTION, KIND_SITE, KIND_CAVE };
 
 enum { OWNER_SIZE = 64, ITEM_NAME_SIZE = 48, TAG_SIZE = OWNER_SIZE + ITEM_NAME_SIZE, CALLER_SIZE = 160, MAX_PATCH_SIZE = 4096, MAX_FRAME_GROWTH = 0x100000 };
+enum { INSTRUCTION_TEXT = 256, HOOK_CODE_TEXT = TAG_SIZE * 4 + 96 + INSTRUCTION_TEXT };
 
 enum OwnerText { OWNER_NONE, OWNER_NAMED, OWNER_CALLER };
 
@@ -331,7 +332,7 @@ typedef void (*FinishHook)(void *context, void *original);
 int install_far_hook(INT_PTR target, void *detour, void **original, FinishHook finish, void *context);
 void write_jump_back(BYTE *at, void *destination);
 BOOL hook_native(INT_PTR target, void *detour, const char *name, void **next);
-void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t size, FinishHook finish, void *context);
+void install_code_hook(lua_State *L, INT_PTR target, void *detour, size_t code, size_t total, FinishHook finish, void *context);
 int copied_length(INT_PTR target);
 void *cave_start(INT_PTR target);
 int l_hook_site(lua_State *L);
@@ -339,17 +340,26 @@ int l_unhook(lua_State *L);
 enum CaveResult { CAVE_OK, CAVE_NO_MEMORY, CAVE_REFUSED };
 int try_cave(lua_State *L, INT_PTR address, const char *bytes, size_t size, BYTE **start);
 typedef struct {
+	UINT16 offset;
+	UINT16 size;
+	BYTE data;
+	int line;
+} CaveLine;
+typedef struct {
 	size_t code;
 	size_t total;
 	char *listing;
+	CaveLine *lines;
 } AssembledCave;
 typedef const char *(*CaveAssembler)(lua_State *L, int spec, INT_PTR site, INT_PTR address, BYTE *out, size_t room, AssembledCave *result);
 void register_cave_assembler(CaveAssembler assembler);
+typedef BOOL (*InstructionFormatter)(const BYTE *code, size_t size, ULONG_PTR address, char *out, size_t room);
+void register_instruction_formatter(InstructionFormatter formatter);
 int try_asm_cave(lua_State *L, INT_PTR site, int spec, const char *tag, BYTE **start);
 int prepare_asm_cave(lua_State *L, INT_PTR site, int spec);
 const char *compare_asm_cave(lua_State *L, INT_PTR site, int spec);
 void release_prepared_caves(void);
-void set_cave_listing(INT_PTR target, char *listing);
+void set_cave_listing(INT_PTR target, char *listing, CaveLine *lines);
 const char *cave_listing(INT_PTR target);
 size_t cave_length(INT_PTR target);
 BOOL log_line(lua_State *L, const char *text);

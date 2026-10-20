@@ -361,6 +361,7 @@ void asm_site_j(void);
 void asm_site_j_here(void);
 void asm_site_k(void);
 void asm_site_k_here(void);
+void cave_reads(void);
 void many_site_0(void);
 void site_target(void);
 void site_target_here(void);
@@ -587,6 +588,7 @@ static const struct {
 	{ "asm_site_j_here", asm_site_j_here },
 	{ "asm_site_k", asm_site_k },
 	{ "asm_site_k_here", asm_site_k_here },
+	{ "cave_reads", cave_reads },
 	{ "many_site_0", many_site_0 },
 	{ "site_target", site_target },
 	{ "site_target_here", site_target_here },

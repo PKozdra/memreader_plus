@@ -3522,6 +3522,9 @@ elseif
 	or SCENARIO == 'fault_report_in_callback'
 	or SCENARIO == 'fault_report_in_site'
 	or SCENARIO == 'fault_report_in_cave'
+	or SCENARIO == 'fault_report_in_asm_cave'
+	or SCENARIO == 'fault_report_in_cave_data'
+	or SCENARIO == 'fault_report_in_cave_return'
 	or SCENARIO == 'fault_report_in_link'
 	or SCENARIO == 'fault_report_in_original'
 	or SCENARIO == 'fault_report_in_around'
@@ -3591,6 +3594,12 @@ then
 			mr.patcher('crash_owner'):cave('crash_cave', mr.pointer(target), '\72\49\192\139\64\16')
 			test_run(target, 1, 2)
 		end
+		local function crash_in_asm_cave(name, text, site)
+			local target = test_function(site)
+			local cave, why = mr.patcher('crash_owner'):cave(name, mr.pointer(target), { asm = text, echo = false })
+			check(cave ~= nil, 'the asm cave installs: ' .. tostring(why))
+			test_run(target, 1, 2)
+		end
 		local function crash_in_link()
 			local single = mr.pointer(test_function('hook_single'))
 			local pad = mr.patcher('pad_owner')
@@ -3621,6 +3630,12 @@ then
 				crash_in_callback()
 			elseif SCENARIO == 'fault_report_in_cave' then
 				crash_in_cave()
+			elseif SCENARIO == 'fault_report_in_asm_cave' then
+				crash_in_asm_cave('crash_asm', 'xor eax, eax\n\n; the next line reads through rax\nmov ecx, dword ptr [rax + 0x10]', 'cave_target')
+			elseif SCENARIO == 'fault_report_in_cave_data' then
+				crash_in_asm_cave('crash_data', 'lea rcx, [rip + table]\nxor eax, eax\nmov edx, dword ptr [rax + 0x10]\n.data\ntable: dd 7', 'cave_target')
+			elseif SCENARIO == 'fault_report_in_cave_return' then
+				crash_in_asm_cave('crash_return', 'lea rdx, [rip + done]\nxor ecx, ecx\ndone:', 'cave_reads')
 			elseif SCENARIO == 'fault_report_in_link' then
 				crash_in_link()
 			elseif SCENARIO == 'fault_report_in_original' then
@@ -8439,6 +8454,82 @@ pop rax
 		if type(a) == 'number' then return a == b end
 		return a ~= nil and b ~= nil and mr.eq(a, b)
 	end
+	local LIMIT_ASM = 'mov rax, {p:8}\nmov ecx, {d:4}\nmov cx, {w:2}\nmov dl, {b:1}'
+	local LIMIT_HEX = '48 B8 {p:8} B9 {d:4} 66 B9 {w:2} B2 {b:1}'
+	local LIMIT_CASES = {
+		{ 'p', 0, true },
+		{ 'p', 16777215, true },
+		{ 'p', 16777216, false },
+		{ 'p', 2 ^ 25, false },
+		{ 'p', -1, false },
+		{ 'p', 1.5, false },
+		{ 'p', mr.pointer('\0\0\0\2\0\0\0\0'), true },
+		{ 'p', '\255\255\255\255\255\255\255\255', true },
+		{ 'd', 16777215, true },
+		{ 'd', -16777215, true },
+		{ 'd', 16777216, false },
+		{ 'd', -16777216, false },
+		{ 'd', 0.5, false },
+		{ 'd', '\255\255\255\255', true },
+		{ 'w', 65535, true },
+		{ 'w', -32768, true },
+		{ 'w', 65536, false },
+		{ 'w', -32769, false },
+		{ 'b', 255, true },
+		{ 'b', -128, true },
+		{ 'b', 256, false },
+		{ 'b', -129, false },
+		{ 'b', '\200', true },
+	}
+	local limits = mr.patcher('asm_limits')
+	local limit_sites, limit_entries = {}, {}
+	for i, kind in ipairs({ 'asm', 'bytes' }) do
+		local fn = mr.pointer(test_function(i == 1 and 'asm_site_g' or 'asm_site_h'))
+		limit_sites[i] = mr.add(fn, 3)
+		limit_entries[i] =
+			{ name = 'limit_' .. kind, feature = 'limit_' .. kind, kind = 'cave', pattern = hex_of(fn, 16), at = 3, expect = hex_of(limit_sites[i], 5) }
+		limit_entries[i][kind] = kind == 'asm' and LIMIT_ASM or LIMIT_HEX
+	end
+	local limit_native = limits:sites(limit_entries, function() end)
+	for _, case in ipairs(LIMIT_CASES) do
+		local values = { p = 0, d = 0, w = 0, b = 0 }
+		values[case[1]] = case[2]
+		local label = ('{%s} = %s'):format(case[1], type(case[2]) == 'string' and #case[2] .. ' bytes' or tostring(case[2]))
+		local assembled = mr.assemble(LIMIT_ASM, nil, values) ~= nil
+		local fits = type(case[2]) ~= 'number' or mr.slot_fits(case[2], ({ p = 8, d = 4, w = 2, b = 1 })[case[1]])
+		check(assembled == case[3] and fits == case[3], label .. ': mr.assemble and the hex rule both give ' .. tostring(case[3]))
+		if not case[3] then
+			local asm_ok, asm_why = limit_native.install('limit_asm', values)
+			local hex_ok, hex_why = limit_native.install('limit_bytes', values)
+			check(
+				not asm_ok and not hex_ok and mr.hook_info(limit_sites[1]) == nil and mr.hook_info(limit_sites[2]) == nil,
+				label .. ': the asm site and the hex site both refuse it and install nothing: ' .. tostring(asm_why) .. ' / ' .. tostring(hex_why)
+			)
+		end
+	end
+	local _, gate_why = mr.assemble(LIMIT_ASM, nil, { p = -1, d = 0, w = 0, b = 0 })
+	check(
+		gate_why == 'asm:1:10: {p:8} as a plain number must be a whole number from 0 to 16777215; pass a pointer value or bytes',
+		'a plain number outside its slot names the slot and the range: ' .. tostring(gate_why)
+	)
+	local _, cave_why = limits:cave('limit_cave', limit_sites[1], { asm = LIMIT_ASM, values = { p = 2 ^ 25, d = 0, w = 0, b = 0 }, echo = false })
+	check(
+		cave_why ~= nil and contains(cave_why, '{p:8} as a plain number') and mr.hook_info(limit_sites[1]) == nil,
+		'p:cave refuses the same value and installs nothing: ' .. tostring(cave_why)
+	)
+	check(mr.assemble('mov eax, {n}', nil, { n = 16777215 }) == '\184\255\255\255\0', 'a plain {n} takes 16777215')
+	check(mr.assemble('add eax, {n}', nil, { n = -16777215 }) ~= nil, 'and -16777215')
+	local _, plain_why = mr.assemble('mov eax, {n}', nil, { n = 16777216 })
+	check(
+		plain_why == 'asm:1:10: {n} as a plain number must be a whole number from -16777215 to 16777215; pass a pointer value or bytes',
+		'a plain {n} past 16777215 is refused: ' .. tostring(plain_why)
+	)
+	local typed, typed_why = mr.assemble('mov eax, {n}', nil, { n = mr.uint32('\255\255\255\255') })
+	check(typed == '\184\255\255\255\255', 'a typed value in a plain {n} keeps its own range: ' .. tostring(typed and hex(typed) or typed_why))
+	check(
+		mr.slot_fits(16777215) and not mr.slot_fits(-16777216) and not mr.slot_fits(1, 3) and not mr.slot_fits('1', 4),
+		'slot_fits: plain range, unknown size, non-number'
+	)
 	for _, trip in ipairs(ROUND_TRIP) do
 		local row
 		for _, candidate in ipairs(CAVES) do
@@ -8581,7 +8672,11 @@ pop rax
 		{ 'a:\nnop\n a: nop', nil, "asm:3:2: label 'a' is defined twice" },
 		{ 'mov rax, {block:8}', nil, 'asm:1:10: {block:8} has no value' },
 		{ 'mov eax, {plain}', nil, 'asm:1:10: {plain} has no value' },
-		{ 'mov byte ptr [rax + {field:1}], 0', { field = 500 }, 'asm:1:5: {field:1} does not fit 0x1f4' },
+		{
+			'mov byte ptr [rax + {field:1}], 0',
+			{ field = 500 },
+			'asm:1:5: {field:1} as a plain number must be a whole number from -128 to 255; pass a pointer value or bytes',
+		},
 		{ 'mov al, {record:4}', { record = 1 }, 'asm:1:9: {record:4} cannot be a 4-byte field in this instruction' },
 		{ 'call {f}', { f = mr.pointer('\0\0\0\0\0\128\0\0') }, 'asm:1:6: call target 0x800000000000 is out of rel32 reach of the cave' },
 		{ 'mov eax, [rip + 0x10]', nil, 'asm:1:10: [rip + number] is not supported: use [rip + label] or [rip + {name}]' },

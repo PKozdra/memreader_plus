@@ -20,6 +20,8 @@ __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 	watch_crashes(L);
 	register_row_kind(&rows_kind);
 	register_cave_assembler(assemble_cave);
+	prepare_asm_tools();
+	register_instruction_formatter(format_instruction);
 	lua_newtable(L);
 	luaL_register(L, NULL, value_functions);
 	luaL_register(L, NULL, memory_functions);

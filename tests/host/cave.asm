@@ -12,6 +12,7 @@ PUBLIC asm_site_i_here
 PUBLIC asm_site_j_here
 PUBLIC asm_site_k_here
 PUBLIC many_site_0
+PUBLIC cave_reads
 
 .code
 
@@ -143,6 +144,13 @@ asm_site_k_here::
 	add eax, 12001
 	ret
 asm_site_k ENDP
+
+cave_reads PROC FRAME
+	.endprolog
+	mov eax, dword ptr [rcx + 10h]
+	add eax, 1
+	ret
+cave_reads ENDP
 
 many_site MACRO number
 	ALIGN 16

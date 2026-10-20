@@ -7,6 +7,14 @@ enum { DEFAULT_ADDRESS = 0x10000, MAX_DISASSEMBLE = 1024, DISASSEMBLE_LINE = 160
 static const BYTE byte_order_mark[] = { 0xEF, 0xBB, 0xBF };
 static char cave_why[ASM_ERROR_SIZE + 160];
 
+static int l_slot_fits(lua_State *L)
+{
+	int size = (int)luaL_optinteger(L, 2, 0);
+
+	lua_pushboolean(L, lua_type(L, 1) == LUA_TNUMBER && plain_slot_fits(lua_tonumber(L, 1), size));
+	return 1;
+}
+
 static Program *new_program(lua_State *L, const char *text, size_t length, INT_PTR address, INT_PTR site, BOOL wildcards)
 {
 	Program *p = lua_newuserdata(L, sizeof *p);
@@ -217,6 +225,7 @@ static const char *finish_cave(Program *p, const char *bytes, size_t size, BYTE 
 		return "the cave is larger than its memory";
 	memcpy(out, p->image, result->total);
 	result->listing = make_listing(p);
+	result->lines = make_line_map(p);
 	return NULL;
 }
 
@@ -254,5 +263,6 @@ const char *assemble_cave(lua_State *L, int spec, INT_PTR site, INT_PTR address,
 const luaL_Reg asm_functions[] = {
 	{ "assemble", l_assemble },
 	{ "disassemble", l_disassemble },
+	{ "slot_fits", l_slot_fits },
 	{ NULL, NULL }
 };

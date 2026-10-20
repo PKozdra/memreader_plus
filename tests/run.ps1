@@ -19,7 +19,7 @@ $expect = [ordered]@{
     file_edit = 0; file_edit_sites = 0; file_edit_off = 0; file_edit_saved_off = 0
     newest_wins_single = 0; newest_wins_two_releases = 0; newest_wins_old_bundle_first = 0; newest_wins_cpecific_after = 0
     newest_wins_stale_cache = 0; newest_wins_no_lookup = 0; newest_wins_bad_markers = 0; newest_wins_failed_start = 0; newest_wins_frozen_boot = 0
-    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash; fault_report_in_site = $crash; fault_report_in_cave = $crash; fault_report_in_link = $crash; fault_report_in_original = $crash; fault_report_in_around = $crash
+    fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash; fault_report_in_site = $crash; fault_report_in_cave = $crash; fault_report_in_asm_cave = $crash; fault_report_in_cave_data = $crash; fault_report_in_cave_return = $crash; fault_report_in_link = $crash; fault_report_in_original = $crash; fault_report_in_around = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
     fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash
     fault_report_two_threads = $crash; fault_report_overlap = $crash; fault_report_worker_stuck = $crash; fault_report_worker_waits = $crash
@@ -30,7 +30,7 @@ $expect = [ordered]@{
     report_snapshot = 0; report_native = 0; report_lua_only = 0; report_loader = 0
 }
 $reports = @{
-    fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'; fault_report_in_site = 'started'; fault_report_in_cave = 'started'; fault_report_in_link = 'started'; fault_report_in_original = 'started'; fault_report_in_around = 'started'
+    fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'; fault_report_in_site = 'started'; fault_report_in_cave = 'started'; fault_report_in_asm_cave = 'started'; fault_report_in_cave_data = 'started'; fault_report_in_cave_return = 'started'; fault_report_in_link = 'started'; fault_report_in_original = 'started'; fault_report_in_around = 'started'
     fault_report_stale = 'started'; fault_report_thread = 'started'; fault_report_native_thread = 'started'; fault_report_overflow = 'started'
     fault_report_cpp = 'started'; fault_report_fallback = 'started'; fault_report_clues = 'started'
     fault_report_two_threads = 'started'; fault_report_overlap = 'started'; fault_report_worker_stuck = 'none'; fault_report_worker_waits = 'started'
@@ -44,7 +44,7 @@ $runtimeCounts = @{
 }
 $readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
-    fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull; fault_report_in_site = $readOfNull; fault_report_in_cave = $readOfNull; fault_report_in_link = $readOfNull; fault_report_in_original = $readOfNull; fault_report_in_around = $readOfNull
+    fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull; fault_report_in_site = $readOfNull; fault_report_in_cave = $readOfNull; fault_report_in_asm_cave = $readOfNull; fault_report_in_cave_data = $readOfNull; fault_report_in_cave_return = $readOfNull; fault_report_in_link = $readOfNull; fault_report_in_original = $readOfNull; fault_report_in_around = $readOfNull
     fault_report_stale = $readOfNull; fault_report_thread = $readOfNull; fault_report_native_thread = $readOfNull
     fault_report_overflow = @('exception 0xc00000fd (stack overflow)'); fault_report_cpp = @('exception 0xe06d7363 (C++ exception, type .H)')
     fault_report_fallback = $readOfNull; fault_report_clues = @('exception 0xc0000005 (access violation)')
@@ -88,8 +88,13 @@ $scenarioNeedles = @{
     fault_report_in_callback = @('RUNNING (on the stack)', ', callback ')
     fault_report_in_site = @(', site hook, RUNNING (on the stack)', ', callback ')
     fault_report_in_cave = @(
-        'Plus code cave for Warhammer3.exe+0x', ', by crash_owner/crash_cave)', 'memreader Plus changes by owner:', '  crash_owner: 1 cave (crash_cave Warhammer3.exe+0x',
+        'Plus code cave for Warhammer3.exe+0x', ', by crash_owner/crash_cave, cave +0x3)', 'memreader Plus changes by owner:', '  crash_owner: 1 cave (crash_cave Warhammer3.exe+0x',
         ', code cave, by crash_owner/crash_cave'
+    )
+    fault_report_in_asm_cave = @(') at 0', ' (Plus code cave for Warhammer3.exe+0x', ', by crash_owner/crash_asm, cave +0x2, line 4: mov ecx, dword ptr [rax+0x10])')
+    fault_report_in_cave_data = @(', by crash_owner/crash_data, cave +0x9, line 3: mov edx, dword ptr [rax+0x10])', ', by crash_owner/crash_data, cave +0x1a, .data line 5)')
+    fault_report_in_cave_return = @(
+        ' (trampoline of the Plus hook on Warhammer3.exe+0x', ', by crash_owner/crash_return, +0x0: mov eax, dword ptr [rcx+0x10])', ', by crash_owner/crash_return, cave +0x9, the jump back)'
     )
     fault_report_in_link = @(
         'RUNNING (on the stack)', ', callback ', 'memreader Plus link running: crash_owner/crash_link (prefix) on Warhammer3.exe+0x', ', by crash_owner/crash_link',
@@ -114,7 +119,7 @@ $scenarioNeedles = @{
 }
 $scenarioAbsent = @{ fault_report_in_original = @('memreader Plus link running') }
 $ownerHeader = 'memreader Plus changes by owner:'
-$ownerScenarios = @('owner_report', 'rows', 'fault_report_in_cave', 'fault_report_in_link', 'fault_report_in_original', 'fault_report_in_around')
+$ownerScenarios = @('owner_report', 'rows', 'fault_report_in_cave', 'fault_report_in_asm_cave', 'fault_report_in_cave_data', 'fault_report_in_cave_return', 'fault_report_in_link', 'fault_report_in_original', 'fault_report_in_around')
 $scenarioPatterns = @{ fault_report_in_site = 'Warhammer3\.exe\+0x[0-9a-f]+  function \+0x[0-9a-f]+, offset \+0x128\r?\n' }
 $contextNeedles = @(
     'Game context set by script at safe moments:', '  mode: campaign', '  campaign: main_warhammer', '  campaign type: sp', '  difficulty: hard',

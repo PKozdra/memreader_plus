@@ -30,7 +30,7 @@ static ZydisDecoder decoder;
 static ZydisFormatter formatter;
 static BOOL tools_ready;
 
-static void prepare_tools(void)
+void prepare_asm_tools(void)
 {
 	if (tools_ready)
 		return;
@@ -92,12 +92,47 @@ static INT64 raw_number(const Name *name)
 	return name->raw_size == 4 ? (INT64)(INT32)(UINT32)value : (INT64)value;
 }
 
+BOOL plain_slot_range(int size, INT64 *low, INT64 *high)
+{
+	*low = -MAX_EXACT_NUMBER;
+	*high = MAX_EXACT_NUMBER;
+	if (size == 1 || size == 2) {
+		*low = -((INT64)1 << (size * 8 - 1));
+		*high = ((INT64)1 << (size * 8)) - 1;
+	} else if (size == 8) {
+		*low = 0;
+	}
+	return size == 0 || size == 1 || size == 2 || size == 4 || size == 8;
+}
+
+BOOL plain_slot_fits(lua_Number number, int size)
+{
+	INT64 low, high;
+
+	return plain_slot_range(size, &low, &high) && number >= (lua_Number)low && number <= (lua_Number)high && number == (lua_Number)(INT64)number;
+}
+
+static BOOL plain_number_ok(Program *p, const Line *line, const Operand *op, int size)
+{
+	const Name *name = &p->names[op->name];
+	INT64 low, high;
+
+	if (name->kind != GIVEN_NUMBER || plain_slot_fits((lua_Number)name->number, size))
+		return TRUE;
+	plain_slot_range(size, &low, &high);
+	if (!size)
+		return asm_fail(p, line->line, op->column, "{%s} as a plain number must be a whole number from %lld to %lld; pass a pointer value or bytes", name->name, low, high);
+	return asm_fail(p, line->line, op->column, "{%s:%d} as a plain number must be a whole number from %lld to %lld; pass a pointer value or bytes", name->name, size, low, high);
+}
+
 static BOOL plain_value(Program *p, const Line *line, const Operand *op, INT64 *out)
 {
 	const Name *name = &p->names[op->name];
 
 	if (name->kind == GIVEN_NONE)
 		return asm_fail(p, line->line, op->column, "{%s} has no value", name->name);
+	if (!plain_number_ok(p, line, op, 0))
+		return FALSE;
 	*out = name->kind == GIVEN_RAW ? raw_number(name) : name->number;
 	return TRUE;
 }
@@ -399,6 +434,8 @@ static BOOL slot_bytes(Program *p, const Line *line, const Operand *op, BYTE *ou
 		memcpy(out, name->raw, (size_t)size);
 		return TRUE;
 	}
+	if (!plain_number_ok(p, line, op, size))
+		return FALSE;
 	if (!fits(name->number, size))
 		return asm_fail(p, line->line, op->column, "{%s:%d} does not fit %s0x%llx", name->name, size, sign_of(name->number), magnitude(name->number));
 	memcpy(out, &name->number, (size_t)size);
@@ -536,7 +573,7 @@ static BOOL emit(Program *p)
 
 BOOL build_program(Program *p)
 {
-	prepare_tools();
+	prepare_asm_tools();
 	return measure(p) && emit(p);
 }
 
@@ -622,7 +659,7 @@ void write_listing(const Program *p, Text *out)
 {
 	int section, i;
 
-	prepare_tools();
+	prepare_asm_tools();
 	for (section = SECTION_CODE; section <= SECTION_DATA; section++) {
 		for (i = 0; i < p->line_count; i++) {
 			if (p->lines[i].section == section && p->lines[i].size > 0)
@@ -633,6 +670,37 @@ void write_listing(const Program *p, Text *out)
 	}
 }
 
+CaveLine *make_line_map(const Program *p)
+{
+	CaveLine *lines = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ((size_t)p->line_count + 1) * sizeof *lines);
+	int i, count = 0;
+
+	if (!lines)
+		return NULL;
+	for (i = 0; i < p->line_count; i++) {
+		const Line *line = &p->lines[i];
+
+		if (line->size <= 0)
+			continue;
+		lines[count].offset = (UINT16)image_offset(p, line);
+		lines[count].size = (UINT16)line->size;
+		lines[count].data = line->section == SECTION_DATA;
+		lines[count].line = line->line;
+		count++;
+	}
+	return lines;
+}
+
+BOOL format_instruction(const BYTE *code, size_t size, ULONG_PTR address, char *out, size_t room)
+{
+	ZydisDecodedInstruction decoded;
+	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+
+	if (!tools_ready || !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code, size, &decoded, operands)))
+		return FALSE;
+	return ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&formatter, &decoded, operands, decoded.operand_count_visible, out, room, (ZyanU64)address, ZYAN_NULL));
+}
+
 int disassemble_one(INT_PTR address, Text *out)
 {
 	BYTE code[ZYDIS_MAX_INSTRUCTION_LENGTH];
@@ -641,7 +709,7 @@ int disassemble_one(INT_PTR address, Text *out)
 	char text[LINE_TEXT] = "";
 	size_t readable = sizeof code;
 
-	prepare_tools();
+	prepare_asm_tools();
 	while (readable > 0 && !copy_original(address, code, readable))
 		readable--;
 	add_text(out, "0x%llx  ", (UINT64)address);

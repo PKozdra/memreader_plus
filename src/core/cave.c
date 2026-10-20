@@ -68,7 +68,7 @@ static int place_cave(lua_State *L)
 {
 	Cave *cave = lua_touserdata(L, 1);
 
-	install_code_hook(L, cave->address, cave->start, cave->total, seal_cave, cave);
+	install_code_hook(L, cave->address, cave->start, cave->size, cave->total, seal_cave, cave);
 	return 0;
 }
 
@@ -320,7 +320,10 @@ static void free_listing(AssembledCave *image)
 {
 	if (image->listing)
 		HeapFree(GetProcessHeap(), 0, image->listing);
+	if (image->lines)
+		HeapFree(GetProcessHeap(), 0, image->lines);
 	image->listing = NULL;
+	image->lines = NULL;
 }
 
 static void free_prepared(PreparedCave *cave)
@@ -454,7 +457,8 @@ int try_asm_cave(lua_State *L, INT_PTR site, int spec, const char *name, BYTE **
 		free_prepared(&cave);
 		return CAVE_REFUSED;
 	}
-	set_cave_listing(site, echo_text(name, &cave));
+	set_cave_listing(site, echo_text(name, &cave), cave.image.lines);
+	cave.image.lines = NULL;
 	free_listing(&cave.image);
 	*start = cave.start;
 	return CAVE_OK;
