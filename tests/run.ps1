@@ -27,7 +27,7 @@ $expect = [ordered]@{
     exit_report = 7; exit_report_terminate = 8; exit_report_crt = 9; exit_report_quiet = 0; exit_report_off = 7
     runtime_report = 0; runtime_report_reports_off = 0; runtime_report_no_folder = 0; runtime_report_write_fails = 0
     runtime_report_then_crash = $crash; settings_cut = $crash; settings_none = $crash
-    report_snapshot = 0; report_native = 0; report_lua_only = 0; report_loader = 0
+    report_snapshot = 0; report_native = 0; report_lua_only = 0; report_loader = 0; locale_guard_big = 0
 }
 $reports = @{
     fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'; fault_report_in_site = 'started'; fault_report_in_cave = 'started'; fault_report_in_asm_cave = 'started'; fault_report_in_cave_data = 'started'; fault_report_in_cave_return = 'started'; fault_report_in_link = 'started'; fault_report_in_original = 'started'; fault_report_in_around = 'started'
@@ -67,6 +67,7 @@ $exitAbsent = @('report_me', "The game's crash handler caught it", 'Lua stack', 
 $offScriptThread = @('fault_report_native_thread', 'fault_report_two_threads', 'fault_report_overlap', 'fault_report_worker_waits')
 $timeLimits = @{
     fault_report_worker_stuck = 4, 12; fault_report_worker_waits = 4, 9; fault_report_worker_blocked = 9, 15; fault_report_worker_dead = 0, 4
+    locale_guard_big = 0, 60
 }
 $moveCalls = @{ fault_report_move_retry = '4'; fault_report_move_fails = '5' }
 $staleTemporary = 'memreader_crash_report_010101_0000.txt.1.tmp'

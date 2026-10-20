@@ -9629,6 +9629,36 @@ elseif SCENARIO == 'cave_near_unreserved' then
 		check(count_logged(logged, NOTE) == 0, 'without logging the line again')
 		check(mr ~= nil and string.sub(pages(mr), -8) == '/16/1024', 'and keeps the block of the session: ' .. (mr and pages(mr) or '?'))
 	end
+elseif SCENARIO == 'locale_guard_big' then
+	local guard = dofile(ROOT .. '/script/memreader_plus/locale_guard.lua')
+	local function saved_table(number)
+		local parts = { 'return {' }
+		for group = 1, 1000 do
+			parts[#parts + 1] = ('[%d]={'):format(group)
+			for row = 1, 400 do
+				parts[#parts + 1] = ('[%d]={["x"]=%s,["name"]="unit,7",["key"]=%d},'):format(row, number, row)
+			end
+			parts[#parts + 1] = '["n"]=1},'
+		end
+		parts[#parts + 1] = '["end"]=1}'
+		return table.concat(parts)
+	end
+	local function wrong_rows(text)
+		local data = assert(loadstring(text))()
+		local wrong = 0
+		for group = 1, 1000 do
+			for row = 1, 400 do
+				local item = data[group][row]
+				if item.x ~= 0.75 or item.key ~= row or item.name ~= 'unit,7' then wrong = wrong + 1 end
+			end
+		end
+		return wrong
+	end
+	local dot = saved_table('0.75')
+	check(#dot > 16777216, 'the saved table is longer than 16777216 characters: ' .. #dot)
+	check(guard.repair(dot) == dot, 'a table saved with decimal points is returned unchanged')
+	local comma = saved_table('0,75')
+	check(wrong_rows(guard.repair(comma)) == 0, 'a table saved with decimal commas past 16777216 characters loads exact')
 else
 	error('unknown scenario ' .. tostring(SCENARIO))
 end

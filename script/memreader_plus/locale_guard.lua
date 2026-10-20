@@ -22,15 +22,14 @@ local function is_number_tail(text)
 	return text:match('^%d+$') ~= nil or text:match('^%d+[eE][%+%-]?%d+$') ~= nil
 end
 
+local function fix_decimal(whole, tail, after)
+	if not is_number_tail(tail) then return nil end
+	return whole .. '.' .. tail .. after
+end
+
 local function repair_value(piece)
-	return (
-		piece:gsub('(%]=%-?%d+),([%deE%+%-]+)()', function(whole, tail, after)
-			local next_text = piece:sub(after, after + 1)
-			if not is_number_tail(tail) then return nil end
-			if next_text:sub(1, 1) ~= '}' and next_text ~= ',[' then return nil end
-			return whole .. '.' .. tail
-		end)
-	)
+	piece = piece:gsub('(%]=%-?%d+),([%deE%+%-]+)(})', fix_decimal)
+	return (piece:gsub('(%]=%-?%d+),([%deE%+%-]+)(,%[)', fix_decimal))
 end
 
 local function repair_key(piece)
@@ -38,14 +37,15 @@ local function repair_key(piece)
 end
 
 function guard.repair(text)
-	local parts = {}
+	if not string.match(text, '%d,%d') then return text end
 	local inside = false
-	for piece, quote in text:gmatch('([^"]*)("?)') do
-		if not inside then piece = repair_key(repair_value(piece)) end
-		parts[#parts + 1] = piece .. quote
-		if quote ~= '' then inside = not inside end
-	end
-	return table.concat(parts)
+	return (
+		text:gsub('([^"]*)("?)', function(piece, quote)
+			if not inside then piece = repair_key(repair_value(piece)) end
+			if quote ~= '' then inside = not inside end
+			return piece .. quote
+		end)
+	)
 end
 
 local function guard_saving(manager)
