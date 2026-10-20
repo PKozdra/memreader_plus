@@ -8825,8 +8825,8 @@ one: dd 1.0
 		return mr.tonumber(mr.call(float_target, 'float(int32, float, float)', armour, low, damage))
 	end
 	check(ap(50, 0.5, 200) == 200, 'the host function returns the damage before the cave')
-	local data_cave = p:cave('ap_data', float_site, { asm = AP_DATA, source = 'script/test/ap.asm' })
-	check(data_cave ~= nil, 'the AP armour cave with .data constants installs')
+	local data_cave, data_why = p:cave('ap_data', float_site, { asm = AP_DATA, source = 'script/test/ap.asm' })
+	check(data_cave ~= nil, 'the AP armour cave with .data constants installs: ' .. tostring(data_why))
 	check(
 		math.abs(ap(50, 0.5, 200) - 150) < 0.01 and math.abs(ap(0, 0.5, 200) - 200) < 0.01 and math.abs(ap(400, 0.5, 200)) < 0.01,
 		'and reduces the damage by the armour roll: ' .. ap(50, 0.5, 200)
