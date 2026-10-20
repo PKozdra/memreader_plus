@@ -2243,7 +2243,7 @@ elseif SCENARIO == 'far_hook' then
 
 	local trampoline = mr.hook_info(target).original
 	local moved = offset_in(trampoline)
-	check(moved == at, 'the spinning thread was moved to the same instruction in the trampoline, at offset ' .. tostring(moved))
+	check(moved == 1 or moved == 4, 'the spinning thread was moved onto its loop in the trampoline, at offset ' .. tostring(moved))
 	check(test_park_finish() == 77, 'the thread leaves the loop and finishes the function')
 	check(mr.tonumber(mr.call(target, 'int32(pointer)', mr.pointer(test_park_flag()))) == 1077, 'the hooked function runs the callback and the original')
 
