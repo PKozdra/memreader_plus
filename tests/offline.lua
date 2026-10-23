@@ -142,6 +142,41 @@ local function fill_code_patches(mr)
 	patch_from_chunk('newest_patch', mr, mr.add(filler, 2000))
 end
 
+local function live(fields)
+	fields.is_null_interface = function()
+		return false
+	end
+	return fields
+end
+
+local function destroyed_character(cqi, faction_key)
+	local details = live({
+		faction = function()
+			return live({
+				name = function()
+					return faction_key
+				end,
+			})
+		end,
+		get_forename = function()
+			return 'names_name_' .. cqi
+		end,
+	})
+	local member = live({
+		command_queue_index = function()
+			return cqi
+		end,
+		character_details = function()
+			return details
+		end,
+	})
+	return {
+		family_member = function()
+			return member
+		end,
+	}
+end
+
 local function fill_crash_context(mr)
 	local listeners = {}
 	local chunk = assert(real_loadfile(PACK .. '/script/_lib/mod/memreader_plus_context.lua'))
@@ -168,6 +203,14 @@ local function fill_crash_context(mr)
 	for _ = 1, 3 do
 		core:event_callback('CharacterTurnStart', faction)
 	end
+	for cqi = 1, 4 do
+		core:event_callback('CharacterDestroyed', destroyed_character(cqi, 'wh_d'))
+	end
+	core:event_callback('MilitaryForceDestroyed', {
+		military_force = function()
+			error('the force is gone')
+		end,
+	})
 	local block = mr.alloc(16)
 	for offset = 0, 4, 4 do
 		mr.write(block, offset, mr.uint32(7))
@@ -610,6 +653,8 @@ local HOST_FAULTS = {
 	fault_report_worker_dead = { 'worker_dead', false },
 	fault_report_move_retry = { 'move_retry', false },
 	fault_report_move_fails = { 'move_fails', false },
+	fault_report_far_field = { 'far_field', false },
+	fault_report_no_holder = { 'no_holder', false },
 }
 
 local BOOT = 'script/_lib/mod/!memreader_plus_boot.lua'
@@ -3715,6 +3760,43 @@ elseif SCENARIO:sub(1, 14) == 'runtime_report' then
 			check(exists(name), 'the named file is in the report folder')
 		end
 	end
+elseif SCENARIO == 'plus_users' then
+	run_mod(OURS)
+	local mr = _G.memreader_plus
+	local data = mr.alloc(64)
+	local function script(path, code)
+		return assert(loadstring('local mr, data = ...\n' .. code, '@' .. path))
+	end
+	local writer = script('script/battle/mod/example_writer.lua', 'for i = 1, 3 do mr.write(data, 0, mr.uint32(i)) end\nmr.read_uint32(data, 0)')
+	local reader = script('script/campaign/mod/example_reader.lua', 'for _ = 1, 5 do mr.read_uint32(data, 0) end')
+	local own = script('script/_lib/mod/memreader_plus_context.lua', 'mr.write(data, 0, mr.uint32(0))')
+	mr.set_crash_context('mode', 'battle')
+	writer(mr, data)
+	local open = package.loadlib('.\\twwh3-memreader_plus.dll', 'luaopen_memreader_plus')
+	check(open ~= nil, 'the test opens Plus again, as a new mode would')
+	local campaign = open()
+	mr.set_crash_context('mode', 'campaign')
+	reader(campaign, data)
+	writer(campaign, data)
+	own(campaign, data)
+	check(pcall(campaign.write, data, 0, campaign.uint32(7)), 'a write straight from pcall works')
+	local name = mr.write_runtime_report()
+	local file = io.open(name, 'rb')
+	local text = file and file:read('*a') or ''
+	if file then file:close() end
+	local function shows(part)
+		return text:find(part, 1, true) ~= nil
+	end
+	check(shows('Mods using memreader Plus this session, by script:'), 'the report lists the scripts that used Plus')
+	check(
+		shows('  example_writer (script/battle/mod/example_writer.lua, battle, campaign): 6 writes\n'),
+		'a script used in battle and then in campaign is listed with both modes and its counts'
+	)
+	check(not shows('example_reader'), 'a script that only reads is not listed')
+	check(text:find('  offline %(.-offline%.lua, [%a, ]+%):[^\n]* writes?') ~= nil, 'a write through pcall counts for the script that called pcall')
+	local users = text:match('by script:\n(.-)\n%S') or ''
+	check(users ~= '' and not users:find('memreader_plus_context', 1, true), "Plus's own scripts are not listed")
+	if not shows('example_writer') then print(text) end
 elseif SCENARIO == 'owner_report' then
 	io.stdout:setvbuf('no')
 	load_other_program_dll()

@@ -841,6 +841,32 @@ static void fault_crt_exit(void)
 
 static INT32 (*volatile divider)(INT32, INT32) = divide;
 
+static __declspec(noinline) ULONG_PTR read_through_field(const BYTE *object, size_t offset)
+{
+	const BYTE *field = *(const BYTE *const *)(object + offset);
+
+	return *(volatile const ULONG_PTR *)(field + 0x10);
+}
+
+static void fault_text_in_field(size_t offset)
+{
+	static const WCHAR words[] = L" inc";
+	BYTE *object = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x2000);
+
+	memcpy(object + offset, words, sizeof words - sizeof words[0]);
+	read_through_field(object, offset);
+}
+
+static void fault_far_field(void)
+{
+	fault_text_in_field(0x438);
+}
+
+static void fault_no_holder(void)
+{
+	fault_text_in_field(0x1800);
+}
+
 static void fault_divide(void)
 {
 	divider(1, 0);
@@ -2059,6 +2085,8 @@ static const struct {
 	{ "worker_dead", fault_worker_dead },
 	{ "move_retry", fault_move_retry },
 	{ "move_fails", fault_move_fails },
+	{ "far_field", fault_far_field },
+	{ "no_holder", fault_no_holder },
 	{ "no_report_folder", fault_no_report_folder },
 };
 

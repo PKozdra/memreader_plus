@@ -449,6 +449,19 @@ static void add_value(Text *text, ULONG_PTR value)
 		add_text(text, "  readable");
 }
 
+BOOL is_plain_heap_pointer(ULONG_PTR value)
+{
+	char scratch[4 * TEXT_PREVIEW];
+	Text text = { scratch, sizeof scratch, 0 };
+	ULONG_PTR first;
+
+	if (!is_heap_pointer(value) || describe_hook_code(value, NULL, 0))
+		return FALSE;
+	if (copy_memory(&first, (INT_PTR)value, sizeof first) && is_vtable(first))
+		return FALSE;
+	return !add_text_preview(&text, value);
+}
+
 void add_registers(Text *text, const CONTEXT *context)
 {
 	const DWORD64 *values = &context->Rax;

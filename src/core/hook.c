@@ -818,6 +818,7 @@ static int l_hook(lua_State *L)
 	Signature signature;
 	Hook *hook;
 
+	note_use(L, USE_HOOK);
 	parse_signature(L, luaL_checkstring(L, 2), &signature);
 	luaL_checktype(L, 3, LUA_TFUNCTION);
 	if (!target)
@@ -850,6 +851,7 @@ int l_hook_site(lua_State *L)
 	INT_PTR target = pointer_argument(L, 1);
 	Hook *hook;
 
+	note_use(L, USE_HOOK);
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	if (!target)
 		return luaL_argerror(L, 1, "address is NULL");

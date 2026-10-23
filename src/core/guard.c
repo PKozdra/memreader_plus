@@ -229,10 +229,13 @@ void note_owned_change(lua_State *L, const char *what, INT_PTR address, size_t s
 	char where[CALLER_SIZE];
 
 	caller_position(L, where, sizeof where);
-	if (in_exe_code(address))
+	if (in_exe_code(address)) {
+		note_use(L, USE_PATCH);
 		note_patch(what, where, tag, address, size);
-	else
-		note_write(what, where, tag, address, size);
+		return;
+	}
+	note_use(L, strcmp(what, "row") == 0 ? USE_ROW : USE_WRITE);
+	note_write(what, where, tag, address, size);
 }
 
 void note_change(lua_State *L, const char *what, INT_PTR address, size_t size)

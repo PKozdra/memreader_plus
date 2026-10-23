@@ -350,6 +350,7 @@ static int l_call(lua_State *L)
 	INT_PTR function = pointer_argument(L, 1);
 	Signature signature;
 
+	note_use(L, USE_CALL);
 	parse_signature(L, luaL_checkstring(L, 2), &signature);
 	if (function && !in_exe_code(function) && !is_executable(function)) {
 		note_refusal(L, "call", function);

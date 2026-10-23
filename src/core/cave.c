@@ -494,6 +494,7 @@ static int l_code_cave(lua_State *L)
 	BYTE *start = NULL;
 	int result;
 
+	note_use(L, USE_CAVE);
 	if (!address)
 		return luaL_argerror(L, 1, "address is NULL");
 	if (size == 0)

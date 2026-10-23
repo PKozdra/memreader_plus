@@ -15,6 +15,8 @@ enum {
 	CONTEXT_VALUE_SIZE = 160,
 	MAX_EVENTS = 32,
 	EVENT_NAME_SIZE = 48,
+	EVENT_DETAILS = 3,
+	EVENT_DETAIL_SIZE = 96,
 	CUT_ROOM = 64,
 	SETTINGS_SIZE = 16384,
 	ALLOCATOR_DEPTH = 4,
@@ -31,6 +33,8 @@ typedef struct {
 	UINT32 count;
 	UINT32 order;
 	ULONGLONG last_tick;
+	UINT32 detail_count;
+	char details[EVENT_DETAILS][EVENT_DETAIL_SIZE];
 } EventEntry;
 
 typedef void (*Section)(Text *report, const CrashInput *input);
@@ -92,28 +96,38 @@ void set_crash_context(const char *name, const char *value)
 	}
 	copy_clean(field->name, sizeof field->name, name);
 	copy_clean(field->value, sizeof field->value, value);
+	if (strcmp(field->name, "mode") == 0)
+		set_use_mode(field->value);
 }
 
-void note_crash_event(const char *name)
+static EventEntry *event_entry(const char *name)
 {
 	EventEntry *oldest = &events[0];
 	int i;
 
-	event_order++;
 	for (i = 0; i < MAX_EVENTS; i++) {
-		if (events[i].count && strncmp(events[i].name, name, EVENT_NAME_SIZE - 1) == 0) {
-			events[i].count++;
-			events[i].order = event_order;
-			events[i].last_tick = GetTickCount64();
-			return;
-		}
+		if (events[i].count && strncmp(events[i].name, name, EVENT_NAME_SIZE - 1) == 0)
+			return &events[i];
 		if (events[i].order < oldest->order)
 			oldest = &events[i];
 	}
 	copy_clean(oldest->name, sizeof oldest->name, name);
-	oldest->count = 1;
-	oldest->order = event_order;
-	oldest->last_tick = GetTickCount64();
+	oldest->count = 0;
+	oldest->detail_count = 0;
+	return oldest;
+}
+
+void note_crash_event(const char *name, const char *detail)
+{
+	EventEntry *entry = event_entry(name);
+
+	entry->count++;
+	entry->order = ++event_order;
+	entry->last_tick = GetTickCount64();
+	if (!detail)
+		return;
+	copy_clean(entry->details[entry->detail_count % EVENT_DETAILS], EVENT_DETAIL_SIZE, detail);
+	entry->detail_count++;
 }
 
 static void add_bytes(Text *text, const char *bytes, size_t length)
@@ -291,6 +305,14 @@ static const EventEntry *next_newest(UINT32 below)
 	return newest;
 }
 
+static void add_event_details(Text *report, const EventEntry *entry)
+{
+	UINT32 shown;
+
+	for (shown = 0; shown < entry->detail_count && shown < EVENT_DETAILS; shown++)
+		add_text(report, "%s%s", shown ? ", " : ": ", entry->details[(entry->detail_count - 1 - shown) % EVENT_DETAILS]);
+}
+
 static void add_events(Text *report, const CrashInput *input)
 {
 	ULONGLONG now = GetTickCount64(), ago;
@@ -301,7 +323,9 @@ static void add_events(Text *report, const CrashInput *input)
 	add_text(report, "Recent script events, newest first:\n");
 	for (; entry; entry = next_newest(entry->order)) {
 		ago = now - entry->last_tick;
-		add_text(report, "  %s x%u, last %llu.%llu s before\n", entry->name, entry->count, ago / 1000, ago % 1000 / 100);
+		add_text(report, "  %s x%u, last %llu.%llu s before", entry->name, entry->count, ago / 1000, ago % 1000 / 100);
+		add_event_details(report, entry);
+		add_text(report, "\n");
 	}
 	(void)input;
 }
@@ -469,6 +493,12 @@ static void add_plus_changes(Text *report, const CrashInput *input)
 	(void)input;
 }
 
+static void add_plus_users(Text *report, const CrashInput *input)
+{
+	add_users(report);
+	(void)input;
+}
+
 static void add_modules(Text *report, const CrashInput *input)
 {
 	add_timing_hooks(report);
@@ -476,17 +506,17 @@ static void add_modules(Text *report, const CrashInput *input)
 }
 
 static const Section crash_sections[] = {
-	add_header, add_thread, add_uptime, add_context, add_settings, add_events, add_lua_part, add_crashed_stack,
+	add_header, add_thread, add_uptime, add_plus_users, add_context, add_settings, add_events, add_lua_part, add_crashed_stack,
 	add_crashed_registers, add_crashed_memory, add_script_stack, add_plus_owners, add_plus_hooks, add_plus_capacity, add_plus_changes, add_modules
 };
 
 static const Section exit_sections[] = {
-	add_exit_header, add_thread_and_log, add_uptime, add_context, add_settings, add_events, add_exit_stack, add_plus_owners,
+	add_exit_header, add_thread_and_log, add_uptime, add_plus_users, add_context, add_settings, add_events, add_exit_stack, add_plus_owners,
 	add_plus_hooks, add_plus_capacity, add_plus_changes, add_modules
 };
 
 static const Section runtime_sections[] = {
-	add_runtime_header, add_thread_and_log, add_uptime, add_context, add_settings, add_events, add_plus_owners, add_plus_hooks,
+	add_runtime_header, add_thread_and_log, add_uptime, add_plus_users, add_context, add_settings, add_events, add_plus_owners, add_plus_hooks,
 	add_plus_capacity, add_plus_changes, add_modules
 };
 

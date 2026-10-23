@@ -15,6 +15,7 @@ static int l_capacity(lua_State *L)
 
 __declspec(dllexport) int luaopen_memreader_plus(lua_State *L)
 {
+	start_use_generation();
 	prepare_hooks();
 	reserve_near_caves();
 	watch_crashes(L);

@@ -65,6 +65,7 @@ add_library(memreader_plus SHARED
 	src/core/native.c
 	src/core/crash_report.c
 	src/core/clues.c
+	src/core/users.c
 	src/core/thunk.asm
 	src/game/game.h
 	src/game/crash.c

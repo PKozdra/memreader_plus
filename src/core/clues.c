@@ -6,7 +6,9 @@ enum {
 	MAX_JUMPS = 4,
 	JUMP_BYTES = 14,
 	REGISTERS = 16,
-	SEARCH_AROUND = 64,
+	SEARCH_NEAR = 64,
+	SEARCH_FAR = 0x1000,
+	MAX_PLAIN_DUMPS = 3,
 	DUMP_BEFORE = 64,
 	DUMP_BYTES = 128,
 	LINE_BYTES = 16,
@@ -154,25 +156,40 @@ void add_timing_hooks(Text *text)
 		add_text(text, "No other program's DLL hooks the game's timing functions\n");
 }
 
-static BOOL holds_value(ULONG_PTR around, ULONG_PTR value, ULONG_PTR *at)
+static BOOL holds_at(ULONG_PTR spot, ULONG_PTR value, BOOL *open, ULONG_PTR *at)
 {
-	ULONG_PTR spot;
+	ULONG_PTR seen;
 
-	for (spot = (around - SEARCH_AROUND) & ~(ULONG_PTR)7; spot <= around + SEARCH_AROUND; spot += sizeof spot) {
-		if (read_pointer(spot) == value) {
-			*at = spot;
+	if (!*open)
+		return FALSE;
+	if (!copy_memory(&seen, (INT_PTR)spot, sizeof seen)) {
+		*open = FALSE;
+		return FALSE;
+	}
+	if (seen != value)
+		return FALSE;
+	*at = spot;
+	return TRUE;
+}
+
+static BOOL holds_value(ULONG_PTR around, ULONG_PTR value, ULONG_PTR reach, ULONG_PTR *at)
+{
+	ULONG_PTR base = around & ~(ULONG_PTR)7, distance;
+	BOOL up = TRUE, down = TRUE;
+
+	for (distance = 0; distance <= reach && (up || down); distance += sizeof distance) {
+		if (holds_at(base + distance, value, &up, at) || (distance && holds_at(base - distance, value, &down, at)))
 			return TRUE;
-		}
 	}
 	return FALSE;
 }
 
-static int holder_of(const DWORD64 *values, ULONG_PTR bad, ULONG_PTR *at)
+static int holder_of(const DWORD64 *values, ULONG_PTR bad, ULONG_PTR reach, ULONG_PTR *at)
 {
 	int i;
 
 	for (i = 0; i < REGISTERS; i++) {
-		if (is_heap_pointer((ULONG_PTR)values[i]) && holds_value((ULONG_PTR)values[i], bad, at))
+		if (is_heap_pointer((ULONG_PTR)values[i]) && holds_value((ULONG_PTR)values[i], bad, reach, at))
 			return i;
 	}
 	return -1;
@@ -263,15 +280,16 @@ static void add_dump(Text *text, ULONG_PTR center)
 	}
 }
 
-static BOOL add_holder(Text *text, const DWORD64 *values, ULONG_PTR bad, const char *what)
+static BOOL add_holder(Text *text, const DWORD64 *values, ULONG_PTR bad, ULONG_PTR reach, const char *what)
 {
-	ULONG_PTR at;
-	int holder = holder_of(values, bad, &at);
+	ULONG_PTR at, base;
+	int holder = holder_of(values, bad, reach, &at);
 
 	if (holder < 0)
 		return FALSE;
-	add_text(text, "Memory around %s%+lld, which holds the bad value of %s:\n", register_name(holder),
-		(long long)(at - (ULONG_PTR)values[holder]), what);
+	base = (ULONG_PTR)values[holder];
+	add_text(text, "Memory around %s%s0x%llx, which holds the bad value of %s:\n", register_name(holder), at < base ? "-" : "+",
+		(unsigned long long)(at < base ? base - at : at - base), what);
 	add_dump(text, at);
 	return TRUE;
 }
@@ -282,10 +300,23 @@ static BOOL add_bad_registers(Text *text, const DWORD64 *values, BOOL text_only)
 
 	for (i = 0; i < REGISTERS; i++) {
 		if (is_bad_pointer((ULONG_PTR)values[i]) && looks_like_text((ULONG_PTR)values[i]) == text_only &&
-			add_holder(text, values, (ULONG_PTR)values[i], register_name(i)))
+			add_holder(text, values, (ULONG_PTR)values[i], text_only ? SEARCH_FAR : SEARCH_NEAR, register_name(i)))
 			return TRUE;
 	}
 	return FALSE;
+}
+
+static void add_plain_registers(Text *text, const DWORD64 *values)
+{
+	int i, shown = 0;
+
+	for (i = 0; i < REGISTERS && shown < MAX_PLAIN_DUMPS; i++) {
+		if (!is_plain_heap_pointer((ULONG_PTR)values[i]))
+			continue;
+		add_text(text, "Memory at %s (readable, not an object):\n", register_name(i));
+		add_dump(text, (ULONG_PTR)values[i]);
+		shown++;
+	}
 }
 
 void add_damaged_memory(Text *text, const CONTEXT *context, const EXCEPTION_RECORD *record)
@@ -297,10 +328,12 @@ void add_damaged_memory(Text *text, const CONTEXT *context, const EXCEPTION_RECO
 		fault = record->ExceptionInformation[1];
 	if (add_bad_registers(text, values, TRUE) || add_bad_registers(text, values, FALSE))
 		return;
-	if (fault && is_bad_pointer(fault) && add_holder(text, values, fault, "the fault address"))
+	if (fault && fault != MAXULONG_PTR && is_bad_pointer(fault) && add_holder(text, values, fault, SEARCH_NEAR, "the fault address"))
 		return;
 	if (fault && is_heap_pointer(fault)) {
 		add_text(text, "Memory at the fault address:\n");
 		add_dump(text, fault);
+		return;
 	}
+	add_plain_registers(text, values);
 }

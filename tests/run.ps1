@@ -21,18 +21,18 @@ $expect = [ordered]@{
     newest_wins_stale_cache = 0; newest_wins_no_lookup = 0; newest_wins_bad_markers = 0; newest_wins_failed_start = 0; newest_wins_frozen_boot = 0
     fault_report = $crash; fault_report_no_log = $crash; fault_report_off = $crash; fault_report_in_callback = $crash; fault_report_in_site = $crash; fault_report_in_cave = $crash; fault_report_in_asm_cave = $crash; fault_report_in_cave_data = $crash; fault_report_in_cave_return = $crash; fault_report_in_link = $crash; fault_report_in_original = $crash; fault_report_in_around = $crash
     fault_report_stale = $crash; fault_report_thread = $crash; fault_report_native_thread = $crash; fault_report_overflow = -1073741571
-    fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash
+    fault_report_cpp = -529697949; fault_report_fallback = $crash; fault_report_clues = $crash; fault_report_far_field = $crash; fault_report_no_holder = $crash
     fault_report_two_threads = $crash; fault_report_overlap = $crash; fault_report_worker_stuck = $crash; fault_report_worker_waits = $crash
     fault_report_worker_blocked = $crash; fault_report_worker_dead = $crash; fault_report_move_retry = $crash; fault_report_move_fails = $crash
     exit_report = 7; exit_report_terminate = 8; exit_report_crt = 9; exit_report_quiet = 0; exit_report_off = 7
-    runtime_report = 0; runtime_report_reports_off = 0; runtime_report_no_folder = 0; runtime_report_write_fails = 0
+    runtime_report = 0; plus_users = 0; runtime_report_reports_off = 0; runtime_report_no_folder = 0; runtime_report_write_fails = 0
     runtime_report_then_crash = $crash; settings_cut = $crash; settings_none = $crash
     report_snapshot = 0; report_native = 0; report_lua_only = 0; report_loader = 0; locale_guard_big = 0
 }
 $reports = @{
     fault_report = '010203_0405'; fault_report_no_log = 'started'; fault_report_off = 'none'; fault_report_in_callback = 'started'; fault_report_in_site = 'started'; fault_report_in_cave = 'started'; fault_report_in_asm_cave = 'started'; fault_report_in_cave_data = 'started'; fault_report_in_cave_return = 'started'; fault_report_in_link = 'started'; fault_report_in_original = 'started'; fault_report_in_around = 'started'
     fault_report_stale = 'started'; fault_report_thread = 'started'; fault_report_native_thread = 'started'; fault_report_overflow = 'started'
-    fault_report_cpp = 'started'; fault_report_fallback = 'started'; fault_report_clues = 'started'
+    fault_report_cpp = 'started'; fault_report_fallback = 'started'; fault_report_clues = 'started'; fault_report_far_field = 'started'; fault_report_no_holder = 'started'
     fault_report_two_threads = 'started'; fault_report_overlap = 'started'; fault_report_worker_stuck = 'none'; fault_report_worker_waits = 'started'
     fault_report_worker_blocked = 'none'; fault_report_worker_dead = 'none'; fault_report_move_retry = 'started'; fault_report_move_fails = 'started'
     exit_report = 'started'; exit_report_terminate = 'started'; exit_report_crt = 'started'; exit_report_quiet = 'none'; exit_report_off = 'none'
@@ -42,12 +42,13 @@ $reports = @{
 $runtimeCounts = @{
     runtime_report = 1; runtime_report_reports_off = 1; runtime_report_no_folder = 0; runtime_report_write_fails = 0; runtime_report_then_crash = 1; report_native = 1; owner_report = 2; rows = 1
 }
+$textInField = @('exception 0xc0000005 (access violation)', 'not readable, text " inc"')
 $readOfNull = @('exception 0xc0000005 (access violation)', 'read of 0000000000000010 (a NULL pointer + 0x10)')
 $faultNeedles = @{
     fault_report = $readOfNull; fault_report_no_log = @('exception 0xc0000005 (access violation)', 'execution of'); fault_report_in_callback = $readOfNull; fault_report_in_site = $readOfNull; fault_report_in_cave = $readOfNull; fault_report_in_asm_cave = $readOfNull; fault_report_in_cave_data = $readOfNull; fault_report_in_cave_return = $readOfNull; fault_report_in_link = $readOfNull; fault_report_in_original = $readOfNull; fault_report_in_around = $readOfNull
     fault_report_stale = $readOfNull; fault_report_thread = $readOfNull; fault_report_native_thread = $readOfNull
     fault_report_overflow = @('exception 0xc00000fd (stack overflow)'); fault_report_cpp = @('exception 0xe06d7363 (C++ exception, type .H)')
-    fault_report_fallback = $readOfNull; fault_report_clues = @('exception 0xc0000005 (access violation)')
+    fault_report_fallback = $readOfNull; fault_report_clues = @('exception 0xc0000005 (access violation)'); fault_report_far_field = $textInField; fault_report_no_holder = $textInField
     fault_report_two_threads = $readOfNull; fault_report_overlap = $readOfNull; fault_report_worker_waits = $readOfNull; fault_report_move_retry = $readOfNull
     fault_report_move_fails = $readOfNull; runtime_report_then_crash = $readOfNull; settings_cut = $readOfNull; settings_none = $readOfNull
 }
@@ -79,6 +80,7 @@ $steamScenario = 'fault_report_cpp'
 $steamCommandLine = '<Steam library>\steamapps\common\game\Warhammer3.exe'
 $eventNeedles = @(
     '  faction turn: wh_c', 'Recent script events, newest first:', '  CharacterTurnStart x3, last ', '  FactionTurnStart x1, last ',
+    '  CharacterDestroyed x4, last ', ' s before: family cqi 4 wh_d names_name_4, family cqi 3 wh_d names_name_3, family cqi 2 wh_d names_name_2', '  MilitaryForceDestroyed x1, last ',
     'Recent memory writes by mods, newest first:', '  write x2 at '
 )
 $scenarioNeedles = @{
@@ -111,14 +113,18 @@ $scenarioNeedles = @{
     exit_report_terminate = @('the game ended itself with exit code 8 (0x00000008) through TerminateProcess', 'not the script thread')
     exit_report_crt = @('the game ended itself with exit code 9 (0x00000009) through ExitProcess', 'Thread: the script thread')
     fault_report_fallback = @("Written when the fault happened: the game's crash handler was not found (its pattern matched nothing)")
+    fault_report_far_field = @('+0x438, which holds the bad value of r', 'Memory around r')
+    fault_report_no_holder = @('Memory at r', ' (readable, not an object):')
     fault_report_clues = @(
         "This fault is in the game's memory allocator: memory was damaged earlier, and the code on this stack only found it",
-        'not readable, text "a to"', 'Memory around rcx+16, which holds the bad value of rax:', '  a toolti', '  p text o',
+        'not readable, text "a to"', 'Memory around rcx+0x10, which holds the bad value of rax:', '  a toolti', '  p text o',
         "Other programs' DLLs that hook timing functions the game uses:", "  $hookerDll hooks QueryPerformanceCounter",
         "  $hookerDll hooks timeGetTime"
     )
 }
-$scenarioAbsent = @{ fault_report_in_original = @('memreader Plus link running') }
+$scenarioAbsent = @{
+    fault_report_in_original = @('memreader Plus link running'); fault_report_far_field = @('(readable, not an object):'); fault_report_no_holder = @('Memory around ')
+}
 $ownerHeader = 'memreader Plus changes by owner:'
 $ownerScenarios = @('owner_report', 'rows', 'fault_report_in_cave', 'fault_report_in_asm_cave', 'fault_report_in_cave_data', 'fault_report_in_cave_return', 'fault_report_in_link', 'fault_report_in_original', 'fault_report_in_around')
 $scenarioPatterns = @{ fault_report_in_site = 'Warhammer3\.exe\+0x[0-9a-f]+  function \+0x[0-9a-f]+, offset \+0x128\r?\n' }
@@ -126,7 +132,7 @@ $contextNeedles = @(
     'Game context set by script at safe moments:', '  mode: campaign', '  campaign: main_warhammer', '  campaign type: sp', '  difficulty: hard',
     '  turn: 42', '  player: wh_a', '  humans: wh_a, wh_b', '  note: first second', '  phase: quitting'
 )
-$contextAbsent = @('  temp: ', '  multiplayer: ')
+$contextAbsent = @('  temp: ', '  multiplayer: ', 'names_name_1', 'force cqi')
 $settingsHeader = 'MCT settings of the mods in this game ('
 $settingsNeedles = @(
     $settingsHeader, ' seconds before this report):', '[alpha_mod] Alpha Mod', '  enabled = true', '  strength = 2.5', '[beta_mod] Beta Mod',

@@ -667,7 +667,7 @@ static int l_set_crash_context(lua_State *L)
 static int l_note_crash_event(lua_State *L)
 {
 	if (lua_type(L, 1) == LUA_TSTRING)
-		note_crash_event(lua_tostring(L, 1));
+		note_crash_event(lua_tostring(L, 1), lua_type(L, 2) == LUA_TSTRING ? lua_tostring(L, 2) : NULL);
 	return 0;
 }
 

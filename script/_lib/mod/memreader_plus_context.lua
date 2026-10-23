@@ -67,13 +67,73 @@ local function safely(fn)
 	end
 end
 
+local function usable(interface)
+	return interface and not interface:is_null_interface() and interface
+end
+
+local function detail_of(reads)
+	local parts = {}
+	for _, read in ipairs(reads) do
+		local ok, value = pcall(read)
+		if ok and value ~= nil and value ~= '' then parts[#parts + 1] = tostring(value) end
+	end
+	if #parts > 0 then return table.concat(parts, ' ') end
+end
+
+local function character_detail(label, holder, character)
+	return detail_of({
+		function()
+			return label .. ' ' .. holder:command_queue_index()
+		end,
+		function()
+			return usable(character):faction():name()
+		end,
+		function()
+			return usable(character):get_forename()
+		end,
+		function()
+			return usable(character):get_surname()
+		end,
+	})
+end
+
+local EVENT_DETAILS = {
+	CharacterDestroyed = function(context)
+		local member = usable(context:family_member())
+		return character_detail('family cqi', member, member:character_details())
+	end,
+	CharacterConvalescedOrKilled = function(context)
+		local character = usable(context:character())
+		return character_detail('cqi', character, character)
+	end,
+	MilitaryForceDestroyed = function(context)
+		local force = usable(context:military_force())
+		return detail_of({
+			function()
+				return 'force cqi ' .. force:command_queue_index()
+			end,
+			function()
+				return usable(force:faction()):name()
+			end,
+		})
+	end,
+}
+
+local function event_detail(read, context)
+	local ok, detail = pcall(function()
+		return read(context)
+	end)
+	if ok and type(detail) == 'string' then return detail end
+end
+
 local function watch_events()
 	local plus = _G.memreader_plus
 	local dispatch = core.event_callback
 	if not plus or not plus.note_crash_event or type(dispatch) ~= 'function' or dispatch == rawget(core, 'memreader_plus_events') then return end
 	local note = plus.note_crash_event
 	local wrapper = function(self, eventname, context)
-		note(eventname)
+		local read = EVENT_DETAILS[eventname]
+		note(eventname, read and event_detail(read, context))
 		return dispatch(self, eventname, context)
 	end
 	rawset(core, 'memreader_plus_events', wrapper)

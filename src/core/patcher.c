@@ -555,6 +555,7 @@ static int cave_step(lua_State *L, int owner, const char *name, int first, Batch
 	INT_PTR at;
 	int item;
 
+	note_use(L, USE_CAVE);
 	if (!spec)
 		code.bytes = luaL_checklstring(L, first + 1, &code.size);
 	why = target_at(L, first, &at);
@@ -986,6 +987,7 @@ static int l_site(lua_State *L)
 	INT_PTR at;
 	int refused, priority, item;
 
+	note_use(L, USE_LINK);
 	refused = open_change(L, &self, &name);
 	if (refused)
 		return refused;
@@ -1122,6 +1124,7 @@ static int add_link(lua_State *L, int kind)
 	int refused, priority, item, set_index = 0;
 	BOOL created;
 
+	note_use(L, USE_LINK);
 	parse_signature(L, luaL_checkstring(L, 3), &signature);
 	name = luaL_checklstring(L, 4, &length);
 	luaL_checktype(L, 5, LUA_TFUNCTION);
