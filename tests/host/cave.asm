@@ -21,8 +21,6 @@ asm_double PROC
 	ret
 asm_double ENDP
 
-	db 32 dup (0CCh)
-
 asm_float PROC FRAME
 	push rbx
 	.pushreg rbx

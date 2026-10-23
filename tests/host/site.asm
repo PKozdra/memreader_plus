@@ -28,6 +28,15 @@ PUBLIC site_crash_here
 PUBLIC site_table_here
 PUBLIC site_codetable_here
 PUBLIC site_noise_here
+PUBLIC site_unwind_here
+PUBLIC site_scope_here
+PUBLIC site_unwind_info
+PUBLIC site_scope_info
+PUBLIC site_bogus_here
+PUBLIC site_odd_here
+PUBLIC site_after_here
+PUBLIC site_bogus_info
+PUBLIC site_odd_info
 PUBLIC site_call_short_here
 PUBLIC site_call_last_here
 PUBLIC site_leaf_here
@@ -438,6 +447,81 @@ site_codetable_inside::
 	dd IMAGEREL site_codetable_inside
 site_codetable ENDP
 
+site_unwind PROC FRAME
+	.endprolog
+	xor eax, eax
+site_unwind_here::
+	db 0Fh, 1Fh, 44h
+site_unwind_inside::
+	db 00h, 00h
+	inc eax
+	ret
+site_unwind ENDP
+
+site_unwind_owner PROC FRAME
+	.endprolog
+	ret
+site_unwind_owner ENDP
+
+site_scope PROC FRAME
+	.endprolog
+	xor eax, eax
+site_scope_here::
+	db 0Fh, 1Fh, 44h
+site_scope_inside::
+	db 00h, 00h
+	inc eax
+	ret
+site_scope ENDP
+
+site_scope_owner PROC FRAME
+	.endprolog
+	ret
+site_scope_owner ENDP
+
+site_bogus PROC FRAME
+	.endprolog
+	xor eax, eax
+site_bogus_here::
+	db 0Fh, 1Fh, 44h
+site_bogus_inside::
+	db 00h, 00h
+	inc eax
+	ret
+site_bogus ENDP
+
+site_bogus_owner PROC FRAME
+	.endprolog
+	ret
+site_bogus_owner ENDP
+
+site_odd PROC FRAME
+	.endprolog
+	xor eax, eax
+site_odd_here::
+	db 0Fh, 1Fh, 44h
+site_odd_inside::
+	db 00h, 00h
+	inc eax
+	ret
+site_odd ENDP
+
+site_after PROC FRAME
+	.endprolog
+	xor eax, eax
+site_after_here::
+	db 0Fh, 1Fh, 44h
+site_after_inside::
+	db 00h, 00h
+	inc eax
+	ret
+site_after ENDP
+
+site_odd_owner PROC FRAME
+	.endprolog
+	ret
+site_odd_owner ENDP
+
 dirty_vectors PROC
 	vinsertf128 ymm0, ymm0, XMMWORD PTR [site_ones], 1
 	vinsertf128 ymm1, ymm1, XMMWORD PTR [site_ones], 1
@@ -462,5 +546,14 @@ dirty_vectors ENDP
 
 site_table_entries dd IMAGEREL site_table, IMAGEREL site_table_inside, IMAGEREL site_codetable
 site_noise_entry dd 0, IMAGEREL site_noise_inside, 0
+	ALIGN 4
+site_unwind_info db 1, 0, 4, 0
+	dd IMAGEREL site_table, IMAGEREL site_unwind_inside
+site_scope_info db 9, 0, 2, 0
+	dd 0, IMAGEREL site_table, 1
+	dd IMAGEREL site_scope, IMAGEREL site_scope_here, IMAGEREL site_table, IMAGEREL site_scope_inside
+site_bogus_info dd 00FF0000h, IMAGEREL site_table, IMAGEREL site_bogus_inside
+site_odd_info db 1, 0, 1, 0
+	dd IMAGEREL site_odd_inside, IMAGEREL site_after_inside, IMAGEREL site_table
 
 END

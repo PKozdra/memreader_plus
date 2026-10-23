@@ -14,7 +14,8 @@ enum {
 	WINDOW_BYTES = 32,
 	DECODER_PADDING = 16,
 	TABLE_CHUNK_WORDS = 4096,
-	MAX_LEAF_BYTES = 0x4000
+	MAX_LEAF_BYTES = 0x4000,
+	UNWIND_HEADER_BYTES = 4
 };
 
 enum { VIEW_POINTER, VIEW_WORD, VIEW_DOUBLE, VIEW_FLOAT, VIEW_BITS, VIEW_FLAGS, VIEW_SHIFT = 4, INDEX_MASK = 15 };
@@ -44,6 +45,13 @@ typedef struct {
 	void *entry;
 	void *originals[MAX_HOOKS];
 } SiteTable;
+
+typedef struct {
+	const BYTE *base;
+	const IMAGE_NT_HEADERS *headers;
+	BYTE *unwind_words;
+	BOOL marked;
+} ModuleScan;
 
 static const BYTE CALL_RIP[2] = { 0xFF, 0x15 };
 static const BYTE JUMP_RIP[2] = { 0xFF, 0x25 };
@@ -282,19 +290,62 @@ static BOOL is_code_rva(const IMAGE_NT_HEADERS *headers, DWORD rva)
 	return code_section_of(headers, rva) != NULL;
 }
 
-static BOOL has_table_entry(const IMAGE_NT_HEADERS *headers, const DWORD *words, size_t count, const SiteRange *site)
+static BOOL is_unwind_version(BYTE header)
+{
+	return (header & 7) == 1 || (header & 7) == 2;
+}
+
+static void mark_unwind_info(ModuleScan *scan, DWORD rva)
+{
+	DWORD image_size = scan->headers->OptionalHeader.SizeOfImage;
+	DWORD end, word;
+
+	if ((rva & 3) || rva > image_size - UNWIND_HEADER_BYTES || !is_unwind_version(scan->base[rva]))
+		return;
+	end = rva + UNWIND_HEADER_BYTES + 2u * scan->base[rva + 2];
+	for (word = rva; word < end && word < image_size; word += sizeof(DWORD))
+		scan->unwind_words[word / 32] |= (BYTE)(1u << (word / 4 % 8));
+}
+
+static void mark_unwind_words(ModuleScan *scan)
+{
+	const IMAGE_DATA_DIRECTORY *directory = &scan->headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+	const RUNTIME_FUNCTION *table = (const RUNTIME_FUNCTION *)(scan->base + directory->VirtualAddress);
+	DWORD count = directory->Size / sizeof(RUNTIME_FUNCTION), i;
+
+	scan->marked = TRUE;
+	scan->unwind_words = calloc(scan->headers->OptionalHeader.SizeOfImage / 32 + 1, 1);
+	if (!scan->unwind_words)
+		return;
+	for (i = 0; i < count; i++)
+		mark_unwind_info(scan, table[i].UnwindData);
+}
+
+static BOOL is_unwind_word(ModuleScan *scan, DWORD rva)
+{
+	if (!scan->marked)
+		mark_unwind_words(scan);
+	return scan->unwind_words && (scan->unwind_words[rva / 32] >> (rva / 4 % 8) & 1);
+}
+
+static BOOL next_to_code(const IMAGE_NT_HEADERS *headers, const DWORD *words, size_t count, size_t i)
+{
+	return (i > 0 && is_code_rva(headers, words[i - 1])) || (i + 1 < count && is_code_rva(headers, words[i + 1]));
+}
+
+static BOOL has_table_entry(ModuleScan *scan, const DWORD *words, size_t count, DWORD rva, const SiteRange *site)
 {
 	size_t i;
 
 	for (i = 0; i < count; i++) {
-		if (words[i] >= site->first && words[i] <= site->last && ((i > 0 && is_code_rva(headers, words[i - 1])) ||
-				(i + 1 < count && is_code_rva(headers, words[i + 1]))))
+		if (words[i] >= site->first && words[i] <= site->last && next_to_code(scan->headers, words, count, i) &&
+				!is_unwind_word(scan, rva + (DWORD)(i * sizeof(DWORD))))
 			return TRUE;
 	}
 	return FALSE;
 }
 
-static BOOL words_in_range(const IMAGE_NT_HEADERS *headers, INT_PTR start, size_t size, const SiteRange *site)
+static BOOL words_in_range(ModuleScan *scan, INT_PTR start, size_t size, const SiteRange *site)
 {
 	DWORD words[TABLE_CHUNK_WORDS];
 	size_t chunk;
@@ -302,7 +353,7 @@ static BOOL words_in_range(const IMAGE_NT_HEADERS *headers, INT_PTR start, size_
 	while (size >= sizeof(DWORD)) {
 		chunk = size < sizeof words ? size : sizeof words;
 		chunk -= chunk % sizeof(DWORD);
-		if (copy_memory(words, start, chunk) && has_table_entry(headers, words, chunk / sizeof(DWORD), site))
+		if (copy_memory(words, start, chunk) && has_table_entry(scan, words, chunk / sizeof(DWORD), (DWORD)(start - (INT_PTR)scan->base), site))
 			return TRUE;
 		if (size - chunk < sizeof(DWORD))
 			break;
@@ -314,19 +365,20 @@ static BOOL words_in_range(const IMAGE_NT_HEADERS *headers, INT_PTR start, size_
 
 static BOOL tables_point_inside(const BYTE *base, const SiteRange *site)
 {
-	const IMAGE_NT_HEADERS *headers = headers_of(base);
-	const IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(headers);
+	ModuleScan scan = { base, headers_of(base), NULL, FALSE };
+	const IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(scan.headers);
+	BOOL found = FALSE;
 	int i;
 
-	for (i = 0; i < headers->FileHeader.NumberOfSections; i++, section++) {
+	for (i = 0; i < scan.headers->FileHeader.NumberOfSections && !found; i++, section++) {
 		DWORD size = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
 		DWORD flags = section->Characteristics;
 
-		if ((flags & IMAGE_SCN_MEM_READ) && !(flags & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE)) &&
-				words_in_range(headers, (INT_PTR)base + section->VirtualAddress, size, site))
-			return TRUE;
+		found = (flags & IMAGE_SCN_MEM_READ) && !(flags & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE)) &&
+			words_in_range(&scan, (INT_PTR)base + section->VirtualAddress, size, site);
 	}
-	return FALSE;
+	free(scan.unwind_words);
+	return found;
 }
 
 static BOOL leaf_span(const BYTE *base, DWORD rva, INT_PTR *start, INT_PTR *end)

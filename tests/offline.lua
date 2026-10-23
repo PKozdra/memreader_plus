@@ -2416,6 +2416,27 @@ elseif SCENARIO == 'cave' then
 		contains(error_of(mr.code_cave, fixture('site_codetable_here'), code), 'refused: a jump table in the function'),
 		'a cave with a jump table in the code of its function is refused'
 	)
+	check(
+		contains(error_of(mr.code_cave, fixture('site_unwind_here'), code), 'refused: a jump table in the module'),
+		'a cave with a row of code addresses into its bytes that no unwind entry names is refused'
+	)
+	check(test_name_unwind_fixtures(), 'the fake unwind infos are named by unwind entries')
+	local unwind_why = error_of(mr.code_cave, fixture('site_unwind_here'), code)
+	check(unwind_why == nil, 'a cave over bytes that unwind codes name next to a code address installs: ' .. tostring(unwind_why))
+	check(
+		contains(error_of(mr.code_cave, fixture('site_scope_here'), code), 'refused: a jump table in the module'),
+		'a cave with a scope table entry after the unwind codes that jumps into its bytes is refused'
+	)
+	check(
+		contains(error_of(mr.code_cave, fixture('site_bogus_here'), code), 'refused: a jump table in the module'),
+		'a cave with a table into its bytes that an unwind entry names but that is no unwind info is refused'
+	)
+	local odd_why = error_of(mr.code_cave, fixture('site_odd_here'), code)
+	check(odd_why == nil, 'a cave over bytes that the padding code of an odd count names installs: ' .. tostring(odd_why))
+	check(
+		contains(error_of(mr.code_cave, fixture('site_after_here'), code), 'refused: a jump table in the module'),
+		'a cave with a table entry right after the unwind codes is refused'
+	)
 	check(contains(error_of(mr.code_cave, fixture('site_call_short_here'), code), 'refused: a call'), 'a cave over a short call is refused')
 	check(mr.hook_info(fixture('site_call_short_here')) == nil, 'and installs nothing')
 	check(
@@ -2733,6 +2754,36 @@ elseif SCENARIO == 'site' then
 	end)
 	check(mr.tonumber(mr.call(address('site_noise'), 'int32()')) == 41, 'a lone DWORD in read-only data that equals an address inside the bytes is not a table')
 	mr.unhook(address('site_noise_here'))
+	check(
+		contains(error_of(mr.hook_site, address('site_unwind_here'), function() end), 'refused: a jump table in the module'),
+		'a row of code addresses into the bytes that no unwind entry names is a table'
+	)
+	check(test_name_unwind_fixtures(), 'the fake unwind infos are named by unwind entries')
+	mr.hook_site(address('site_unwind_here'), function(regs)
+		regs.rax = 40
+	end)
+	check(
+		mr.tonumber(mr.call(address('site_unwind'), 'int32()')) == 41,
+		'unwind codes that equal an address inside the bytes next to a code address are not a table'
+	)
+	mr.unhook(address('site_unwind_here'))
+	check(
+		contains(error_of(mr.hook_site, address('site_scope_here'), function() end), 'refused: a jump table in the module'),
+		'a scope table entry after the unwind codes that jumps into the bytes is still a table'
+	)
+	check(
+		contains(error_of(mr.hook_site, address('site_bogus_here'), function() end), 'refused: a jump table in the module'),
+		'a table that an unwind entry names but that is no unwind info is still a table'
+	)
+	mr.hook_site(address('site_odd_here'), function(regs)
+		regs.rax = 40
+	end)
+	check(mr.tonumber(mr.call(address('site_odd'), 'int32()')) == 41, 'the padding code after an odd count of unwind codes is not a table')
+	mr.unhook(address('site_odd_here'))
+	check(
+		contains(error_of(mr.hook_site, address('site_after_here'), function() end), 'refused: a jump table in the module'),
+		'a table entry right after the padding code is still a table'
+	)
 	mr.hook_site(address('site_split_free'), function(regs)
 		regs.rax = 40
 	end)

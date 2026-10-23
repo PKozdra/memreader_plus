@@ -395,6 +395,24 @@ void site_table_here(void);
 void site_codetable(void);
 void site_noise(void);
 void site_noise_here(void);
+void site_unwind(void);
+void site_unwind_here(void);
+void site_unwind_owner(void);
+void site_scope(void);
+void site_scope_here(void);
+void site_scope_owner(void);
+extern const BYTE site_unwind_info[];
+extern const BYTE site_scope_info[];
+void site_bogus(void);
+void site_bogus_here(void);
+void site_bogus_owner(void);
+void site_odd(void);
+void site_odd_here(void);
+void site_after(void);
+void site_after_here(void);
+void site_odd_owner(void);
+extern const BYTE site_bogus_info[];
+extern const BYTE site_odd_info[];
 void site_codetable_here(void);
 void site_split(void);
 void site_split_cold(void);
@@ -622,6 +640,16 @@ static const struct {
 	{ "site_codetable", site_codetable },
 	{ "site_noise", site_noise },
 	{ "site_noise_here", site_noise_here },
+	{ "site_unwind", site_unwind },
+	{ "site_unwind_here", site_unwind_here },
+	{ "site_scope", site_scope },
+	{ "site_scope_here", site_scope_here },
+	{ "site_bogus", site_bogus },
+	{ "site_bogus_here", site_bogus_here },
+	{ "site_odd", site_odd },
+	{ "site_odd_here", site_odd_here },
+	{ "site_after", site_after },
+	{ "site_after_here", site_after_here },
 	{ "site_codetable_here", site_codetable_here },
 	{ "site_split", site_split },
 	{ "site_split_here", site_split_here },
@@ -2218,6 +2246,27 @@ static int l_test_chain_cold_part(lua_State *L)
 	return 1;
 }
 
+static BOOL point_unwind(void (*owner)(void), const BYTE *info)
+{
+	DWORD64 base = 0;
+	PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry((DWORD64)owner, &base, NULL);
+	DWORD old;
+
+	if (!entry)
+		return FALSE;
+	VirtualProtect(entry, sizeof *entry, PAGE_READWRITE, &old);
+	entry->UnwindData = (DWORD)(info - (const BYTE *)base);
+	VirtualProtect(entry, sizeof *entry, old, &old);
+	return TRUE;
+}
+
+static int l_test_name_unwind_fixtures(lua_State *L)
+{
+	lua_pushboolean(L, point_unwind(site_unwind_owner, site_unwind_info) && point_unwind(site_scope_owner, site_scope_info) &&
+		point_unwind(site_bogus_owner, site_bogus_info) && point_unwind(site_odd_owner, site_odd_info));
+	return 1;
+}
+
 static int l_test_dirty_vectors(lua_State *L)
 {
 	(void)L;
@@ -2283,6 +2332,7 @@ static int run_pass(char **argv, int argc, int pass)
 	lua_register(L, "test_clobber_vectors", l_test_clobber_vectors);
 	lua_register(L, "test_dirty_vectors", l_test_dirty_vectors);
 	lua_register(L, "test_chain_cold_part", l_test_chain_cold_part);
+	lua_register(L, "test_name_unwind_fixtures", l_test_name_unwind_fixtures);
 	lua_register(L, "cave_count", l_cave_count);
 	lua_register(L, "cave_count_address", l_cave_count_address);
 	lua_register(L, "test_access_faults", l_test_access_faults);
