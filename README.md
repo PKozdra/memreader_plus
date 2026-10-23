@@ -1,6 +1,6 @@
 # memreader Plus (TWWH3)
 
-memreader Plus is a Lua module that lets mod scripts for Total War: WARHAMMER III read and write the game's memory, call the game's own functions, and hook them to change what they do.
+memreader Plus is a Lua module that lets mod scripts for Total War: WARHAMMER III read and write the game's memory, call game functions, and hook them to change what they do.
 
 Based on [memreader by Cpecific](https://github.com/Cpecific/twwh2-memreader), who wrote the WH2 and the WH3 build. Cpecific's module was based on [squeek502/memreader](https://github.com/squeek502/memreader).
 
@@ -14,19 +14,19 @@ Mods written for memreader will keep working when memreader Plus is installed: `
 
 - `call` runs a function from the game's code with arguments you pass from Lua and gives you its return value. You can use it to look up a DB row or to hash a string the way the game does. See [Calling game functions](#calling-game-functions).
 
-- `hook_site` runs a callback at an instruction in the middle of a function and lets it read and change the registers. `code_cave` puts your own machine code at an address. See [Hooking game functions](#hooking-game-functions).
+- `hook_site` runs a callback at an instruction in the middle of a function and lets it read and change the registers. `code_cave` puts machine code you write at an address, and `assemble` turns x64 assembly text into that code. See [Hooking game functions](#hooking-game-functions).
 
 - `hook` makes your Lua callback run every time the game calls a given function. The callback can read or change the arguments, replace the return value, or skip the game's function completely. Several mods can hook the same function. See [Hooking game functions](#hooking-game-functions).
 
 - `find_pattern` searches the game's code for a byte pattern and returns its address. A mod that finds its addresses this way keeps working after a game patch, as long as the bytes it searches for did not change. memreader Plus keeps each result for the game session, so a mod that searches again in the next game mode gets its addresses at once. `read_original` reads code as it was before a hook or patch changed it.
 
-- When the game crashes while a script is running, memreader Plus writes a text file with the Lua call stack and the list of loaded mods.
+- When the game crashes while a script is running, memreader Plus writes a text file with the Lua call stack and the list of loaded mods. `write_runtime_report` writes the same kind of report on request, while the game runs. See [Crash reports](#crash-reports) and [Runtime report](#runtime-report).
 
 - `patcher` gives your mod a handle for links, patches, caves, frames and relocations that are recorded under the mod's name. Links can run before or after a game function, with a priority, and a callback that fails stays attached. `batch` writes several patches as one unit, and `sites` describes them as a table. Crash reports list every change by mod and name. See [Patching with owners](#patching-with-owners).
 
-- `game_alloc`, `patch`, `vector_insert` and `string_set` change game data in place: memory from the game's own heap, code patches that check the old bytes first, CA vectors that grow and shrink, and CA strings set to new text. `map_add_key` and `list_insert` add entries to the game's hash maps and lists. See [Changing game data](#changing-game-data).
+- `game_alloc`, `patch`, `vector_insert` and `string_set` change game data in place: memory from the game's heap, code patches that check the old bytes first, CA vectors that grow and shrink, and CA strings set to new text. `map_add_key` and `list_insert` add entries to the game's hash maps and lists. See [Changing game data](#changing-game-data).
 
-- `read_pack_file` reads any file from the loaded packs, text or binary, the same way the game reads its own files. See [Reading files from packs](#reading-files-from-packs).
+- `read_pack_file` reads any file from the loaded packs, text or binary, the same way the game reads the vanilla files. See [Reading files from packs](#reading-files-from-packs).
 
 - `file_edit` changes the text of a game file, such as a UI layout, each time the game reads it. Several mods can edit the same vanilla file without shipping a copy of it. With `file_edit_list`, `file_edit_preview`, `file_edit_apply`, `file_edit_remove`, `file_edit_status` and `set_file_edits` you can look at the edits, try ops on a text, remove an edit and turn edits off. `memreader_plus.twui` writes the ops of a layout edit for you from component ids. See [Editing game files as they load](#editing-game-files-as-they-load).
 
@@ -35,6 +35,8 @@ Mods written for memreader will keep working when memreader Plus is installed: `
 ### Fixes
 
 - Reads of 1 KB or more no longer crash the game. `div`, `gt`, `lt` and `tonumber` treat `int8` to `int32` as signed. `add(pointer, -16)` subtracts 16. A typed value used as an offset is no longer ignored. `read_string` reads short CA strings (up to 14 characters, stored inline) correctly.
+
+- `hook_site`, `code_cave` and site entries no longer refuse some valid sites. The check for jump tables that point into a site mistook some of the exe's unwind data, which Windows reads to walk the stack, for such tables, and the call failed with `refused:`. memreader Plus now skips that data, and a site that a real jump table points into is still refused.
 
 - Plain reads are several times faster. memreader Plus copies the memory directly, with a guard against bad addresses, instead of calling `ReadProcessMemory`: about 120 ns instead of about 800 ns for a `read_uint32` in game. A bad address still gives a Lua error.
 
@@ -57,7 +59,7 @@ Every difference, with before and after values, is in [Differences from memreade
 - [Crash reports](#crash-reports)
 - [Runtime report](#runtime-report)
 - [Both mods installed](#both-mods-installed)
-- [Other mods that carry memreader Plus](#other-mods-that-carry-memreader-plus)
+- [Other mods that use memreader Plus](#other-mods-that-use-memreader-plus)
 - [API reference](#api-reference)
 - [Differences from memreader 1.2](#differences-from-memreader-12)
 - [Building from source](#building-from-source)
@@ -100,14 +102,14 @@ local chptr = mr.ud_topointer(character)
 tostring(character) -- ex: CHARACTER_SCRIPT_INTERFACE (0000000049376488)
 mr.tostring(chptr) -- ex: 0000000049376488
 
--- here's how you can call a function from the game's own code: its hash function (MurmurHash3, 32-bit)
+-- here's how you can call a function in the game's code: its hash function (MurmurHash3, 32-bit)
 -- it turns a text into a number, and the same text always gives the same number
 -- the game uses that number to find entries in its string-key tables, such as the key map of a DB table, so this gives you the number it would look up:
 
 -- 1. find the function by the bytes it starts with (they survive game patches that do not touch it)
 local address, count = mr.find_pattern('48 89 5C 24 08 44 8B CA 8B DA 41 C1 E9 02 41 BA ED 5E 54 4A')
 assert(count == 1)
--- 2. the function reads its text from memory, so put the text in a buffer of your own
+-- 2. the function reads its text from memory, so put the text in a buffer you allocate
 local key = 'wh2_main_hef_bow_arrow'
 local text = mr.alloc(#key + 1)
 mr.write(text, 0, key)
@@ -115,7 +117,7 @@ mr.write(text, 0, key)
 local hash = mr.call(address, 'uint32(pointer, uint32)', text, #key)
 out(mr.tostring(hash)) -- 1628994413 (0x61187B6D)
 
--- a hook runs your Lua function whenever the game calls one of its own functions
+-- a hook runs your Lua function whenever the game calls the function you hooked
 -- this one tells the game how many units an army may have (20)
 -- armies above 20 units can crash the end turn unless other parts of the game are fixed too, so use this only to try hooks out
 local unit_cap, found = mr.find_pattern('80 B9 ?? ?? ?? ?? ?? 73 ?? 48 8B 81 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ?? 48 8B 81 ?? ?? ?? ?? B9 ?? ?? ?? ?? 8B 80 ?? ?? ?? ?? 3B C1 0F 47 C1 C3 B8 ?? ?? ?? ?? C3')
@@ -183,10 +185,10 @@ These four functions read many fields in one call. You describe the memory layou
 | `{ off, 'int64' }`, `{ off, 'uint64' }` | exact typed value |
 | `{ off, 'float' }`, `{ off, 'double' }`, `{ off, 'boolean' }` | number or boolean |
 | `{ off, 'string' }`, `{ off, 'unistring' }` | text of a `CA::String` or `CA::UniString` |
-| `{ off, 'address' }` | the pointer `p + off`; nothing is read |
+| `{ off, 'address' }` | the pointer `p + off`, without a read |
 | `{ off, 'pointer' }` | pointer, or `false` when NULL |
-| `{ off, 'pointer', field }` | follows the pointer and reads `field` there; `false` when NULL |
-| `{ off, 'struct', layout }` | a table; `layout` is `{ name = field, ... }` |
+| `{ off, 'pointer', field }` | follows the pointer and reads `field` there, or gives `false` when it is NULL |
+| `{ off, 'struct', layout }` | a table, where `layout` is `{ name = field, ... }` |
 | `{ off, 'vector', field, stride }` | a CA vector at `off`: an array, `field` read in each element |
 | `{ off, 'list', field }` | a CA list (also the node list of a CA hash map): `field` read in each node |
 
@@ -324,7 +326,7 @@ local nagash = cm:get_character_by_cqi(cqis[1])
 out(nagash:character_subtype_key()) -- wh3_dlc29_nag_nagash
 ```
 
-The list holds the same numbers, in the same order, as `faction_i:character_list()`. Only the first ones stay the same between campaigns; later numbers depend on how many characters the game created before them.
+The list holds the same numbers, in the same order, as `faction_i:character_list()`. Only the first ones stay the same between campaigns. Later numbers depend on how many characters the game created before them.
 
 To read a DB table, find the game's list of tables, pick the table whose name (`read_string(table, 0x58, true)`) you want, then read its rows with `read_array(table, 0x08)` and its keys with `read_list(table, 0x28, ...)`. `find_projectiles` in `tests/ingame_smoke.lua` shows one way to find the `projectiles` table. The key of a record sits at a different place in each table, so take the keys from the key map. In the unmodded game, the `cultures` table has 28 rows and 28 keys.
 
@@ -393,7 +395,7 @@ local row = mr.call(record_index, 'uint32(pointer, pointer)', projectiles_table,
 
 - Find addresses with `find_pattern` and check that the count is 1. With a wrong address or a wrong signature, the game's code runs on wrong values.
 
-- Lua owns the memory that `alloc` returns and frees it at the next mode switch. Give it only to functions that use it during the call (a key to look up, a buffer to fill). Never give it to a function that keeps it, frees it or reallocates it: a by-value `CA::String`, a string assigned into a game object, a container that takes ownership, a listener registration. The game would free Lua's memory, or keep a pointer that dangles after the mode switch. For anything the game keeps, build it with the game's own constructors.
+- Lua owns the memory that `alloc` returns and frees it at the next mode switch. Give it only to functions that use it during the call (a key to look up, a buffer to fill). Never give it to a function that keeps it, frees it or reallocates it: a by-value `CA::String`, a string assigned into a game object, a container that takes ownership, a listener registration. The game would free Lua's memory, or keep a pointer that dangles after the mode switch. For anything the game keeps, build it with the game's constructors.
 
 - A crash inside the called function becomes a Lua error: `the called function crashed at <address> (...); the game may be unstable now`. This covers access violations, illegal instructions, the `int3` padding between functions, integer division by zero and similar CPU faults. The game's code stopped halfway, so a lock may still be held or an object may be half changed. Stop calling game functions, and let the player save and restart. C++ exceptions and stack overflows still crash the game.
 
@@ -426,7 +428,7 @@ mr.unhook(murmur)
 
 A callback can run code before or after the original, change the arguments, replace the result, or skip the original. An integer result follows the rules for integer arguments of `call`: a typed value, raw bytes, or a whole number that fits the type.
 
-Several mods can hook the same address. The newest callback runs first. Each callback calls `hook_next` to pass the call down, or returns its own result without it. For new code, `patcher` links (prefix, postfix and around, with a priority and a name) do the same job and keep a failing callback attached. See [Patching with owners](#patching-with-owners).
+Several mods can hook the same address. The newest callback runs first. Each callback calls `hook_next` to pass the call down, or returns a result without calling it. For new code, `patcher` links (prefix, postfix and around, with a priority and a name) do the same job and keep a failing callback attached. See [Patching with owners](#patching-with-owners).
 
 #### `hook(address: pointer, signature: string, callback: function)`
 Adds `callback` on top of the address's chain. The first hook of an address also patches the game's code. An address takes at most 16 callbacks, all with the same signature. A different signature, or the same function twice, is an error.
@@ -439,9 +441,9 @@ Removes that callback. Without `callback` it removes all of them, and the game c
 
 memreader Plus hooks four of the game's file reading functions itself once a mod calls `file_edit` (see [Editing game files as they load](#editing-game-files-as-they-load)). Your callbacks on those functions still work. They run first and see the file as it ships, and `hook_next` or `original` then goes through the file edits before the game's function.
 #### `hook_site(address: pointer, callback: function)`
-Runs `callback(regs)` each time the game reaches the instruction at `address`, which can be in the middle of a function. The callback runs before that instruction, and the game then continues with it and the code after it. `address` must be the start of an instruction. The 5 or more bytes from `address`, up to the end of an instruction, are copied and run from a copy, so none of them may be a `ret` or `jmp`, a `call` may only be the last of them (a thread that is inside the called function when the hook goes in would return into the middle of the patch), and nothing may jump into them: no jump in any part of the function (the cold blocks of a split function count too), and no jump table in the exe or in the function's own code. `address` must lie in a loaded module. Plus decodes the function around it and refuses an address when the code before it does not decode up to the address, when the copied bytes run past the end of the function, and when a function without an unwind entry cannot be checked. Otherwise `hook_site` raises an error that starts with `refused:`. Plus does not check a code address that is held as a full pointer in a table, or the address where a C++ `catch` block resumes. Pick a site in the middle of straight code, not at the first instruction after a `try`. A `call` that ends the copied bytes works, but an exception that the called function throws and something above the hooked function catches cannot get through the copy. An address takes at most 16 callbacks. The newest runs first, and each sees what the ones before it wrote. All of them run, and none passes the call down.\
+Runs `callback(regs)` each time the game reaches the instruction at `address`, which can be in the middle of a function. The callback runs before that instruction, and the game then continues with it and the code after it. `address` must be the start of an instruction. The 5 or more bytes from `address`, up to the end of an instruction, are copied and run from a copy, so none of them may be a `ret` or `jmp`, a `call` may only be the last of them (a thread that is inside the called function when the hook goes in would return into the middle of the patch), and nothing may jump into them: no jump in any part of the function (the cold blocks of a split function count too), and no jump table in the exe or in the function's code. `address` must lie in a loaded module. Plus decodes the function around it and refuses an address when the code before it does not decode up to the address, when the copied bytes run past the end of the function, and when a function without an unwind entry cannot be checked. Otherwise `hook_site` raises an error that starts with `refused:`. Plus does not check a code address that is held as a full pointer in a table, or the address where a C++ `catch` block resumes. Pick a site in the middle of straight code, not at the first instruction after a `try`. A `call` that ends the copied bytes works, but an exception that the called function throws and something above the hooked function catches cannot get through the copy. An address takes at most 16 callbacks. The newest runs first, and each sees what the ones before it wrote. All of them run, and none passes the call down.\
 `regs` reads and writes the registers as they are at the instruction, and every write goes back to the CPU when the last callback returns. The 64-bit registers `rax`, `rcx`, `rdx`, `rbx`, `rsp`, `rbp`, `rsi`, `rdi` and `r8` to `r15` read as pointer values and accept a pointer value, a typed integer, a whole number (negative ones too) or 8 raw bytes. Their 32-bit parts `eax` to `r15d` read as `uint32` values, so a register holding 4,294,967,295 comes back exactly. Use `mr.tonumber`, `mr.add` and `mr.eq` on them, because `regs.eax == 5` is never true. A write to one clears the upper half, as the CPU does. A plain number is accepted when it is whole and fits (-2147483648 to 4294967295 for a 32-bit part, up to 2^63 for a 64-bit register), and Lua rounds any number above 16,777,216 itself, so write larger values as `mr.uint32(...)` or `mr.uint64(...)`. `rsp` can be read but not written. `rflags` reads and writes as a number, and a write changes only the status flags and the direction flag. `xmm0` to `xmm5` read and write the low 8 bytes as a double, but the game's Lua numbers are 32-bit floats, so that view keeps about 7 digits. `xmm0q` to `xmm5q` read and write the same 8 bytes exactly, as a `uint64`. `xmm0f` to `xmm5f` read and write the low 4 bytes as a float. A write keeps the rest of the register. Any other name is an error. The registers are valid only while a site callback runs.\
-The same rules as for `hook` apply: the callback runs only on the script thread, and a call from another thread goes straight on to the instruction and is counted in `hook_info(address).other_thread_calls`. A callback that raises an error is detached, the writes it made before the error stay, and the later callbacks still run. `unhook(address)` and `unhook(address, callback)` detach site callbacks too. An address holds either a function hook, a site hook or a code cave, and a function hook and a site hook can sit in one function when their copied bytes do not overlap. The callback runs inside whatever the game was doing at that instruction, and it allocates (register values, Lua's garbage collector). Do not put a site in the game's memory allocator, in a region that holds a lock the allocator or the Lua state needs, or in Lua's own code: they deadlock or damage memory. Put sites in the game's own logic, such as a compare or a counter. A site costs about 0.15 µs per call with an empty callback, about 0.25 µs when it reads one register and about 0.5 µs when it reads and writes 32-bit registers.
+The same rules as for `hook` apply: the callback runs only on the script thread, and a call from another thread goes straight on to the instruction and is counted in `hook_info(address).other_thread_calls`. A callback that raises an error is detached, the writes it made before the error stay, and the later callbacks still run. `unhook(address)` and `unhook(address, callback)` detach site callbacks too. An address holds either a function hook, a site hook or a code cave, and a function hook and a site hook can sit in one function when their copied bytes do not overlap. The callback runs inside whatever the game was doing at that instruction, and it allocates (register values, Lua's garbage collector). Do not put a site in the game's memory allocator, in a region that holds a lock the allocator or the Lua state needs, or in Lua's code: they deadlock or damage memory. Put sites in the game logic, such as a compare or a counter. A site costs about 0.15 µs per call with an empty callback, about 0.25 µs when it reads one register and about 0.5 µs when it reads and writes 32-bit registers.
 ```lua
 local site = mr.add(mr.find_pattern(PATTERN), 12)
 mr.hook_site(site, function(regs)
@@ -459,9 +461,9 @@ Returns the number of hook callbacks that are running (0 outside a callback).
 
 - The hook writes a 5-byte jump over the first instructions of the function. The jump stays after `unhook` and in later game modes. Reads of those bytes return the jump, so read operands there with `read_original`. `patch`, `relocate_field`, `write` and `grow_frame` refuse to change the first instructions of a hooked function, because the game now runs a copy of them.
 
-- Call `hook` from your script's own code or a listener, never inside a coroutine. The callback runs on the same Lua thread as the `hook` call. While that thread is suspended, the game's calls skip the callback.
+- Call `hook` from the main code of your script or from a listener, never inside a coroutine. The callback runs on the same Lua thread as the `hook` call. While that thread is suspended, the game's calls skip the callback.
 
-- Do not call the game's script functions inside a callback (`common.*`, `cm:*`, `ModLog`, interface methods). The hooked function often runs while another script function is still in progress. A callback that called `common.get_localised_string` crashed the campaign later, in a `context:character()`, probably because the second script function corrupted the state of the first. Inside a callback, read memory with memreader Plus and use Lua's own `string.*`, `math.*` and `table.*`. Store the values you need in a variable, and call the game's script functions later from a listener or a timer. A library that calls the game's functions can refuse to run inside a callback with `if mr.hook_depth() > 0 then`.
+- Do not call the game's script functions inside a callback (`common.*`, `cm:*`, `ModLog`, interface methods). The hooked function often runs while another script function is still in progress. A callback that called `common.get_localised_string` crashed the campaign later, in a `context:character()`, probably because the second script function corrupted the state of the first. Inside a callback, read memory with memreader Plus and use Lua's standard `string.*`, `math.*` and `table.*`. Store the values you need in a variable, and call the game's script functions later from a listener or a timer. A library that calls the game's functions can refuse to run inside a callback with `if mr.hook_depth() > 0 then`.
 
 - Only calls on the script thread reach the callback. Calls from the game's other threads, and every call while no callback is attached, run the original function directly.
 
@@ -469,17 +471,17 @@ Returns the number of hook callbacks that are running (0 outside a callback).
 
 - A crash in a callback crashes the game and, with crash reports on, writes a crash report. This also happens when the hooked function was reached through `call`. A `call` made inside the callback still turns a crash in the code it calls into a Lua error.
 
-- `hook`, `hook_site` and `code_cave` take read-only executable code, in `Warhammer3.exe` or in another DLL. Writable memory, such as the copy-protection region, and memreader Plus's own code are refused with an error that starts with `refused:`.
+- `hook`, `hook_site` and `code_cave` take read-only executable code, in `Warhammer3.exe` or in another DLL. Writable memory, such as the copy-protection region, and the code of memreader Plus are refused with an error that starts with `refused:`.
 
-- Every hooked call on the script thread runs your Lua. A hook whose callback returns its own result costs about 0.4 µs per call. With `hook_next` down to the original it costs about 0.5 to 0.75 µs, and each further `hook_next` level adds about 0.3 to 0.4 µs. Hooking a function the game calls thousands of times per frame slows the game down. Check how often a hook fired with `hook_info(address).calls`.
+- Every hooked call on the script thread runs your Lua. A hook whose callback returns without calling `hook_next` costs about 0.4 µs per call. With `hook_next` down to the original it costs about 0.5 to 0.75 µs, and each further `hook_next` level adds about 0.3 to 0.4 µs. Hooking a function the game calls thousands of times per frame slows the game down. Check how often a hook fired with `hook_info(address).calls`.
 
-- Do not hook Lua's own functions or the allocator Lua uses, because the callback itself runs Lua. Do not hook functions that raise Lua errors, such as script bindings: the error jumps past the hook and leaves it in a broken state. `__vectorcall` functions are not supported, because the hook does not save all the registers they use. MinHook refuses functions shorter than 5 bytes.
+- Do not hook the functions of the Lua runtime or the allocator Lua uses, because the callback itself runs Lua. Do not hook functions that raise Lua errors, such as script bindings: the error jumps past the hook and leaves it in a broken state. `__vectorcall` functions are not supported, because the hook does not save all the registers they use. MinHook refuses functions shorter than 5 bytes.
 
 - A hook that changes the game model desyncs multiplayer unless every client has it.
 
 ## Changing game data
 
-These functions change memory the game owns. The game frees what it owns with its own allocator, so a block it keeps must come from that allocator and not from `alloc`.
+These functions change memory the game owns. The game frees what it owns with its allocator, so a block it keeps must come from that allocator and not from `alloc`.
 
 A function here that takes one address (`patch`, `grow_frame`, `game_free`, the `map_*` functions, and also `call`, `hook` and `function_start`) takes a pointer value or exactly 8 raw bytes. Any other string is an argument error. Functions that take a pointer and an offset, like the reads, accept the same arguments as the reads.
 
@@ -508,7 +510,7 @@ Inserts one element at `position` (1 to size + 1, the same numbering as `read_ve
 Removes `count` elements (default 1) from `position` on and moves the later ones down. The freed slots at the end are zeroed.
 #### `string_set(pointer, offset, text: string)`
 #### `unistring_set(pointer, offset, text: string)`
-Replaces the `CA::String` or `CA::UniString` at `pointer + offset` with `text`, built by the game's own string code, and frees the old text. `unistring_set` takes UTF-8 text and refuses text that is not valid UTF-8. Text with a zero byte, or a field that does not hold a CA string, is an error.
+Replaces the `CA::String` or `CA::UniString` at `pointer + offset` with `text`, built by the game's string code, and frees the old text. `unistring_set` takes UTF-8 text and refuses text that is not valid UTF-8. Text with a zero byte, or a field that does not hold a CA string, is an error.
 #### `relocate_field(sites: table): true | nil, float`
 Applies a list of byte patches as one unit. Each site is a table `{address, expected, bytes}` with the same meaning as `patch`. Every site is checked first. When one holds neither its `expected` nor its `bytes`, nothing is written and the result is `nil` and that site's number. When all sites hold `expected` or are already patched, every unpatched one is written and the result is `true`. Each site has the limits of `patch`, and an error names the site by its number (`site 2: ...`). Use it to move a struct field or grow an array across several code sites, so a build the patches do not fit leaves the game untouched. A site in the first instructions of a hooked function gives `nil` and its number, the same way it does in `patch`.
 #### `grow_frame(address: pointer, by: float): true | nil, string`
@@ -524,7 +526,7 @@ Write one instruction per line. `;` or `//` starts a comment and `name:` is a la
 
 `db`, `dw`, `dd` and `dq` write data. `align 16` pads up to the next multiple of 16: with `nop` instructions in the code, so the code can run through the padding, and with zero bytes in the data. Lines after `.data` go behind the jump back into the game, so the code can read constants there with `[rip + label]`.
 
-A jump to a label takes the 2-byte form when the label is in reach and the long form when it is not. `short` or `near` before the label forces one form. A jump or call to a number or a value always takes the 5-byte form, counted from the instruction's own address, and a target more than 2 GB away is an error.
+A jump to a label takes the 2-byte form when the label is in reach and the long form when it is not. `short` or `near` before the label forces one form. A jump or call to a number or a value always takes the 5-byte form, counted from the address of that instruction, and a target more than 2 GB away is an error.
 
 `values` fills the placeholders of the text. `{name:4}` is a field of exactly 4 bytes (or 1, 2 or 8) that keeps its offset in the code, so `cave_value` can read it back later. `{name}` is a plain value that the instruction may encode in fewer bytes. A value is a whole number, a pointer or a string of 1, 2, 4 or 8 bytes. A string of 1 or 2 bytes counts as unsigned and a string of 4 bytes as signed. A plain number must stay in the range a hex template of a site entry takes: -128 to 255 for `{name:1}`, -32768 to 65535 for `{name:2}`, -16777215 to 16777215 for `{name:4}` and `{name}`, and 0 to 16777215 for `{name:8}`. Anything else, such as -1 or 2^25 in an 8-byte field, is an error, because a Lua number that large is no longer exact and an address in a field has to be. Pass a pointer, a typed value or bytes instead. `memreader_plus.slot_fits(number, [size])` answers whether a plain number may fill a field of that size (no size: a `{name}` value).
 
@@ -536,7 +538,7 @@ Returns how many 14-byte runs of `int3` padding in the exe are still free for fa
 #### `map_find_key(map: pointer, key: string): pointer | nil`
 Looks `key` up in the `CA_STD::UNORDERED` hash map at `map` and returns its node, or `nil`. The map must have `CA::String` keys, like the key map of a DB table (`DATABASE_TABLE` +0x28). The lookup hashes the key and walks one bucket, the same way the game does. Keys are compared byte for byte, so case matters. In all three `map_*` functions a key is at most 4096 bytes long and has no zero byte.
 #### `map_add_key(map: pointer, key: string, index: float, [source: pointer]): pointer, boolean`
-Adds `key` to a DB key map through the game's own insert function and returns the node and `true`. The new node maps the key to row `index` (0 to 16,777,215) and holds `source` at +0x28 (the pack the row came from, NULL when left out). If the key is already there, nothing changes, and the result is the existing node and `false`. The game grows the bucket array when the map gets too full. Use it only on DB key maps: the game's insert builds nodes of that shape (a key, a row number and a source pointer).
+Adds `key` to a DB key map through the game's insert function and returns the node and `true`. The new node maps the key to row `index` (0 to 16,777,215) and holds `source` at +0x28 (the pack the row came from, NULL when left out). If the key is already there, nothing changes, and the result is the existing node and `false`. The game grows the bucket array when the map gets too full. Use it only on DB key maps: the game's insert builds nodes of that shape (a key, a row number and a source pointer).
 #### `map_remove_key(map: pointer, key: string): boolean`
 Removes `key` from a map with `CA::String` keys and returns `true`, or `false` when the key is not there. The key text is freed at once, and the node at the next mode switch.
 #### `list_insert(pointer, offset, position: float, bytes: string): pointer`
@@ -596,7 +598,7 @@ p:remove('raise_limit')
 p:remove_all()
 ```
 
-The patterns above are examples. Real ones come from your own search for code that matches once, as in [Calling game functions](#calling-game-functions).
+The patterns above are examples. Real ones come from a search you run for code that matches once, as in [Calling game functions](#calling-game-functions).
 
 ### Handles, names and limits
 
@@ -636,7 +638,7 @@ If you know the C# library Harmony, the order is the same as its. In each of the
 The callbacks you added with `hook` count as one group of arounds with priority 0. They run newest first among themselves, as they always did, and `hook_next` and `game(...)` walk the same list.
 
 #### The `call` object
-The first argument of a prefix and a postfix, and the `game` argument of an around, are all the same object. It is reused for every call, so keep nothing from it. A method or field used outside a link of its own call, for example a `call` stored in a variable, raises `call object used after its call returned`.
+The first argument of a prefix and a postfix, and the `game` argument of an around, are all the same object. It is reused for every call, so keep nothing from it. A method or field used after the link call that received it has returned, for example a `call` stored in a variable, raises `call object used after its call returned`.
 
 - `call:set(i, value)` sets argument `i` (1 to the number of arguments) for the links below and for the game function. It works only in a prefix, and it takes effect when that prefix returns without an error.
 - `call:skip([result])` skips the arounds and the game function. It works only in a prefix, and the result is required when the signature has one. No lower prefix runs after a skip.
@@ -666,7 +668,7 @@ Each link counts its calls, skips and errors, and keeps the text of its first er
 A link that has failed may have done half of its work before the error, and it runs again on the next call. If it changes state, restore the state with `pcall` the way you would in any callback.
 
 #### Target tables
-Wherever a method takes an address `at`, it also takes `{ pattern = '...', at = offset, expect = '...' }`. The pattern, in the `find_pattern` format, must match exactly once. `at` is a whole offset from the start of the match, 0 when left out. `expect` is hex bytes and `??` separated by spaces. It is compared with the bytes at the address as they were before any hook or patch, and it may be shorter than the change. The result is the same as with `find_pattern` and a check of your own, and the search uses the cache of `find_patterns`. A failure answers `nil` and one of these texts:
+Wherever a method takes an address `at`, it also takes `{ pattern = '...', at = offset, expect = '...' }`. The pattern, in the `find_pattern` format, must match exactly once. `at` is a whole offset from the start of the match, 0 when left out. `expect` is hex bytes and `??` separated by spaces. It is compared with the bytes at the address as they were before any hook or patch, and it may be shorter than the change. The result is the same as with `find_pattern` and a check you write, and the search uses the cache of `find_patterns`. A failure answers `nil` and one of these texts:
 
 - `pattern found 0 times` or `pattern found 2 times` (any count other than 1)
 - `bad pattern: hex bytes and ?? separated by spaces, starting with a byte`
@@ -712,7 +714,7 @@ Writes a whole number into a field of 1 byte (0 to 255) or 4 bytes (-16777215 to
 #### `handle:cave(name: string, at, code: string | table): pointer | nil, string`
 Like `code_cave`, with a name and an owner. It returns the cave's address. A repeated call with the same code returns the same address.
 
-`code` can also be a table with assembly text, `{ asm = text, values = {...}, source = 'script/my_mod/caves/tick.asm', bytes = hex_bytes, echo = false }`, where only `asm` is required. Plus assembles the text at the cave's own address (see `assemble`), so `call {target}` to a game function and `[rip + label]` work. The memory for such a cave lies within about 1.75 GB of `at`. Plus sets aside room for 64 of these caves next to the game's code when it loads, and only a cave past those 64 has to look for free memory. When no free memory is that close, the call answers `nil, "no free memory near the game's code for the cave"`, and every later cave near the same code gets the same answer at once until the game closes. `source` names the text in errors and in the listing, and defaults to `asm`. The assembled code must equal `bytes` if you pass them, or the call answers `nil, 'asm and bytes differ at +0x12'`.
+`code` can also be a table with assembly text, `{ asm = text, values = {...}, source = 'script/my_mod/caves/tick.asm', bytes = hex_bytes, echo = false }`, where only `asm` is required. Plus assembles the text at the address of the cave (see `assemble`), so `call {target}` to a game function and `[rip + label]` work. The memory for such a cave lies within about 1.75 GB of `at`. Plus sets aside room for 64 of these caves next to the game's code when it loads, and only a cave past those 64 has to look for free memory. When no free memory is that close, the call answers `nil, "no free memory near the game's code for the cave"`, and every later cave near the same code gets the same answer at once until the game closes. `source` names the text in errors and in the listing, and defaults to `asm`. The assembled code must equal `bytes` if you pass them, or the call answers `nil, 'asm and bytes differ at +0x12'`.
 
 An error in the text answers `nil` and `<source>:<line>:<column>: <what>`, and nothing is written. After a new cave goes in, Plus writes its listing once through `set_log`, starting with the owner in brackets, unless `echo` is `false`. `hook_info(at).listing` returns the same text. `memreader_plus.supports.cave_asm` is `true` on a Plus that takes the table. An older Plus raises an error for it.
 #### `handle:frame(name: string, at, grow: float): true | nil, string`
@@ -810,7 +812,7 @@ The fields of an entry:
 | `name`, `feature`, `kind` | all | `kind` is `anchor`, `patch`, `value`, `cave`, `frame`, `relocate`, `site`, `prefix`, `postfix`, `around` or `hook` (the same as `around`). `feature` groups the entries that work or fail together |
 | `pattern` or `variants` | all | the hex pattern, which must match once. `variants` is a list of tables that can each override `pattern`, `at`, `expect` and `bytes`, tried in order, and the first that matches once and verifies wins |
 | `at` | all but `anchor` | offset from the match to the site, 0 when left out |
-| `expect` | all but `anchor`, `frame`, `relocate` | the bytes that must be at the site, hex with `??`. A link can leave it out when it hooks the match itself (no `at`) or has an `expect_target`, except with target `'call'`, which reads the call from it. The linter refuses a link's `expect` that only repeats the start of the pattern |
+| `expect` | all but `anchor`, `frame`, `relocate` | the bytes that must be at the site, hex with `??`. A link can leave it out when it hooks the match itself (no `at`) or has an `expect_target`, except with target `'call'`, which reads the call from it |
 | `bytes` | `patch`, `cave` | `patch`: the new bytes, as long as `expect`. `cave`: the code, where `{name:4}` is a 4-byte value (`{name:1}`, `{name:8}`) that comes from a read of the same name or from the table given to `install` |
 | `asm` or `asm_file` | `cave` | the code as assembly text (see `assemble`): the text itself, usually in a long string `[[ ... ]]`, or the pack path of a text file such as `'script/my_mod/caves/tick.asm'`. Fields `{name:4}` come from a read or from the table given to `install`. A plain value `{name}` must come from a read, because Plus checks an installed cave by assembling its text again with the reads alone. With `bytes` next to it, Plus refuses the entry when the two give different code, and an older Plus uses `bytes`. Without `bytes`, an older Plus raises an error for the table, so check `memreader_plus.supports.cave_asm` first. A missing file marks the entry missing with `asm file not found: <path>`, and a path that is not a `.asm` file under `script/` with `asm_file must be a script/<mod>/<name>.asm path` |
 | `reads` | all | values read out of the match, `uint8`, `int32`, `call`, `rip` or `chain`, with optional `equals`, `low` and `high` checks. `from = 'other_entry'` takes a read from another entry |
@@ -830,7 +832,7 @@ The object it returns:
 - `address(name)` and `value(name, read)` give an entry's address and a value it read.
 - `install(name, [callback or arguments])` and `install_feature(feature, [table of callbacks or arguments by entry name])` write the entries. They return `true`, or `false` and the reason. Every entry is checked first, so a refusal writes nothing. Patches, values, caves, frames and relocations then go in as one batch, and links are attached last. A call from inside a hooked call answers `false, 'not from inside a hooked call'` and marks nothing.
 - `set(name, number)` writes a `value` entry. `remove(name)` takes back a patch, value or link, and answers `false, 'stays for the session'` for a cave, frame or relocation.
-- `disable(name, why)` marks an entry missing from your own checks. `cave_value(name, placeholder)` reads a placeholder's value back out of an installed cave, also in a later game mode. `listing(name)` returns the listing of an installed `asm` cave, which the object also writes through `log` when it installs the cave.
+- `disable(name, why)` marks an entry as missing when a check in your script fails. `cave_value(name, placeholder)` reads a placeholder's value back out of an installed cave, also in a later game mode. `listing(name)` returns the listing of an installed `asm` cave, which the object also writes through `log` when it installs the cave.
 - `log_missing()` writes one line per missing entry through `log`, once per mode, as `[my_army_mod] cap_site not found (pattern found 0 times): cap off`. `report()` returns `name=ours|vanilla|missing` joined by commas, for the crash context and a multiplayer handshake.
 
 If Plus can't stop the other threads or one of them is inside the code to be written (`a thread is inside <owner>/<name>`, `a thread could not be checked`, `the other threads could not be suspended`), nothing is written and no entry is marked missing. The call answers `false` and the reason, `found` and `feature_ok` stay true and `report()` says `vanilla`, so the mod can try again later, for example on the first tick. Any other failure marks the entry missing with its reason and the feature is not tried again in that session. A write that could not be put back marks every patch and value of the call missing. Caves and frames that a failed batch left are marked installed, one line `install failed (<reason>), left in place: <names>` is logged, and that feature is not tried again either. A link that can't be attached takes back the links and patches of that call.
@@ -853,7 +855,7 @@ Returns `nil` when nothing hooks or claims the address. Otherwise it returns `{ 
 
 Counts are plain Lua numbers, exact up to 16,777,216.
 #### `flush_log()`
-Writes the link errors that wait in the log now. It does nothing inside a callback or when nothing waits. memreader Plus's own script calls it every 5 seconds.
+Writes the link errors that wait in the log now. It does nothing inside a callback or when nothing waits. The memreader Plus script calls it every 5 seconds.
 #### `capacity(): table`
 Returns how full memreader Plus's tables are, for every mod together. Each entry is a table with the fields `used`, `room` and `limit`, so you read `memreader_plus.capacity().items.used`. `used` counts what mods have taken, `room` counts what fits before the table grows again, and `limit` is the size the table never grows past. When `used` reaches `limit`, the next change that needs that table answers `nil, 'full'`.
 
@@ -914,11 +916,11 @@ Both functions take a path inside the packs, with `/` or `\` between folders, 1 
 
 - Paths take `/` or `\`, upper or lower case, with or without a leading `/`.
 - A path must be 1 to 1024 bytes without a zero byte. A file over 64 MiB is an error.
-- The files come from the game's own file system, so this works in the frontend, in a campaign and in a battle. Call it from your script, not from inside a hook callback.
+- The files come from the game's file system, so this works in the frontend, in a campaign and in a battle. Call it from your script, not from inside a hook callback.
 
 ## Editing game files as they load
 
-`file_edit` changes the text of a game file each time the game reads it, so your mod doesn't have to ship its own copy of a vanilla file. It works on UI layouts (`.twui.xml`, loading screens included) and on the XML the game reads for models and materials, such as `.wsmodel` and `.xml.material` files. Several mods can edit the same file, and each mod's edit still applies when another mod ships its own copy of that file, as long as the text it looks for is in that copy.
+`file_edit` changes the text of a game file each time the game reads it, so your mod doesn't have to ship a copy of the vanilla file. It works on UI layouts (`.twui.xml`, loading screens included) and on the XML the game reads for models and materials, such as `.wsmodel` and `.xml.material` files. Several mods can edit the same file, and each mod's edit still applies when another mod ships a copy of that file, as long as the text it looks for is in that copy.
 
 ```lua
 local ok, why = mr.file_edit({
@@ -937,7 +939,7 @@ end
 
 The edit is made once, when you call `file_edit`, and the game gets the edited text on every later read of that file in the session, in every game mode. A layout the game already holds in its layout cache is dropped from the cache when you register the edit, so the next panel or component made from it uses the edited text. Components that already exist keep their old look until the game creates them again.
 
-Templates in `ui/templates/` reach fewer layouts. Each layout in the cache carries its own copy of every template it uses, made when the game read the layout, so a template edit reaches only layouts the game reads after the edit. `file_edit` says so in its second result. On its first start the game reads its templates and its common layouts before any mod script runs, so in the main menu those layouts keep the old templates. When a campaign loads, the game reads the campaign's layouts after the `campaign/mod` scripts have loaded, so a template edit made in a declared file or when your campaign script loads reaches them.
+Templates in `ui/templates/` reach fewer layouts. Each layout in the cache carries a separate copy of every template it uses, made when the game read the layout, so a template edit reaches only layouts the game reads after the edit. `file_edit` says so in its second result. On its first start the game reads its templates and its common layouts before any mod script runs, so in the main menu those layouts keep the old templates. When a campaign loads, the game reads the campaign's layouts after the `campaign/mod` scripts have loaded, so a template edit made in a declared file or when your campaign script loads reaches them.
 
 #### `file_edit(edit: table): true | nil, string`
 Registers an edit and returns `true`, or `nil` and the reason when it was skipped. A wrong field also gives `nil` and the reason, never an error, and so does a key that `file_edit` doesn't know, such as a misspelt `prioriy`. The fields of `edit`:
@@ -1017,7 +1019,7 @@ local ok, why = twui.edit({
 #### `twui.edit(edit: table): true | nil, string`
 Takes the fields of `file_edit` (`owner`, `id`, `path`, `priority`, `once`) with `changes` in place of `ops`, and returns what `file_edit` returns. All changes of one call apply, or none of them. A key it doesn't know, a bad path or a missing file gives `nil` and the reason. A `set` registers even when the file already has the value, so it still wins over an earlier mod's edit of that attribute.
 #### `twui.preview(edit: table, [text: string]): string, table | nil, string`
-Returns the edited text and the list of ops that `twui.edit` would register, and registers nothing. `edit.path` is needed even when you pass `text`, which is then edited instead of the file. It also takes an edit with `ops` in place of `changes`. The ops run through `file_edit_apply` on the copy of the file the game would load, so the text shows what your ops do to that copy on their own. It leaves out the edits of other mods, the order that `priority` sets and the XML check, so an edit that previews well can still be skipped or replaced when you register it.
+Returns the edited text and the list of ops that `twui.edit` would register, and registers nothing. `edit.path` is needed even when you pass `text`, which is then edited instead of the file. It also takes an edit with `ops` in place of `changes`. The ops run through `file_edit_apply` on the copy of the file the game would load, so the text shows what your ops do to that copy. It leaves out the edits of other mods, the order that `priority` sets and the XML check, so an edit that previews well can still be skipped or replaced when you register it.
 
 Each change names one component with a selector:
 
@@ -1028,7 +1030,7 @@ A selector that matches no component, or more than one, makes the call return `n
 
 The changes:
 
-- `{ set = selector, values = { name = value }, on = ..., where = { ... }, expect = { ... } }` sets attributes. `on` picks the elements that get them: `'component'` (the default, the component's own element), `'state'` (each of its states), `'image'` (the image sizes in each state), `'text'` (the text settings in each state, such as `font_m_size`, `textxoffset` and `texthalign`), `'component_image'` (its list of images, where `imagepath` is) or `'engine'` (its `LayoutEngine`). `where` keeps only the elements whose attributes have these values, for example `where = { name = 'active' }` for one state. With `expect`, the call is refused unless every chosen element has these values now. An attribute the element doesn't have is added. Values are text or whole numbers below 10000000. memreader Plus escapes `&`, `<`, `>`, `"`, tabs and line breaks in them, so write context expressions as plain text.
+- `{ set = selector, values = { name = value }, on = ..., where = { ... }, expect = { ... } }` sets attributes. `on` picks the elements that get them: `'component'` (the default, the element of the component), `'state'` (each of its states), `'image'` (the image sizes in each state), `'text'` (the text settings in each state, such as `font_m_size`, `textxoffset` and `texthalign`), `'component_image'` (its list of images, where `imagepath` is) or `'engine'` (its `LayoutEngine`). `where` keeps only the elements whose attributes have these values, for example `where = { name = 'active' }` for one state. With `expect`, the call is refused unless every chosen element has these values now. An attribute the element doesn't have is added. Values are text or whole numbers below 10000000. memreader Plus escapes `&`, `<`, `>`, `"`, tabs and line breaks in them, so write context expressions as plain text.
 - `{ hide = selector, expect = { ... } }` sets `visible="false"` on the component.
 - `{ add_callback = selector, values = { callback_id = 'ContextListEngineItemsPerRowSetter', ... } }` adds a `callback_with_context` with these attributes to the component, and gives the component a callback list when it has none.
 
@@ -1083,7 +1085,7 @@ The same game object always gives the same userdata while it exists, so `==` wor
 
 ## Crash reports
 
-When the game crashes, memreader Plus writes `memreader_crash_report_DDMMYY_HHMM.txt` next to `Warhammer3.exe`. It writes the report from inside the game's own crash handler, so a crash on any thread gets one, and a fault the game recovers from writes nothing. The report is plain text, usually 8 to 50 KB, small enough for pastebin. If a game patch moves the crash handler so that memreader Plus can't find it, memreader Plus writes the report as soon as a fatal fault (access violation, illegal instruction, integer division by zero, stack overflow) happens on the script thread, and the report says so and why.
+When the game crashes, memreader Plus writes `memreader_crash_report_DDMMYY_HHMM.txt` next to `Warhammer3.exe`. It writes the report from inside the game's crash handler, so a crash on any thread gets one, and a fault the game recovers from writes nothing. The report is plain text, usually 8 to 50 KB, small enough for pastebin. If a game patch moves the crash handler so that memreader Plus can't find it, memreader Plus writes the report as soon as a fatal fault (access violation, illegal instruction, integer division by zero, stack overflow) happens on the script thread, and the report says so and why.
 
 memreader Plus writes the report under a temporary name ending in `.tmp` and renames it when it is complete, so a report file is never cut off halfway. If the game closes while the report is being written, you find no report, only the `.tmp` file, which you can delete. Of two threads that crash at the same moment, the second one waits until the report of the first is written. After 5 seconds without a report, the crashing thread writes it itself.
 
@@ -1091,7 +1093,7 @@ memreader Plus also writes a report when the game ends itself with an error code
 
 The first lines give the time, the exception and where it happened, as `Warhammer3.exe+offset` with the start of the function around it. A C++ exception also gives its type, and an access violation gives the address that was read or written. Then the report says which thread crashed, how long the game had been running, and how much memory the game used and the PC had left.
 
-The Lua stack comes next, innermost first, with the source file, line and function of each frame and the string, number and boolean locals of the first 12 frames. A C function's frame shows its address in the exe, which tells you which game binding the script was calling. An event handler's `eventname` is one of the locals. If the stack says `no Lua function was running`, the fault is in the game's own code. For a crash on another thread, memreader Plus pauses the script thread for a moment and shows where it was.
+The Lua stack comes next, innermost first, with the source file, line and function of each frame and the string, number and boolean locals of the first 12 frames. A C function's frame shows its address in the exe, which tells you which game binding the script was calling. An event handler's `eventname` is one of the locals. If the stack says `no Lua function was running`, the fault is in the game's code. For a crash on another thread, memreader Plus pauses the script thread for a moment and shows where it was.
 
 For the crashing thread, the report shows up to 32 frames of the native call stack, each with its function, then the registers and the bytes of code around the crash. A register that points somewhere gets a short note: an address in a module, the stack, an object and its vtable, or the start of a text. When a register points into a DLL of another program, the note says `another program's DLL` and leaves out the DLL's name. A register that holds text where an address should be shows the text, such as `not readable, text "a to"`. Frames found by searching the stack for return addresses, after the function tables run out, are marked `(stack scan)` and can be wrong.
 
@@ -1099,9 +1101,9 @@ When the crash is inside the game's memory allocator, a line under the stack say
 
 After that the report lists what mods did through memreader Plus. Hooks come first, the ones running when the game crashed at the top, each with the file and line of its callbacks. Then every piece of game code patched in this session, and the last 24 memory writes, newest first. Each patch and write names the script line that made it, and repeated patches or writes from one line are counted in one entry. An entry shows the lowest and highest address of its changes. When the changes do not touch each other, it says `spread between` and `(not one block)`. Most of the code between those two addresses was not changed, so a crash there does not point at the mod. Changes made through `patcher` also name the owner and the change, and a block at the start of this list shows every owner's changes (see [Patching with owners](#patching-with-owners)).
 
-Near the end, the report names a DLL that another program loaded into the game only where the DLL is part of the crash: as the module the fault happened in, or in a frame of the native or Lua stack. It also names a DLL that changes how the game measures time, as speed hacks and trainers do, together with each timing function it hooks, such as `QueryPerformanceCounter`. The report doesn't list the other DLLs, because people post these reports in public and the names would show what else runs on their PC. After that come the game version, the command line and the crash folder. It lists every mod in load order with its file size, date, Workshop id and folder. The list holds up to 2048 mods and 1024 search paths, and when a game has more, or the report runs out of room, a line such as `and 56 more mods not listed` gives the count of the rest. Last, it names the game's own crash files for the same crash (`.mdmp` and `.stack.txt`).
+Near the end, the report names a DLL that another program loaded into the game only where the DLL is part of the crash: as the module the fault happened in, or in a frame of the native or Lua stack. It also names a DLL that changes how the game measures time, as speed hacks and trainers do, together with each timing function it hooks, such as `QueryPerformanceCounter`. The report doesn't list the other DLLs, because people post these reports in public and the names would show what else runs on their PC. After that come the game version, the command line and the crash folder. It lists every mod in load order with its file size, date, Workshop id and folder. The list holds up to 2048 mods and 1024 search paths, and when a game has more, or the report runs out of room, a line such as `and 56 more mods not listed` gives the count of the rest. Last, it names the crash files the game wrote for the same crash (`.mdmp` and `.stack.txt`).
 
-Near the top, `Mods using memreader Plus this session` lists every script that used memreader Plus since the game started, one line each: the file name, its path, the modes it was used in (such as `battle, campaign`) and how many calls, writes, patches, caves, hooks, links and rows it made. Reads are not counted, since a read cannot crash the game, so a script that only reads is not listed. A script that used Plus in an earlier battle or campaign stays listed. memreader Plus's own scripts are left out.
+Near the top, `Mods using memreader Plus this session` lists every script that used memreader Plus since the game started, one line each: the file name, its path, the modes it was used in (such as `battle, campaign`) and how many calls, writes, patches, caves, hooks, links and rows it made. Reads are not counted, since a read cannot crash the game, so a script that only reads is not listed. A script that used Plus in an earlier battle or campaign stays listed. The scripts of memreader Plus are left out.
 
 A short `Game context` block says what was going on: the mode (frontend, campaign or battle), the phase (main menu, loading a campaign, campaign, loading a battle, battle, or quitting after the player clicked Quit) and, in a campaign, the campaign, campaign type, whether it is multiplayer, difficulty, turn number, your faction, the human factions and the faction whose turn it is. In a battle it adds the battle type. A small script in memreader Plus's pack fills these in at safe moments, because the Lua state may be broken when the game crashes. In a campaign it runs on the first tick, at every new turn and at the start of every faction's turn, and in a battle when the battle scripts load. A turn number is the turn of the last update, so a crash in the middle of a round shows that round.
 
@@ -1119,13 +1121,13 @@ Crash reports are on by default. To change the setting from Lua, call:
 Turns crash reports on or off and returns the previous setting.
 
 #### `set_crash_context(name: string, value?: string)`
-Adds or changes one line of the report's `Game context` block. Without a value, the line is removed. A name is cut at 23 characters and a value at 159, new lines become spaces, and there is room for 12 lines. Your mod can use it to put its own state in the report.
+Adds or changes one line of the report's `Game context` block. Without a value, the line is removed. A name is cut at 23 characters and a value at 159, new lines become spaces, and there is room for 12 lines. Your mod can use it to put its state in the report.
 
 #### `note_crash_event(name: string, detail?: string)`
-Adds `name` to the report's `Recent script events` block, the way memreader Plus's own script records each game event. Your mod can use it to mark its own steps, for example right before it changes game data. A name is cut at 47 characters, and a value that is not a string is ignored. The report keeps the last 3 details given for each name and shows them after the time, newest first. A detail is cut at 95 characters.
+Adds `name` to the report's `Recent script events` block, the way the memreader Plus script records each game event. Your mod can use it to mark its steps, for example right before it changes game data. A name is cut at 47 characters, and a value that is not a string is ignored. The report keeps the last 3 details given for each name and shows them after the time, newest first. A detail is cut at 95 characters.
 
 #### `set_crash_settings(text?: string): boolean`
-Sets the text of the report's MCT settings block and returns `true`. memreader Plus's own script calls it with the settings of every mod on MCT, so you only need it for a list of your own, and the next MCT refresh replaces your text. The text should hold one `[mod]` heading line and then one `  option = value` line for each setting. A text over 16384 bytes is cut after the last full line, and the line `... cut: the settings list reached its size limit` takes the place of what was left out. Control characters other than new lines become spaces. Without a string, or with an empty one, the block says that no settings are recorded. The report shows how many seconds ago the text was set.
+Sets the text of the report's MCT settings block and returns `true`. The memreader Plus script calls it with the settings of every mod on MCT, so you only need it for a different list, and the next MCT refresh replaces your text. The text should hold one `[mod]` heading line and then one `  option = value` line for each setting. A text over 16384 bytes is cut after the last full line, and the line `... cut: the settings list reached its size limit` takes the place of what was left out. Control characters other than new lines become spaces. Without a string, or with an empty one, the block says that no settings are recorded. The report shows how many seconds ago the text was set.
 
 ## Runtime report
 
@@ -1155,9 +1157,9 @@ Players will often have memreader and memreader Plus enabled together. The game 
 
 memreader Plus replaces Cpecific's memreader in any load order, and every mod that uses `_G.memreader` ends up using memreader Plus. A `_lib/mod` file whose name sorts before `!memreader_plus_boot.lua` runs before either mod loads and finds no `_G.memreader`. If memreader Plus cannot write its DLL (two game instances running different versions lock the file), it logs `cannot write ...` and does not load. Cpecific's loader then loads Cpecific's DLL, and `_G.memreader` is Cpecific's.
 
-## Other mods that carry memreader Plus
+## Other mods that use memreader Plus
 
-Some mods ship a copy of memreader Plus inside their own pack. Each release of memreader Plus keeps its scripts in a folder named after the release, under `script/memreader_plus/`, and the start file loads the newest release it finds there, whatever the load order. Copies made before this layout use only the old loader paths. By the time they run, the newest memreader Plus is already loaded, so they stop without loading anything. If you ship a copy in your mod, take all of `script/memreader_plus/` and the `script/_lib/mod/` files of one release and keep them unchanged.
+Some mods ship a copy of memreader Plus inside their pack. Each release of memreader Plus keeps its scripts in a folder named after the release, under `script/memreader_plus/`, and the start file loads the newest release it finds there, whatever the load order. Copies made before this layout use only the old loader paths. By the time they run, the newest memreader Plus is already loaded, so they stop without loading anything. If you ship a copy in your mod, take all of `script/memreader_plus/` and the `script/_lib/mod/` files of one release and keep them unchanged.
 
 ## API reference
 
@@ -1186,7 +1188,7 @@ The address of `Warhammer3.exe` in memory: `0x0000000140000000`. The game always
 #### `version: float`
 `1.2`, the memreader API version. memreader Plus keeps it at 1.2 on purpose (see [Both mods installed](#both-mods-installed)).
 #### `plus_version: string`
-The version of memreader Plus, for example `'0.8.2'`.
+The version of memreader Plus as text, three numbers separated by dots.
 
 ### Addition +
 #### `add(float, float): float`
@@ -1324,7 +1326,7 @@ Searches for up to 64 patterns in one pass over the game's code. `patterns` is a
 #### `read_original(pointer, [offset], bytes: float): string`
 Returns `bytes` bytes (1 to 4096) of the game's code at `pointer + offset` as `find_pattern` sees them. Where a memreader Plus hook, `patch`, `relocate_field` or `grow_frame` changed the code, you get the bytes from before the change. Everywhere else, including code changed with `write`, you get the bytes that are there now. The range must be inside `Warhammer3.exe`, and a size outside 1 to 4096 is an error.\
 With two arguments the second one is the size, so `read_original(p, 16)` reads 16 bytes at `p`. The other reads always take the second argument as the offset: `read(p, 16)` reads at `p + 16`, has no size and returns `''`.\
-Use it to read an operand from the first bytes of a function that may be hooked, by your mod or another one, in this game mode or an earlier one. `hook_info(address).original` is no replacement. It is the hook's trampoline, a copy of the first instructions in other memory. An instruction there that addresses memory relative to its own position has different offset bytes than in the game's code. After the copied instructions the trampoline holds its jump back into the game's code, not the rest of the function.\
+Use it to read an operand from the first bytes of a function that may be hooked, by your mod or another one, in this game mode or an earlier one. `hook_info(address).original` is no replacement. It is the hook's trampoline, a copy of the first instructions in other memory. An instruction there that addresses memory relative to its position has different offset bytes than in the game's code. After the copied instructions the trampoline holds its jump back into the game's code, not the rest of the function.\
 memreader Plus keeps the original bytes of up to 65,536 changed spots per session. A change takes one spot for every 16 bytes it covers, at least one, and a change to code whose original bytes are already kept takes none. Once all 65,536 are used, or Windows can't give the memory for more, code changed later shows its new bytes to `find_pattern` and `read_original`. memreader Plus then writes one line about it to `memreader_plus_refused.txt`, unless the file already holds 32 lines for the session.
 #### `function_start(address: pointer): pointer, pointer | nil`
 Returns the start of the game function that contains `address`, and the end of the code range that holds `address`. It reads the exe's function table, the same one Windows uses to unwind the stack. Some functions are split into several ranges, and then the start is that of the first range while the end belongs to the range around `address`. Returns `nil` for an address in no listed function: data, padding between functions, or a small function that never calls anything and so has no table entry. An address outside `Warhammer3.exe` is an error.\
@@ -1398,7 +1400,7 @@ out(('took %.1f us'):format(mr.elapsed_us(start)))
 
 | | memreader 1.2 (Workshop 2789863945) | memreader Plus |
 |---|---|---|
-| Every read | a `ReadProcessMemory` call: about 800 ns per read in game | a guarded direct copy: about 120 ns per `read_uint32` in game (a new exact typed value costs more); a bad address is still a Lua error |
+| Every read | a `ReadProcessMemory` call: about 800 ns per read in game | a guarded direct copy: about 120 ns per `read_uint32` in game (a new exact typed value costs more). A bad address is still a Lua error |
 | `read` / `read_string` of 1024 bytes or more | crashes the game | works |
 | Signed types in `div`, `gt`, `lt`, `tonumber` | treated as unsigned: `div(int32(-8), 2)` = 2147483644, `gt(int32(-1), 5)` = true, `tonumber(int32(-1))` = 1.8e19 | signed: -4, false, -1 |
 | `add(pointer, -16)` | adds 0xFFFFFFF0 | subtracts 16 |
@@ -1412,9 +1414,9 @@ out(('took %.1f us'):format(mr.elapsed_us(start)))
 | `div(pointer 0x8000000000000000, -1)` | crashes the game | wraps to 0x8000000000000000 |
 | `read` of more than 16 MiB | tries to allocate it | error `cannot read more than 16777216 bytes at once` |
 | `createtable(1e9)` | asks for about 16 GB | size hints capped at 2^20 each |
-| `read_rowidx` | divides in float: off by one above 16 MiB | integer division; a row size below 1 is an error |
+| `read_rowidx` | divides in float: off by one above 16 MiB | integer division, and a row size below 1 is an error |
 | Padding bytes of typed values | not initialised | zeroed |
-| New functions | | `int64`, `uint64`, `is_null`, `read_int64`, `read_uint64`, `read_double`, `read_unistring`, `read_struct`, `read_vector`, `read_list`, `read_chain`, `find_pattern`, `find_patterns`, `function_start`, `read_original`, `call`, `alloc`, `hook`, `hook_next`, `unhook`, `hook_info`, `hook_depth`, `hook_site`, `code_cave`, `game_alloc`, `game_free`, `patch`, `relocate_field`, `grow_frame`, `commit_stack`, `hop_slots`, `capacity`, `vector_reserve`, `vector_insert`, `vector_erase`, `string_set`, `unistring_set`, `map_find_key`, `map_add_key`, `map_remove_key`, `list_insert`, `list_erase`, `read_pack_file`, `pack_file_exists`, `file_edit`, `file_edit_remove`, `file_edit_list`, `file_edit_preview`, `file_edit_apply`, `file_edit_status`, `set_file_edits`, `ticks`, `elapsed_us`, `set_crash_reports`, `set_crash_context`, `note_crash_event`, the field `plus_version` and the table `twui` |
+| New functions | | `int64`, `uint64`, `is_null`, `read_int64`, `read_uint64`, `read_double`, `read_unistring`, `read_struct`, `read_vector`, `read_list`, `read_chain`, `find_pattern`, `find_patterns`, `function_start`, `read_original`, `call`, `alloc`, `hook`, `hook_next`, `unhook`, `hook_info`, `hook_depth`, `hook_site`, `code_cave`, `game_alloc`, `game_free`, `patch`, `relocate_field`, `grow_frame`, `commit_stack`, `hop_slots`, `capacity`, `vector_reserve`, `vector_insert`, `vector_erase`, `string_set`, `unistring_set`, `map_find_key`, `map_add_key`, `map_remove_key`, `list_insert`, `list_erase`, `read_pack_file`, `pack_file_exists`, `file_edit`, `file_edit_remove`, `file_edit_list`, `file_edit_preview`, `file_edit_apply`, `file_edit_status`, `set_file_edits`, `ticks`, `elapsed_us`, `set_crash_reports`, `set_crash_context`, `note_crash_event`, `set_crash_settings`, `write_runtime_report`, `assemble`, `disassemble`, `patcher`, `patch_list`, `patch_info`, `flush_log`, `pointer_set`, `slot_fits`, the field `plus_version` and the tables `twui` and `supports` |
 | Lua globals | `_G.memreader` | `_G.memreader_plus`, and `_G.memreader` for compatibility |
 | DLL in the game folder | `twwh3-memreader.dll`, rewritten only when the loaded `version` differs | `twwh3-memreader_plus.dll`, rewritten whenever its bytes differ from the pack |
 | Metatables | `memreader.module`, `memreader.snapshot` | none, so nothing collides when both DLLs load |
@@ -1434,7 +1436,7 @@ pwsh -File tests\run.ps1      # tests
 
 | Folder | What |
 |---|---|
-| `script/` | the Lua in the pack: loaders and the TWUI module |
+| `script/` | the Lua in the pack: loaders, the crash context script, the declared sites and the TWUI module |
 | `src/` | the DLL's C and assembly source |
 | `vendor/` | Lua 5.1 (with the game's float numbers), MinHook, Zydis and the Zycore headers |
 | `tools/` | pack building and helper scripts |
